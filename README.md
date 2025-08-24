@@ -6,7 +6,7 @@
 
 ## ✨ 核心特性
 
-- 🔄 **完美API转换**: 100% 兼容 Anthropic API 格式，支持 Claude Code CLI 集成，目前不支持 Claude Code CLI工具调用
+- 🔄 **完美API转换**: 100% 兼容 Anthropic API 格式，支持 Claude Code CLI 集成，目前不支持 Claude Code CLI工具调用 原因：Sider API 不支持 Claude Code CLI 不支持 的工具，限制了
 - 🎯 **智能会话管理**: 自动捕获和管理 Sider 真实会话ID，确保对话连续性
 - 💬 **双重会话机制**: 支持真实 Sider 会话 + 本地上下文推断，提供最佳用户体验
 - 🛠️ **完整工具支持**: 支持 Anthropic 工具调用格式和 Sider AI 原生功能
@@ -348,4 +348,4 @@ MIT License
 
 ---
 
-**Sider2API** - 让 Sider AI 与 Claude Code 完美融合 🚀
+**Sider2API** - 让 Sider AI 与 Claude Code 完美融合!!! 🚀
