@@ -1,0 +1,45 @@
+{
+  "name": "sider2api",
+  "version": "1.0.0",
+  "description": "Convert Sider AI API to Anthropic API format for Claude Code compatibility",
+  "type": "module",
+  "bin": {
+    "sider2api": "./dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "bun run --watch ./src/main.ts",
+    "start": "NODE_ENV=production bun run ./src/main.ts",
+    "lint": "eslint . --cache",
+    "typecheck": "tsc",
+    "prepack": "bun run build"
+  },
+  "keywords": [
+    "sider-ai",
+    "anthropic-api",
+    "claude-code",
+    "api-converter",
+    "typescript",
+    "hono",
+    "bun"
+  ],
+  "author": "sider2api",
+  "license": "MIT",
+  "dependencies": {
+    "citty": "^0.1.6",
+    "consola": "^3.4.2",
+    "fetch-event-stream": "^0.1.5",
+    "gpt-tokenizer": "^3.0.1",
+    "hono": "^4.9.0",
+    "tiny-invariant": "^1.3.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.19",
+    "eslint": "^9.33.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2"
+  }
+}
