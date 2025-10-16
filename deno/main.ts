@@ -10,6 +10,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { messagesRouter } from './src/routes/messages.ts';
+import modelsRouter from './src/routes/models.ts';
 
 const app = new Hono();
 
@@ -47,6 +48,7 @@ app.get('/', (c) => {
     runtime: 'Deno Deploy',
     endpoints: {
       health: '/health',
+      models: '/v1/models',
       messages: '/v1/messages',
       count_tokens: '/v1/messages/count_tokens',
       conversations: '/v1/messages/conversations',
@@ -56,6 +58,7 @@ app.get('/', (c) => {
 });
 
 // 注册 API 路由
+app.route('/v1/models', modelsRouter);
 app.route('/v1/messages', messagesRouter);
 
 // 404 处理

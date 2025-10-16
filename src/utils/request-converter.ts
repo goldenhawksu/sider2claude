@@ -11,6 +11,7 @@ import { consola } from 'consola';
 // import { getOrCreateConversation, getParentMessageId } from './conversation-manager.js'; // Fallback functions, not used in current version
 import { siderConversationClient } from './sider-conversation.js';
 import { getNextParentMessageId, isContinuousConversation, getOrCreateContinuousSession } from './sider-session-manager.js';
+import { mapModelName } from '../config/models';
 
 /**
  * 转换 Anthropic 请求到 Sider 格式（同步版本，用于新会话）
@@ -288,46 +289,7 @@ function extractTextContent(content: string | Array<{ type: string; text?: strin
   throw new Error('Invalid content format');
 }
 
-/**
- * 映射模型名称：Anthropic → Sider
- */
-function mapModelName(anthropicModel: string): string {
-  // 模型名称映射表
-  const modelMap: Record<string, string> = {
-    // Claude 3.7 系列
-    'claude-3.7-sonnet': 'claude-3.7-sonnet-think',
-    'claude-3-7-sonnet': 'claude-3.7-sonnet-think',
-    'claude-3.7': 'claude-3.7-sonnet-think',
-    
-    // Claude 4 系列
-    'claude-4-sonnet': 'claude-4-sonnet-think', 
-    'claude-4': 'claude-4-sonnet-think',
-    'claude-sonnet-4': 'claude-4-sonnet-think',
-    
-    // 默认映射
-    'claude-3-sonnet': 'claude-3.7-sonnet-think',
-    'claude-sonnet': 'claude-3.7-sonnet-think',
-  };
-
-  // 查找映射
-  const mapped = modelMap[anthropicModel.toLowerCase()];
-  if (mapped) {
-    return mapped;
-  }
-
-  // 如果包含 think，直接使用
-  if (anthropicModel.includes('think')) {
-    return anthropicModel;
-  }
-
-  // 默认返回 claude-3.7-sonnet-think
-  consola.warn('Unknown model, using default:', {
-    requested: anthropicModel,
-    fallback: 'claude-3.7-sonnet-think',
-  });
-  
-  return 'claude-3.7-sonnet-think';
-}
+// 模型映射函数已移至 ../config/models.ts，通过 import 引入
 
 /**
  * 验证 Anthropic 请求格式
