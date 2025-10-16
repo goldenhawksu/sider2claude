@@ -120,26 +120,16 @@ export async function convertAnthropicToSiderAsync(
     try {
       // 尝试获取真正的 Sider 会话历史
       const historyResponse = await siderConversationClient.getConversationHistory(
-        conversationId, 
-        authToken, 
+        conversationId,
+        authToken,
         50 // 限制历史消息数量
       );
-
-      // 构建包含历史的上下文
-      const historyContext = siderConversationClient.buildContextFromHistory(
-        historyResponse.data.messages,
-        800 // 限制上下文长度
-      );
-
-      let requestText = currentUserInput;
-      if (historyContext) {
-        requestText = `Previous conversation:\n${historyContext}\nContinuing:\n${currentUserInput}`;
-      }
 
       // 获取最新的父消息ID
       const latestMessage = historyResponse.data.messages[historyResponse.data.messages.length - 1];
       const parentMessageId = latestMessage ? latestMessage.id : '';
 
+      // ✅ 修复：不要手动拼接历史文本，Sider API 会通过 cid + parent_message_id 自动关联历史
       const siderRequest: SiderRequest = {
         cid: conversationId,
         parent_message_id: parentMessageId,
@@ -148,7 +138,7 @@ export async function convertAnthropicToSiderAsync(
         client_prompt: buildSafeClientPrompt(anthropicRequest),
         multi_content: [{
           type: 'text',
-          text: requestText,
+          text: currentUserInput, // ✅ 只发送当前用户输入，不拼接历史
           user_input_text: currentUserInput,
         }],
         prompt_templates: [],
@@ -158,9 +148,9 @@ export async function convertAnthropicToSiderAsync(
       console.log('Using real Sider conversation history:', {
         conversationId: conversationId.substring(0, 10) + '...',
         historyMessageCount: historyResponse.data.messages.length,
-        contextLength: historyContext.length,
         parentMessageId: parentMessageId.substring(0, 10) + '...',
         title: historyResponse.data.conversation.title,
+        onlyCurrentInput: true, // ✅ 标记：仅发送当前输入，依赖 Sider API 关联历史
       });
 
       return siderRequest;
@@ -193,41 +183,13 @@ function convertAnthropicToSiderSync(
   const currentUserInput = extractTextContent(lastUserMessage.content);
   const siderModel = mapModelName(anthropicRequest.model);
 
-  // 构建请求文本 - 包含简化的会话上下文
+  // ✅ 修复：构建请求文本 - 仅添加系统消息，不拼接历史
+  // 因为 Sider API 会通过 cid + parent_message_id 自动关联历史
   let requestText = currentUserInput;
-  
-  // 添加系统消息（新会话）
+
+  // 仅在新会话时添加系统消息
   if (anthropicRequest.system && anthropicRequest.messages.length === 1) {
     requestText = `${anthropicRequest.system}\n\n${currentUserInput}`;
-  }
-  
-  // 为多轮对话添加简化的历史上下文
-  else if (anthropicRequest.messages.length > 1) {
-    let context = '';
-    
-    // 添加系统消息（如果有）
-    if (anthropicRequest.system) {
-      context += `System: ${anthropicRequest.system}\n\n`;
-    }
-    
-    // 添加最近的对话历史（最多2轮）
-    const recentHistory = anthropicRequest.messages.slice(-3, -1);
-    
-    for (const message of recentHistory) {
-      const content = extractTextContent(message.content);
-      // 限制每条消息长度避免过长
-      const truncated = content.length > 100 ? content.substring(0, 100) + '...' : content;
-      context += `${message.role === 'user' ? 'Human' : 'Assistant'}: ${truncated}\n`;
-    }
-    
-    // 总长度控制
-    if (context.length > 300) {
-      context = context.substring(0, 300) + '...\n';
-    }
-    
-    if (context) {
-      requestText = `${context}\nCurrent: ${currentUserInput}`;
-    }
   }
 
   // 获取真实的父消息ID（如果有会话ID）

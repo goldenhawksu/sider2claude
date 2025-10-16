@@ -203,7 +203,28 @@ messagesRouter.post('/', async (c: Context) => {
 messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
     const body = await c.req.json();
-    
+
+    // 验证必需字段
+    if (!body.model) {
+      return c.json({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'Missing required field: model',
+        },
+      } satisfies AnthropicError, 400);
+    }
+
+    if (!body.messages || !Array.isArray(body.messages)) {
+      return c.json({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'Missing required field: messages',
+        },
+      } satisfies AnthropicError, 400);
+    }
+
     // 简单的 token 计数估算 (后续可以使用 gpt-tokenizer)
     const totalLength = JSON.stringify(body.messages || []).length;
     const estimatedTokens = Math.ceil(totalLength / 4); // 粗略估算
@@ -214,7 +235,7 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
 
   } catch (error) {
     console.error('Token count error:', error);
-    
+
     return c.json({
       type: 'error',
       error: {
