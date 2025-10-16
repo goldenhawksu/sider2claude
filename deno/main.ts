@@ -30,8 +30,8 @@ app.use('*', logger());
 app.get('/health', (c) => {
   return c.json({
     status: 'ok',
-    service: 'sider2api',
-    version: '1.0.0-deno',
+    service: 'sider2claude',
+    version: '1.0.0-2025.10.17-deno',
     timestamp: new Date().toISOString(),
     tech_stack: 'hono + deno',
     runtime: 'Deno Deploy',
