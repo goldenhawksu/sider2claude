@@ -1,4 +1,4 @@
-# Sider2Claude
+# Sider2API
 
 将 Sider AI 的 API 转换为 Anthropic API 格式，为 Claude Code CLI 提供完全兼容的接口服务。
 
@@ -301,6 +301,123 @@ bun run typecheck
 - **类型系统**: TypeScript - 完整的类型安全
 - **SSE 处理**: 原生 fetch API 支持
 - **日志系统**: [Consola](https://github.com/unjs/consola) - 优雅的控制台日志
+
+## 🧪 测试
+
+项目包含完整的测试套件，用于验证 API 功能。
+
+### 快速测试
+
+```bash
+# 快速验证 API 是否正常工作
+cd test
+bun run quick-test.ts
+```
+
+### 运行所有测试
+
+**Windows**:
+```batch
+cd test
+run-tests.bat all
+```
+
+**Linux/macOS**:
+```bash
+cd test
+chmod +x run-tests.sh
+./run-tests.sh all
+```
+
+### 测试套件包含
+
+- ✅ 健康检查测试 (2 个)
+- ✅ 基础消息 API 测试 (4 个)
+- ✅ 会话保持测试 (3 个)
+- ✅ 流式响应测试 (3 个)
+- ✅ Token 计数测试 (5 个)
+
+**总计**: 17 个测试用例
+
+### 测试文档
+
+- 📖 [完整测试指南](docs/API-TESTING.md)
+- 📊 [测试执行报告](docs/TEST-EXECUTION-REPORT.md)
+- 🐛 [测试结果分析](docs/TESTING-RESULTS.md)
+
+## ☁️ 部署选项
+
+本项目支持多种部署平台，可以根据需求选择最适合的方案：
+
+### 选项 1: Railway（当前生产环境）⭐⭐⭐⭐⭐
+
+**Railway 部署**: https://sider2claude.up.railway.app
+
+**优势**：
+- ✅ 原生 Bun 支持，零配置
+- ✅ 已验证稳定运行（88.2% 测试通过）
+- ✅ 自动 HTTPS 和域名
+- ✅ 内置日志和监控
+
+**部署步骤**：
+1. 连接 GitHub 仓库
+2. 添加环境变量 `SIDER_AUTH_TOKEN`
+3. 自动构建和部署
+
+### 选项 2: Deno Deploy（全球边缘网络）⭐⭐⭐⭐
+
+**状态**: ✅ 代码已就绪，可立即部署
+
+**优势**：
+- ✅ 全球 35+ 边缘节点，超低延迟
+- ✅ 快速冷启动（~50-200ms）
+- ✅ 更高免费额度（100万请求/月）
+- ✅ 自动扩展和 HTTPS
+
+**快速部署**：
+```bash
+# 1. 访问 Deno Deploy
+https://dash.deno.com/new
+
+# 2. 连接 GitHub 仓库
+# 3. 设置入口文件: deno/main.ts
+# 4. 添加环境变量: SIDER_AUTH_TOKEN
+# 5. 点击 Deploy
+```
+
+详细说明请参考：
+- [Deno Deploy 部署指南](DENO-DEPLOY.md)
+- [Deno 版本 README](deno/README.md)
+- [Deno 迁移完成报告](docs/DENO-MIGRATION-COMPLETED.md)
+
+### 选项 3: 其他平台
+
+- **Vercel**: 需要配置 Node.js 运行时（不推荐，Serverless 限制）
+- **Fly.io**: 支持 Bun，配置简单
+- **Self-hosted**: VPS 部署，完全控制
+
+### 当前部署状态
+
+**Railway 生产环境** ⭐: https://sider2claude.up.railway.app
+
+**最新测试结果** (2025-10-16 20:39) - 配置真实 Sider Token 后:
+- ✅ 健康检查: 2/2 通过 (100%)
+- ✅ 基础消息 API: 4/4 通过 (100%)
+- ⚠️ 会话保持: 2/3 通过 (67%) - 多轮对话需要优化
+- ✅ 流式响应: 3/3 通过 (100%)
+- ⚠️ Token 计数: 4/5 通过 (80%)
+
+**总计**: **15/17 通过 (88.2%)** 🎉
+
+**评分**: ⭐⭐⭐⭐☆ (4.4/5)
+
+详见 [📊 最终测试报告](docs/FINAL-TEST-REPORT.md)（完整详细分析）。
+
+---
+
+**之前的测试结果**:
+- [Railway 初次测试](docs/RAILWAY-TEST-REPORT-DETAILED.md) (70.6% - 使用 dummy token)
+- [Vercel 测试](docs/TEST-EXECUTION-REPORT.md) (11.8% - 路由问题)
 
 ## 🔍 故障排除
 
