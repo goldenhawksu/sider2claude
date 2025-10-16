@@ -1,4 +1,4 @@
-# Sider2API
+# Sider2Claude
 
 将 Sider AI 的 API 转换为 Anthropic API 格式，为 Claude Code CLI 提供完全兼容的接口服务。
 
