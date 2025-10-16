@@ -115,8 +115,8 @@ export async function convertAnthropicToSiderAsync(
   const currentUserInput = extractTextContent(lastUserMessage.content);
   const siderModel = mapModelName(anthropicRequest.model);
 
-  // 2. 检查是否是多轮对话且有会话ID
-  if (conversationId && anthropicRequest.messages.length > 1) {
+  // 2. ✅ 修复：只要有会话ID就尝试获取历史（不再检查消息数量）
+  if (conversationId) {
     try {
       // 尝试获取真正的 Sider 会话历史
       const historyResponse = await siderConversationClient.getConversationHistory(
@@ -192,14 +192,16 @@ function convertAnthropicToSiderSync(
     requestText = `${anthropicRequest.system}\n\n${currentUserInput}`;
   }
 
-  // 获取真实的父消息ID（如果有会话ID）
+  // ✅ 修复：获取真实的父消息ID（只要有会话ID就尝试）
   let parentMessageId = '';
-  if (conversationId && anthropicRequest.messages.length > 1) {
+  if (conversationId) {
     parentMessageId = getNextParentMessageId(conversationId);
-    console.debug('Using real parent message ID:', {
-      cid: conversationId.substring(0, 12) + '...',
-      parentId: parentMessageId ? parentMessageId.substring(0, 12) + '...' : 'none',
-    });
+    if (parentMessageId) {
+      console.debug('Using real parent message ID:', {
+        cid: conversationId.substring(0, 12) + '...',
+        parentId: parentMessageId.substring(0, 12) + '...',
+      });
+    }
   }
 
   // 构建 Sider 请求

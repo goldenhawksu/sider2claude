@@ -83,22 +83,23 @@ messagesRouter.post('/', async (c: Context) => {
     
     // 2. 将 Anthropic 请求转换为 Sider 格式
     let siderRequest;
-    
-    if (conversationId && anthropicRequest.messages.length > 1) {
+
+    // ✅ 修复：只要提供了会话ID，就尝试获取历史（不再检查消息数量）
+    if (conversationId) {
       // 使用真正的 Sider 会话历史
       console.log('Attempting to use real conversation history:', {
         conversationId: conversationId.substring(0, 10) + '...',
         messageCount: anthropicRequest.messages.length,
         hasParentMessageId: !!parentMessageId,
       });
-      
+
       try {
         siderRequest = await convertAnthropicToSiderAsync(
-          anthropicRequest, 
-          auth.token, 
+          anthropicRequest,
+          auth.token,
           conversationId
         );
-        
+
         // 如果客户端直接提供了父消息ID，优先使用客户端的
         if (parentMessageId) {
           siderRequest.parent_message_id = parentMessageId;
@@ -109,7 +110,7 @@ messagesRouter.post('/', async (c: Context) => {
       } catch (error) {
         console.warn('Failed to get conversation history, using fallback:', error);
         siderRequest = convertAnthropicToSider(anthropicRequest, conversationId);
-        
+
         // 如果客户端提供了父消息ID，使用它
         if (parentMessageId) {
           siderRequest.parent_message_id = parentMessageId;
@@ -118,7 +119,7 @@ messagesRouter.post('/', async (c: Context) => {
     } else {
       // 新会话或没有会话ID，使用基本模式
       siderRequest = convertAnthropicToSider(anthropicRequest, conversationId);
-      
+
       // 如果客户端提供了父消息ID，使用它（即使没有会话ID）
       if (parentMessageId) {
         siderRequest.parent_message_id = parentMessageId;
