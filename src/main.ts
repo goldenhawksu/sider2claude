@@ -1,7 +1,7 @@
 
 
 /**
- * Sider2API - 将 Sider AI API 转换为 Anthropic API 格式
+ * Sider2Claude - 将 Sider AI API 转换为 Anthropic API 格式
  * 
  * 目标: 为 Claude Code CLI 提供 Anthropic API 兼容接口
  * 技术栈: Hono + Bun
@@ -41,7 +41,7 @@ app.get('/health', (c) => {
 // 根路径信息
 app.get('/', (c) => {
   return c.json({
-    name: 'Sider2API',
+    name: 'Sider2Claude',
     description: 'Convert Sider AI API to Anthropic API format for Claude Code compatibility',
     version: '1.0.0',
     tech_stack: 'hono + bun',
@@ -72,7 +72,7 @@ app.onError((err, c) => {
 });
 
 // 启动服务器
-consola.info(`🚀 Sider2API server starting on port ${PORT}`);
+consola.info(`🚀 Sider2Claude server starting on port ${PORT}`);
 consola.info(`📋 Health check: http://localhost:${PORT}/health`);
 consola.info(`📖 API info: http://localhost:${PORT}/`);
 

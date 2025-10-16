@@ -1,6 +1,6 @@
-# Sider2API - Deno Deploy 版本
+# Sider2Claude - Deno Deploy 版本
 
-这是 Sider2API 的 Deno 兼容版本，可以部署到 Deno Deploy 平台。
+这是 Sider2Claude 的 Deno 兼容版本，可以部署到 Deno Deploy 平台。
 
 ## ✨ 特性
 

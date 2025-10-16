@@ -1,4 +1,4 @@
-# Sider2API
+# Sider2Claude
 
 将 Sider AI 的 API 转换为 Anthropic API 格式，为 Claude Code CLI 提供完全兼容的接口服务。
 
@@ -39,7 +39,7 @@ bun --version
 
 ```bash
 git clone <your-repo-url>
-cd sider2api
+cd sider2claude
 ```
 
 ### 3. 安装依赖
@@ -85,7 +85,7 @@ bun run start
 
 ### 自动会话ID管理
 
-Sider2API 自动从 Sider API 响应中捕获真实的会话信息，无需手动管理：
+Sider2Claude 自动从 Sider API 响应中捕获真实的会话信息，无需手动管理：
 
 ```json
 {
@@ -263,7 +263,7 @@ export ANTHROPIC_MODEL=claude-3.7-sonnet
 ### 项目结构
 
 ```
-sider2api/
+Sider2Claude/
 ├── src/
 │   ├── types/           # TypeScript 类型定义
 │   ├── routes/          # API 路由定义
@@ -329,6 +329,36 @@ chmod +x run-tests.sh
 ./run-tests.sh all
 ```
 
+### Deno 本地测试 🦕
+
+在部署到 Deno Deploy 之前,可以在本地测试 Deno 版本:
+
+**安装 Deno**:
+```powershell
+# Windows PowerShell
+irm https://deno.land/install.ps1 | iex
+
+# 或使用安装脚本
+.\scripts\install-deno.ps1
+```
+
+**启动 Deno 服务器** (端口 4142):
+```bash
+cd deno
+start-local.bat    # Windows
+
+# 或使用 deno task
+deno task dev
+```
+
+**运行 Deno 测试**:
+```bash
+bun run test/02-deno-local.test.ts
+```
+
+**快速指南**: [docs/deno-quickstart.md](docs/deno-quickstart.md)
+**完整配置**: [DENO-LOCAL-SETUP.md](DENO-LOCAL-SETUP.md)
+
 ### 测试套件包含
 
 - ✅ 健康检查测试 (2 个)
@@ -336,14 +366,18 @@ chmod +x run-tests.sh
 - ✅ 会话保持测试 (3 个)
 - ✅ 流式响应测试 (3 个)
 - ✅ Token 计数测试 (5 个)
+- ✅ **新增**: Deno 本地测试 (4 个)
+- ✅ **新增**: Models API 测试 (10个模型)
 
-**总计**: 17 个测试用例
+**总计**: 21+ 个测试用例
 
 ### 测试文档
 
 - 📖 [完整测试指南](docs/API-TESTING.md)
 - 📊 [测试执行报告](docs/TEST-EXECUTION-REPORT.md)
 - 🐛 [测试结果分析](docs/TESTING-RESULTS.md)
+- 🦕 [Deno 测试环境](docs/deno-setup-complete.md)
+- 🎯 [Models API 功能](docs/feature-models-api.md)
 
 ## ☁️ 部署选项
 
@@ -465,4 +499,4 @@ MIT License
 
 ---
 
-**Sider2API** - 让 Sider AI 与 Claude Code 完美融合!!! 🚀
+**Sider2Claude** - 让 Sider AI 与 Claude Code 完美融合!!! 🚀

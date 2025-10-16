@@ -1,5 +1,5 @@
 /**
- * Sider2API - Deno Deploy 版本
+ * Sider2Claude - Deno Deploy 版本
  *
  * 将 Sider AI API 转换为 Anthropic API 格式
  * 目标: 为 Claude Code CLI 提供 Anthropic API 兼容接口
@@ -41,7 +41,7 @@ app.get('/health', (c) => {
 // 根路径信息
 app.get('/', (c) => {
   return c.json({
-    name: 'Sider2API',
+    name: 'Sider2Claude',
     description: 'Convert Sider AI API to Anthropic API format for Claude Code compatibility',
     version: '1.0.0-deno',
     tech_stack: 'hono + deno',
@@ -79,7 +79,7 @@ export default {
 
 // 本地开发服务器
 if (import.meta.main) {
-  console.log(`🚀 Sider2API server starting on port ${PORT}`);
+  console.log(`🚀 Sider2Claude server starting on port ${PORT}`);
   console.log(`📋 Health check: http://localhost:${PORT}/health`);
   console.log(`📖 API info: http://localhost:${PORT}/`);
 

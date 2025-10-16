@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-**Sider2API** 是一个 API 代理服务，将 Sider AI API 转换为完全兼容 Anthropic API 格式的服务，专门为 Claude Code CLI 提供支持。
+**Sider2Claude** 是一个 API 代理服务，将 Sider AI API 转换为完全兼容 Anthropic API 格式的服务，专门为 Claude Code CLI 提供支持。
 
 **核心技术栈**：
 - **运行时**: Bun v1.0+（高性能 JavaScript 运行时）

@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "sider2api",
+      "name": "Sider2Claude",
       "dependencies": {
         "citty": "^0.1.6",
         "consola": "^3.4.2",
