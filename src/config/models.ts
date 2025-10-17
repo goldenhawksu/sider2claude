@@ -75,7 +75,20 @@ export const SUPPORTED_MODELS: ModelInfo[] = [
     owned_by: 'anthropic',
     siderModel: 'claude-4.5-sonnet-think',
   },
-
+  {
+    id: 'claude-haiku-4.5',
+    object: 'model',
+    created: 1677649963,
+    owned_by: 'anthropic',
+    siderModel: 'claude-haiku-4.5',
+  },
+  {
+    id: 'claude-haiku-4.5-think',
+    object: 'model',
+    created: 1677649963,
+    owned_by: 'anthropic',
+    siderModel: 'claude-haiku-4.5-think',
+  },
   // 通用别名
   {
     id: 'claude-3-sonnet',
