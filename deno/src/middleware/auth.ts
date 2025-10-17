@@ -150,6 +150,11 @@ export function createAuthMiddleware(options: {
  * @param allowDummy 是否允许 dummy token
  */
 function isValidToken(token: string, allowDummy: boolean): boolean {
+  // Claude Code 使用 "dummy" token (优先检查,兼容 Claude Code)
+  if (allowDummy && token === 'dummy') {
+    return true;
+  }
+
   // 从环境变量获取有效的 AUTH_TOKEN (Deno 版本)
   const validAuthToken = Deno.env.get('AUTH_TOKEN');
 
@@ -159,11 +164,6 @@ function isValidToken(token: string, allowDummy: boolean): boolean {
   }
 
   // 向后兼容: 如果没有配置 AUTH_TOKEN,使用旧的验证逻辑
-
-  // Claude Code 使用 "dummy" token
-  if (allowDummy && token === 'dummy') {
-    return true;
-  }
 
   // 基本格式验证 (可以根据需要扩展)
   if (token.length < 10) {
