@@ -13,6 +13,7 @@ import { logger } from 'hono/logger';
 import { consola } from 'consola';
 import { messagesRouter } from './routes/messages';
 import modelsRouter from './routes/models';
+import completeRouter from './routes/complete';
 import { router } from './routes';
 
 const app = new Hono();
@@ -49,6 +50,7 @@ app.get('/', (c) => {
       health: '/health',
       models: '/v1/models',
       messages: '/v1/messages',
+      complete: '/v1/complete',
       count_tokens: '/v1/messages/count_tokens',
     },
 
@@ -58,6 +60,7 @@ app.get('/', (c) => {
 // 注册 API 路由
 app.route('/v1/models', modelsRouter);
 app.route('/v1/messages', messagesRouter);
+app.route('/v1/complete', completeRouter);
 app.route('/api', router); // 测试路由
 
 // 404 处理

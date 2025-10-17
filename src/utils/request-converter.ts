@@ -181,7 +181,7 @@ export async function convertAnthropicToSiderAsync(
  * 同步版本的转换函数（用于新会话或降级模式）
  * 简化版本，确保稳定性
  */
-function convertAnthropicToSiderSync(
+export function convertAnthropicToSiderSync(
   anthropicRequest: AnthropicRequest,
   conversationId?: string
 ): SiderRequest {
