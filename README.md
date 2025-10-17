@@ -11,7 +11,7 @@
 - 💬 **双重会话机制**: 支持真实 Sider 会话 + 本地上下文推断，提供最佳用户体验
 - 🛠️ **完整工具支持**: 支持 Anthropic 工具调用格式和 Sider AI 原生功能
 - 🚀 **流式响应**: 原生支持 SSE 流式输出，兼容所有 Anthropic 客户端
-- 🔐 **企业级安全**: Bearer Token 认证，支持真实 Sider 认证令牌
+- 🔐 **双层认证**: 客户端使用 AUTH_TOKEN 认证,后端使用 SIDER_AUTH_TOKEN 访问 Sider AI,提供企业级安全保障
 - ⚡ **高性能架构**: 基于 Hono + Bun 技术栈，启动快速，响应迅速
 - 🧾 **开发友好**: 完整的 TypeScript 类型定义，详细的错误处理和调试日志
 
@@ -57,13 +57,27 @@ bun install
 PORT=4141
 NODE_ENV=development
 
+# 认证配置 (双层认证)
+# AUTH_TOKEN: 客户端使用的认证 Token (自定义字符串)
+AUTH_TOKEN=my-secret-api-key-2025
+
 # Sider AI API 配置
 SIDER_API_URL=https://sider.ai/api/chat/v1/completions
-SIDER_AUTH_TOKEN=your_sider_bearer_token_here
+# SIDER_AUTH_TOKEN: 从 sider.ai 获取的 JWT Token (以 eyJhbGci 开头)
+SIDER_AUTH_TOKEN=eyJhbGci...
 
 # 可选配置
 LOG_LEVEL=info
 REQUEST_TIMEOUT=30000
+```
+
+**双层认证架构**：
+```
+客户端 (使用 AUTH_TOKEN)
+    ↓
+Sider2Claude API (验证 AUTH_TOKEN)
+    ↓
+Sider AI (使用 SIDER_AUTH_TOKEN)
 ```
 
 ### 5. 启动服务
@@ -238,9 +252,11 @@ Token 计数端点，用于计算输入文本的 token 数量。
 ```bash
 # 设置 Claude Code 使用我们的 API
 export ANTHROPIC_BASE_URL=http://localhost:4141
-export ANTHROPIC_AUTH_TOKEN=dummy
+export ANTHROPIC_AUTH_TOKEN=my-secret-api-key-2025  # 使用你配置的 AUTH_TOKEN
 export ANTHROPIC_MODEL=claude-3.7-sonnet
 ```
+
+**注意**: 使用双层认证时，`ANTHROPIC_AUTH_TOKEN` 应设置为你在 `.env` 中配置的 `AUTH_TOKEN` 值。
 
 ### 配置文件方式
 
@@ -249,7 +265,7 @@ export ANTHROPIC_MODEL=claude-3.7-sonnet
 ```json
 {
   "anthropic_base_url": "http://localhost:4141",
-  "anthropic_auth_token": "dummy",
+  "anthropic_auth_token": "my-secret-api-key-2025",
   "anthropic_model": "claude-3.7-sonnet"
 }
 ```
@@ -257,6 +273,76 @@ export ANTHROPIC_MODEL=claude-3.7-sonnet
 ### 验证集成
 
 配置完成后，Claude Code 将自动使用我们的 API 服务，享受 Sider AI 的强大功能。
+
+## 🔌 与 New-API 集成
+
+### 快速配置 (3 步)
+
+#### 1️⃣ 在 New-API 中添加渠道
+
+```
+渠道配置:
+├─ 类型: Anthropic Claude
+├─ 名称: Sider2Claude
+├─ Base URL: https://deno-sider2claude.deno.dev
+├─ 密钥: my-secret-api-key-2025  ← 使用 AUTH_TOKEN
+├─ 优先级: 1
+└─ 状态: ✅ 启用
+```
+
+**重要提示 (双层认证)**:
+- ✅ Base URL **不要包含** `/v1` 或其他路径
+- ✅ 密钥填写 AUTH_TOKEN (客户端认证 Token)
+- ✅ SIDER_AUTH_TOKEN 在服务器端环境变量中配置
+- ✅ 保存后点击 **测试** 按钮验证配置
+
+#### 2️⃣ 在 New-API 中创建令牌
+
+1. 进入 **令牌管理** → **添加令牌**
+2. 设置名称、额度和过期时间
+3. (可选) 绑定到 Sider2Claude 渠道
+4. **保存** 并复制生成的 Token (`sk-xxx...`)
+
+#### 3️⃣ 使用 New-API Token 调用
+
+```bash
+# 使用 New-API 生成的 Token (sk-xxx...)
+curl -X POST https://your-new-api.com/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxxxx..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3.7-sonnet",
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+**认证流程 (双层认证)**:
+```
+客户端 (使用 sk-xxx New-API Token)
+    ↓
+New-API (使用 AUTH_TOKEN)
+    ↓
+Sider2Claude (验证 AUTH_TOKEN)
+    ↓
+Sider AI (使用 SIDER_AUTH_TOKEN)
+```
+
+### 常见问题: 401 missing authorization header
+
+**问题**: 在 New-API 中测试渠道时返回 401 错误
+
+**原因**: 混淆了 New-API Token、AUTH_TOKEN 和 SIDER_AUTH_TOKEN
+
+**解决方案 (双层认证)**:
+- ❌ **错误**: 客户端直接使用 SIDER_AUTH_TOKEN (`eyJhbGci...`)
+- ✅ **正确**: 客户端使用 New-API Token (`sk-xxx...`)
+- ✅ **正确**: AUTH_TOKEN 配置在 New-API 渠道的"密钥"字段
+- ✅ **正确**: SIDER_AUTH_TOKEN 配置在服务器端环境变量
+
+**详细文档**:
+- [New-API 集成指南](docs/new-api-integration.md)
+- [配置对比说明](docs/new-api-config-comparison.md)
+- [快速参考卡](docs/new-api-quick-reference.md)
 
 ## 🛠️ 开发指南
 
@@ -373,8 +459,10 @@ bun run test/02-deno-local.test.ts
 
 ### 测试文档
 
+- 📊 [最新测试总结](docs/TEST-SUMMARY-2025-10-17.md) ⭐ **推荐** - 100% 通过
+- 📋 [Deno Deploy 测试报告](docs/test-report-deno-deploy-2025-10-17.md) - 完整测试结果
+- 🔧 [New-API 故障排除](docs/new-api-troubleshooting.md) - 401 错误解决方案
 - 📖 [完整测试指南](docs/API-TESTING.md)
-- 📊 [测试执行报告](docs/TEST-EXECUTION-REPORT.md)
 - 🐛 [测试结果分析](docs/TESTING-RESULTS.md)
 - 🦕 [Deno 测试环境](docs/deno-setup-complete.md)
 - 🎯 [Models API 功能](docs/feature-models-api.md)
@@ -400,13 +488,14 @@ bun run test/02-deno-local.test.ts
 
 ### 选项 2: Deno Deploy（全球边缘网络）⭐⭐⭐⭐
 
-**状态**: ✅ 代码已就绪，可立即部署
+**状态**: ✅ 代码已就绪，支持双层认证，可立即部署
 
 **优势**：
 - ✅ 全球 35+ 边缘节点，超低延迟
 - ✅ 快速冷启动（~50-200ms）
 - ✅ 更高免费额度（100万请求/月）
 - ✅ 自动扩展和 HTTPS
+- ✅ 支持双层认证架构
 
 **快速部署**：
 ```bash
@@ -415,11 +504,17 @@ https://dash.deno.com/new
 
 # 2. 连接 GitHub 仓库
 # 3. 设置入口文件: deno/main.ts
-# 4. 添加环境变量: SIDER_AUTH_TOKEN
+# 4. 添加环境变量:
+#    - AUTH_TOKEN=my-secret-api-key-2025
+#    - SIDER_AUTH_TOKEN=eyJhbGci...
+#    - SIDER_API_URL=https://sider.ai/api/chat/v1/completions
+#    - LOG_LEVEL=info
 # 5. 点击 Deploy
 ```
 
 详细说明请参考：
+- [Deno Deploy 最终部署指南](docs/deno-deploy-final-guide.md) ⭐ **推荐**
+- [部署修复说明](DEPLOY-FIX.md)
 - [Deno Deploy 部署指南](DENO-DEPLOY.md)
 - [Deno 版本 README](deno/README.md)
 - [Deno 迁移完成报告](docs/DENO-MIGRATION-COMPLETED.md)
@@ -455,24 +550,100 @@ https://dash.deno.com/new
 
 ## 🔍 故障排除
 
-### 常见问题
+### Claude Code 集成问题 ⚠️
 
-1. **认证失败**
+#### 问题: `API Error (500 {"text":"Error: Sider API error: 400 Bad Request"})`
+
+**症状**:
+- Claude Code 报告 400 或 500 错误
+- 请求不断重试失败
+- 使用 `claude-4.5-sonnet-think` 或其他模型
+
+**根本原因**: Token 配置问题(不是模型名称问题!)
+
+**快速修复**:
+
+1. **检查 Token 配置**:
+   ```powershell
+   # Windows PowerShell
+   $env:ANTHROPIC_AUTH_TOKEN
+   ```
+
+   ❌ 如果显示 "dummy" 或为空 → **这就是问题所在!**
+
+   ✅ 应该是以 `eyJhbGci` 开头的 JWT Token
+
+2. **使用修复脚本** (推荐):
+   ```powershell
+   # 自动检测和修复 Token 配置
+   .\scripts\fix-claude-code.ps1
+   ```
+
+3. **手动获取真实 Sider Token**:
+   - 访问 https://sider.ai 并登录
+   - 打开开发者工具 (F12) → Network 标签
+   - 发送一条消息
+   - 找到 `completions` 请求
+   - 复制 Authorization header 中的 JWT Token
+
+4. **更新环境变量**:
+   ```powershell
+   $env:ANTHROPIC_AUTH_TOKEN="eyJhbGci... (你的真实 Token)"
+   ```
+
+5. **重启 Claude Code** 并测试
+
+**详细指南**: [docs/claude-code-fix.md](docs/claude-code-fix.md)
+
+**已验证**: 所有 10 个模型(包括 `claude-4.5-sonnet-think`)在使用真实 Token 时 100% 工作 ✅
+
+---
+
+### 其他常见问题
+
+1. **认证失败 (403 Forbidden)**
    - 检查 `SIDER_AUTH_TOKEN` 是否正确
-   - 确认 token 是否过期
+   - 确认 Token 是否过期(Sider Token 通常有效期 30 天)
+   - 使用 `curl` 测试 Token 有效性:
+     ```bash
+     curl -X POST https://deno-sider2claude.deno.dev/v1/messages \
+       -H "Authorization: Bearer YOUR_TOKEN" \
+       -H "Content-Type: application/json" \
+       -d '{"model":"claude-3.7-sonnet","messages":[{"role":"user","content":"test"}],"max_tokens":50}'
+     ```
 
-2. **会话不连续**
+2. **模型不存在 (404)**
+   - 检查可用模型列表:
+     ```bash
+     curl https://deno-sider2claude.deno.dev/v1/models
+     ```
+   - 使用已验证的模型名称
+
+3. **会话不连续**
    - 检查是否正确传递 `X-Conversation-ID` 和 `X-Parent-Message-ID`
    - 查看服务器日志确认会话状态
+   - Claude Code 通常会自动管理会话
 
-3. **响应格式错误**
+4. **响应格式错误**
    - 确认请求格式符合 Anthropic API 规范
    - 检查 Sider API 服务状态
+   - 查看服务器日志获取详细错误信息
 
 ### 调试模式
 
-设置环境变量启用详细日志：
+**本地服务器调试**:
+```bash
+# 1. 启动本地服务器
+bun run dev
 
+# 2. 配置 Claude Code 使用本地服务器
+$env:ANTHROPIC_BASE_URL="http://localhost:4141"
+$env:ANTHROPIC_AUTH_TOKEN="your_real_token"
+
+# 3. 观察终端日志查看详细信息
+```
+
+**启用详细日志**:
 ```bash
 LOG_LEVEL=debug
 ```
@@ -480,10 +651,11 @@ LOG_LEVEL=debug
 ### 获取帮助
 
 如果遇到问题，请：
-1. 检查服务器日志
-2. 确认环境配置
-3. 查看项目文档
-4. 提交 Issue 描述问题
+1. 查看 [故障排除文档](docs/claude-code-fix.md)
+2. 检查服务器日志
+3. 确认环境配置
+4. 运行 `.\scripts\fix-claude-code.ps1` 自动诊断
+5. 提交 Issue 并附上错误日志
 
 ## 📄 许可证
 

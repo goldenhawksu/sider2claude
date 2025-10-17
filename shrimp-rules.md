@@ -1,4 +1,4 @@
-# Sider2API 开发规范 - AI Agent 专用
+# Sider2Claude 开发规范 - AI Agent 专用
 
 ## 项目概述
 
