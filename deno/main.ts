@@ -9,7 +9,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
-import { messagesRouter } from './src/routes/messages.ts';
+import { hybridMessagesRouter } from './src/routes/messages-hybrid.ts';
 import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
 
@@ -55,13 +55,18 @@ app.get('/', (c) => {
       count_tokens: '/v1/messages/count_tokens',
       conversations: '/v1/messages/conversations',
       sider_sessions: '/v1/messages/sider-sessions',
+      backends_status: '/v1/messages/backends/status',  // 新增混合路由状态端点
+    },
+    features: {
+      hybrid_routing: true,  // 启用混合路由
+      backends: ['sider', 'anthropic'],
     },
   });
 });
 
 // 注册 API 路由
 app.route('/v1/models', modelsRouter);
-app.route('/v1/messages', messagesRouter);
+app.route('/v1/messages', hybridMessagesRouter);  // 使用混合路由
 app.route('/v1/complete', completeRouter);
 
 // 404 处理

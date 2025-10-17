@@ -11,7 +11,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { consola } from 'consola';
-import { messagesRouter } from './routes/messages';
+import { hybridMessagesRouter } from './routes/messages-hybrid'; // 使用混合路由
 import modelsRouter from './routes/models';
 import completeRouter from './routes/complete';
 import { router } from './routes';
@@ -59,7 +59,7 @@ app.get('/', (c) => {
 
 // 注册 API 路由
 app.route('/v1/models', modelsRouter);
-app.route('/v1/messages', messagesRouter);
+app.route('/v1/messages', hybridMessagesRouter); // 使用混合路由
 app.route('/v1/complete', completeRouter);
 app.route('/api', router); // 测试路由
 
