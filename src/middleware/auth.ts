@@ -23,7 +23,7 @@ export class AuthError extends Error {
 // 提取的认证信息
 export interface AuthInfo {
   token: string;
-  type: 'bearer';
+  type: 'bearer' | 'x-api-key';
 }
 
 /**
@@ -49,6 +49,34 @@ export function extractBearerToken(authHeader: string | undefined): string {
 }
 
 /**
+ * 提取认证 Token (支持多种格式)
+ * 优先级: x-api-key > Authorization (Bearer)
+ */
+export function extractAuthToken(c: Context): { token: string; type: 'bearer' | 'x-api-key' } {
+  // 1. 检查 x-api-key header (Anthropic 官方格式)
+  const xApiKey = c.req.header('x-api-key');
+  if (xApiKey?.trim()) {
+    return {
+      token: xApiKey.trim(),
+      type: 'x-api-key'
+    };
+  }
+
+  // 2. 检查 Authorization header (Bearer token)
+  const authHeader = c.req.header('authorization');
+  if (authHeader) {
+    const token = extractBearerToken(authHeader);
+    return {
+      token,
+      type: 'bearer'
+    };
+  }
+
+  // 3. 都没有，抛出错误
+  throw new AuthError('Missing authentication. Provide either "Authorization: Bearer <token>" or "x-api-key: <token>" header', 401, 'MISSING_AUTH');
+}
+
+/**
  * 认证中间件工厂函数
  * @param options 配置选项
  */
@@ -60,15 +88,16 @@ export function createAuthMiddleware(options: {
 
   return async function authMiddleware(c: Context, next: Next) {
     try {
-      const authHeader = c.req.header('authorization');
-      
+      // 检查是否提供了任何认证 header
+      const hasAuth = c.req.header('authorization') || c.req.header('x-api-key');
+
       // 如果不是必须认证且没有提供 header，则跳过
-      if (!required && !authHeader) {
+      if (!required && !hasAuth) {
         return await next();
       }
 
-      // 提取 token
-      const token = extractBearerToken(authHeader);
+      // 提取 token (支持 Bearer 和 x-api-key)
+      const { token, type } = extractAuthToken(c);
 
       // 验证 token (目前简单验证，后续可扩展)
       if (!isValidToken(token, allowDummy)) {
@@ -78,13 +107,13 @@ export function createAuthMiddleware(options: {
       // 将认证信息存储到 context
       c.set('auth', {
         token,
-        type: 'bearer' as const,
+        type,
       } satisfies AuthInfo);
 
       // 日志记录 (不记录完整 token)
       consola.debug('Auth successful:', {
         tokenPrefix: token.substring(0, 8) + '...',
-        type: 'bearer',
+        type,
       });
 
       await next();
