@@ -205,9 +205,15 @@ export function convertAnthropicToSiderSync(
     }
   }
 
+  // ⚠️ CRITICAL FIX: 检查是否是虚拟会话 ID
+  // "continuous-conversation" 是内部使用的虚拟 ID，不能发送给 Sider API
+  const actualCid = (conversationId && !isContinuousConversation(conversationId))
+    ? conversationId
+    : '';
+
   // 构建 Sider 请求
   const siderRequest: SiderRequest = {
-    cid: conversationId || '', // 使用真实的会话ID或空字符串
+    cid: actualCid, // 只使用真实的 Sider 会话ID，虚拟ID替换为空字符串
     parent_message_id: parentMessageId, // 使用真实的父消息ID
     model: siderModel,
     from: 'chat',
