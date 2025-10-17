@@ -50,16 +50,11 @@ export class AnthropicApiAdapter {
     const mappedModel = await this.mapModelName(request.model);
     const mappedRequest = { ...request, model: mappedModel };
 
-    // 如果请求是流式的,拒绝处理 (应该使用 sendStreamRequest)
-    if (mappedRequest.stream) {
-      throw new Error('Stream requests must use sendStreamRequest() method');
-    }
-
     console.info('🚀 Forwarding to Anthropic API:', {
       model: mappedRequest.model,
       messages: mappedRequest.messages.length,
       tools: mappedRequest.tools?.length || 0,
-      stream: false,
+      stream: mappedRequest.stream || false,
     });
 
     try {

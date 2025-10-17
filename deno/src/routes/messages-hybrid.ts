@@ -87,7 +87,16 @@ messagesRouter.post('/', async (c: Context) => {
         }
 
         console.log('ℹ️ ' + `🤖 Using Anthropic API`);
-        response = await anthropicAdapter.sendRequest(anthropicRequest);
+
+        // 根据请求类型选择合适的方法
+        if (anthropicRequest.stream) {
+          // Anthropic 原生 API 不支持流式请求,将 stream 标志设为 false
+          // SSE 流式响应由 createStreamingResponse 函数模拟实现
+          const nonStreamRequest = { ...anthropicRequest, stream: false };
+          response = await anthropicAdapter.sendRequest(nonStreamRequest);
+        } else {
+          response = await anthropicAdapter.sendRequest(anthropicRequest);
+        }
 
         // 记录后端选择
         if (conversationId) {
@@ -159,7 +168,11 @@ messagesRouter.post('/', async (c: Context) => {
 
         try {
           if (fallbackBackend === 'anthropic' && anthropicAdapter) {
-            response = await anthropicAdapter.sendRequest(anthropicRequest);
+            // 降级到 Anthropic 时也要处理流式请求
+            const requestToSend = anthropicRequest.stream
+              ? { ...anthropicRequest, stream: false }
+              : anthropicRequest;
+            response = await anthropicAdapter.sendRequest(requestToSend);
             selectedBackend = 'anthropic';
             if (conversationId) {
               routerEngine.recordSessionBackend(conversationId, 'anthropic');
