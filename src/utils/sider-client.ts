@@ -190,7 +190,7 @@ export class SiderClient {
 
       try {
         const data = JSON.parse(dataStr) as SiderSSEResponse;
-        consola.debug('Parsed SSE data:', { type: data.data?.type, hasText: !!(data.data as any)?.text });
+        // consola.debug('Parsed SSE data:', { type: data.data?.type, hasText: !!(data.data as any)?.text });
         
         if (data.code !== 0) {
           consola.warn('Sider API warning:', { code: data.code, msg: data.msg });
@@ -257,7 +257,7 @@ export class SiderClient {
           case 'text':
             // 最终文本内容
             if (data.data.text) {
-              consola.debug('Adding text part:', data.data.text);
+              // consola.debug('Adding text part:', data.data.text);
               result.textParts.push(data.data.text);
             } else {
               consola.debug('Received text event but no text content');
