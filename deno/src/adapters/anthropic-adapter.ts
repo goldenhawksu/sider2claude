@@ -5,7 +5,7 @@
 
 import type { AnthropicRequest, AnthropicResponse } from '../types/anthropic.ts';
 import type { AnthropicBackendConfig } from '../config/backends.ts';
-import { consola } // from 'consola';
+// Note: Using console instead of consola for Deno compatibility
 import { ModelMapper } from '../utils/model-mapper.ts';
 
 export class AnthropicApiAdapter {
