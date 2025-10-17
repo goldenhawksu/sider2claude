@@ -216,6 +216,10 @@ Sider API 返回 SSE 格式流，事件类型：
 - ⏳ 精确 Token 计算（使用 gpt-tokenizer）
 - ⏳ 真正的 SSE 流式响应（参考 copilot-api）
 
+**已知限制**：
+- ❌ MCP Server / invoke-agent 功能（详见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)）
+- ❌ Claude Code 的复杂工具调用工作流
+
 ## 调试技巧
 
 1. **查看会话状态**：
@@ -249,3 +253,4 @@ Sider API 返回 SSE 格式流，事件类型：
 - [README.md](README.md) - 项目介绍和快速开始
 - [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) - Claude Code CLI 集成指南
 - [shrimp-rules.md](shrimp-rules.md) - AI 代理开发规范和约束
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) - 已知限制和解决方案
