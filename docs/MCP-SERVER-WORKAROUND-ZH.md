@@ -41,7 +41,7 @@ claude code
 **简单任务(免费)**:
 ```bash
 export ANTHROPIC_BASE_URL=https://deno-sider2claude.deno.dev
-export ANTHROPIC_AUTH_TOKEN=sk-this-is-free-sider2claude-key
+export ANTHROPIC_AUTH_TOKEN=sk-this-is-free-sider-key
 ```
 
 **复杂任务(付费但功能全)**:
