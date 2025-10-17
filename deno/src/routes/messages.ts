@@ -7,13 +7,14 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { requireAuth, getAuthInfo } from '../middleware/auth.ts';
-import type { AnthropicRequest, AnthropicError } from '../types.ts';
-import { convertAnthropicToSider, convertAnthropicToSiderAsync, validateAnthropicRequest } from '../utils/request-converter.ts';
-import { siderClient } from '../utils/sider-client.ts';
-import { convertSiderToAnthropic, createErrorResponse, getSessionHeaders } from '../utils/response-converter.ts';
-import { getConversationStats, cleanupExpiredConversations } from '../utils/conversation-manager.ts';
-import { getSiderSessionStats, cleanupExpiredSiderSessions } from '../utils/sider-session-manager.ts';
+import { requireAuth, getAuthInfo } from '../middleware/auth';
+import type { AnthropicRequest, AnthropicError } from '../types';
+import { convertAnthropicToSider, convertAnthropicToSiderAsync, validateAnthropicRequest } from '../utils/request-converter';
+import { siderClient } from '../utils/sider-client';
+import { convertSiderToAnthropic, createErrorResponse, getSessionHeaders } from '../utils/response-converter';
+import { getConversationStats, cleanupExpiredConversations } from '../utils/conversation-manager';
+import { getSiderSessionStats, cleanupExpiredSiderSessions } from '../utils/sider-session-manager';
+import { consola } from 'consola';
 
 const messagesRouter = new Hono();
 
@@ -41,7 +42,7 @@ messagesRouter.post('/', async (c: Context) => {
     // 解析请求体
     const anthropicRequest = await c.req.json() as AnthropicRequest;
     
-    console.log('Received Anthropic API request:', {
+    consola.info('Received Anthropic API request:', {
       model: anthropicRequest.model,
       messageCount: anthropicRequest.messages?.length || 0,
       hasMaxTokens: !!anthropicRequest.max_tokens,
@@ -53,7 +54,7 @@ messagesRouter.post('/', async (c: Context) => {
 
     // 打印会话历史摘要（用于调试会话保持）
     if (anthropicRequest.messages.length > 1) {
-      console.log('Conversation history:', {
+      consola.info('Conversation history:', {
         totalMessages: anthropicRequest.messages.length,
         roles: anthropicRequest.messages.map(m => m.role),
         lastUserMessage: anthropicRequest.messages
@@ -77,40 +78,39 @@ messagesRouter.post('/', async (c: Context) => {
       if (hasAssistantMessage) {
         // 生成一个基于时间的会话ID，或者使用固定值表示连续对话
         conversationId = 'continuous-conversation';
-        console.log('Inferred continuous conversation from message history');
+        consola.info('Inferred continuous conversation from message history');
       }
     }
     
     // 2. 将 Anthropic 请求转换为 Sider 格式
     let siderRequest;
-
-    // ✅ 修复：只要提供了会话ID，就尝试获取历史（不再检查消息数量）
-    if (conversationId) {
+    
+    if (conversationId && anthropicRequest.messages.length > 1) {
       // 使用真正的 Sider 会话历史
-      console.log('Attempting to use real conversation history:', {
+      consola.info('Attempting to use real conversation history:', {
         conversationId: conversationId.substring(0, 10) + '...',
         messageCount: anthropicRequest.messages.length,
         hasParentMessageId: !!parentMessageId,
       });
-
+      
       try {
         siderRequest = await convertAnthropicToSiderAsync(
-          anthropicRequest,
-          auth.token,
+          anthropicRequest, 
+          auth.token, 
           conversationId
         );
-
+        
         // 如果客户端直接提供了父消息ID，优先使用客户端的
         if (parentMessageId) {
           siderRequest.parent_message_id = parentMessageId;
-          console.log('Using client-provided parent message ID:', {
+          consola.info('Using client-provided parent message ID:', {
             parentMessageId: parentMessageId.substring(0, 12) + '...',
           });
         }
       } catch (error) {
-        console.warn('Failed to get conversation history, using fallback:', error);
+        consola.warn('Failed to get conversation history, using fallback:', error);
         siderRequest = convertAnthropicToSider(anthropicRequest, conversationId);
-
+        
         // 如果客户端提供了父消息ID，使用它
         if (parentMessageId) {
           siderRequest.parent_message_id = parentMessageId;
@@ -119,19 +119,28 @@ messagesRouter.post('/', async (c: Context) => {
     } else {
       // 新会话或没有会话ID，使用基本模式
       siderRequest = convertAnthropicToSider(anthropicRequest, conversationId);
-
+      
       // 如果客户端提供了父消息ID，使用它（即使没有会话ID）
       if (parentMessageId) {
         siderRequest.parent_message_id = parentMessageId;
-        console.log('Using client-provided parent message ID for new conversation:', {
+        consola.info('Using client-provided parent message ID for new conversation:', {
           parentMessageId: parentMessageId.substring(0, 12) + '...',
         });
       }
     }
 
     // 3. 调用 Sider API
-    console.log('Calling Sider API...');
-    const siderResponse = await siderClient.chat(siderRequest, auth.token);
+    consola.info('Calling Sider API...');
+
+    // 使用环境变量中的 SIDER_AUTH_TOKEN (如果配置了),否则使用客户端提供的 token
+    const siderAuthToken = process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN') || auth.token;
+
+    consola.debug('Using Sider auth token:', {
+      fromEnv: !!(process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN')),
+      tokenPrefix: siderAuthToken.substring(0, 8) + '...'
+    });
+
+    const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
 
     // 4. 将 Sider 响应转换为 Anthropic 格式
     const anthropicResponse = convertSiderToAnthropic(siderResponse, anthropicRequest.model);
@@ -139,7 +148,7 @@ messagesRouter.post('/', async (c: Context) => {
     // 获取会话信息响应头
     const sessionHeaders = getSessionHeaders(siderResponse);
 
-    console.log('Request completed successfully:', {
+    consola.info('Request completed successfully:', {
       responseId: anthropicResponse.id,
       outputTokens: anthropicResponse.usage.output_tokens,
       isStreaming: !!anthropicRequest.stream,
@@ -163,7 +172,7 @@ messagesRouter.post('/', async (c: Context) => {
     }
 
   } catch (error) {
-    console.error('Messages API error:', error);
+    consola.error('Messages API error:', error);
     
     // 如果是验证错误，返回 400
     if (error instanceof Error && (
@@ -204,28 +213,7 @@ messagesRouter.post('/', async (c: Context) => {
 messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
     const body = await c.req.json();
-
-    // 验证必需字段
-    if (!body.model) {
-      return c.json({
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          message: 'Missing required field: model',
-        },
-      } satisfies AnthropicError, 400);
-    }
-
-    if (!body.messages || !Array.isArray(body.messages)) {
-      return c.json({
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          message: 'Missing required field: messages',
-        },
-      } satisfies AnthropicError, 400);
-    }
-
+    
     // 简单的 token 计数估算 (后续可以使用 gpt-tokenizer)
     const totalLength = JSON.stringify(body.messages || []).length;
     const estimatedTokens = Math.ceil(totalLength / 4); // 粗略估算
@@ -236,7 +224,7 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
 
   } catch (error) {
     console.error('Token count error:', error);
-
+    
     return c.json({
       type: 'error',
       error: {
@@ -254,7 +242,7 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
 function createStreamingResponse(_c: Context, response: any) {
   const text = response.content[0]?.text || '';
   
-  console.debug('Creating streaming response:', {
+  consola.debug('Creating streaming response:', {
     responseId: response.id,
     textLength: text.length,
     model: response.model
@@ -338,7 +326,7 @@ function createStreamingResponse(_c: Context, response: any) {
         }
 
       } catch (error) {
-        console.error('Streaming error:', error);
+        consola.error('Streaming error:', error);
         controller.error(error);
       }
     }
@@ -362,7 +350,7 @@ messagesRouter.get('/conversations', async (c: Context) => {
   try {
     const stats = getConversationStats();
     
-    console.log('Conversation stats requested:', {
+    consola.info('Conversation stats requested:', {
       totalConversations: stats.totalConversations,
       requestedBy: getAuthInfo(c)?.token?.substring(0, 20) + '...' || 'unknown'
     });
@@ -373,7 +361,7 @@ messagesRouter.get('/conversations', async (c: Context) => {
       conversations: stats
     });
   } catch (error) {
-    console.error('Failed to get conversation stats:', error);
+    consola.error('Failed to get conversation stats:', error);
     return c.json({ error: 'Failed to get conversation stats' }, 500);
   }
 });
@@ -383,7 +371,7 @@ messagesRouter.post('/conversations/cleanup', async (c: Context) => {
   try {
     const cleaned = cleanupExpiredConversations(1); // 清理1小时前的会话
     
-    console.log('Conversation cleanup completed:', {
+    consola.info('Conversation cleanup completed:', {
       cleanedCount: cleaned,
       requestedBy: getAuthInfo(c)?.token?.substring(0, 20) + '...' || 'unknown'
     });
@@ -394,7 +382,7 @@ messagesRouter.post('/conversations/cleanup', async (c: Context) => {
       cleanedConversations: cleaned
     });
   } catch (error) {
-    console.error('Failed to cleanup conversations:', error);
+    consola.error('Failed to cleanup conversations:', error);
     return c.json({ error: 'Failed to cleanup conversations' }, 500);
   }
 });
@@ -404,7 +392,7 @@ messagesRouter.get('/sider-sessions', async (c: Context) => {
   try {
     const stats = getSiderSessionStats();
     
-    console.log('Sider session stats requested:', {
+    consola.info('Sider session stats requested:', {
       totalSessions: stats.totalSessions,
       requestedBy: getAuthInfo(c)?.token?.substring(0, 20) + '...' || 'unknown'
     });
@@ -415,7 +403,7 @@ messagesRouter.get('/sider-sessions', async (c: Context) => {
       sider_sessions: stats
     });
   } catch (error) {
-    console.error('Failed to get Sider session stats:', error);
+    consola.error('Failed to get Sider session stats:', error);
     return c.json({ error: 'Failed to get Sider session stats' }, 500);
   }
 });
@@ -425,7 +413,7 @@ messagesRouter.post('/sider-sessions/cleanup', async (c: Context) => {
   try {
     const cleaned = cleanupExpiredSiderSessions(2); // 清理2小时前的会话
     
-    console.log('Sider session cleanup completed:', {
+    consola.info('Sider session cleanup completed:', {
       cleanedCount: cleaned,
       requestedBy: getAuthInfo(c)?.token?.substring(0, 20) + '...' || 'unknown'
     });
@@ -436,7 +424,7 @@ messagesRouter.post('/sider-sessions/cleanup', async (c: Context) => {
       cleanedSiderSessions: cleaned
     });
   } catch (error) {
-    console.error('Failed to cleanup Sider sessions:', error);
+    consola.error('Failed to cleanup Sider sessions:', error);
     return c.json({ error: 'Failed to cleanup Sider sessions' }, 500);
   }
 });

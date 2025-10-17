@@ -131,7 +131,16 @@ messagesRouter.post('/', async (c: Context) => {
 
     // 3. 调用 Sider API
     consola.info('Calling Sider API...');
-    const siderResponse = await siderClient.chat(siderRequest, auth.token);
+
+    // 使用环境变量中的 SIDER_AUTH_TOKEN (如果配置了),否则使用客户端提供的 token
+    const siderAuthToken = process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN') || auth.token;
+
+    consola.debug('Using Sider auth token:', {
+      fromEnv: !!(process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN')),
+      tokenPrefix: siderAuthToken.substring(0, 8) + '...'
+    });
+
+    const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
 
     // 4. 将 Sider 响应转换为 Anthropic 格式
     const anthropicResponse = convertSiderToAnthropic(siderResponse, anthropicRequest.model);

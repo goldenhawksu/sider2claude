@@ -6,6 +6,7 @@
  */
 
 import type { Context, Next } from 'hono';
+import { consola } from 'consola';
 
 // 认证错误类型
 export class AuthError extends Error {
@@ -81,7 +82,7 @@ export function createAuthMiddleware(options: {
       } satisfies AuthInfo);
 
       // 日志记录 (不记录完整 token)
-      console.debug('Auth successful:', {
+      consola.debug('Auth successful:', {
         tokenPrefix: token.substring(0, 8) + '...',
         type: 'bearer',
       });
@@ -89,7 +90,7 @@ export function createAuthMiddleware(options: {
       await next();
     } catch (error) {
       if (error instanceof AuthError) {
-        console.warn('Authentication failed:', {
+        consola.warn('Authentication failed:', {
           code: error.code,
           message: error.message,
         });
@@ -104,7 +105,7 @@ export function createAuthMiddleware(options: {
       }
 
       // 其他错误
-      console.error('Auth middleware error:', error);
+      consola.error('Auth middleware error:', error);
       return c.json({
         error: {
           type: 'api_error',
@@ -121,6 +122,16 @@ export function createAuthMiddleware(options: {
  * @param allowDummy 是否允许 dummy token
  */
 function isValidToken(token: string, allowDummy: boolean): boolean {
+  // 从环境变量获取有效的 AUTH_TOKEN
+  const validAuthToken = process.env.AUTH_TOKEN || Bun?.env?.AUTH_TOKEN || Deno?.env?.get?.('AUTH_TOKEN');
+
+  // 如果环境变量中配置了 AUTH_TOKEN,则必须匹配
+  if (validAuthToken) {
+    return token === validAuthToken;
+  }
+
+  // 向后兼容: 如果没有配置 AUTH_TOKEN,使用旧的验证逻辑
+
   // Claude Code 使用 "dummy" token
   if (allowDummy && token === 'dummy') {
     return true;
@@ -133,7 +144,7 @@ function isValidToken(token: string, allowDummy: boolean): boolean {
 
   // 这里可以添加更复杂的 token 验证逻辑
   // 例如: JWT 验证、数据库查询等
-  
+
   return true;
 }
 

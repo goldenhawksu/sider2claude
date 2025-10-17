@@ -122,6 +122,16 @@ export function createAuthMiddleware(options: {
  * @param allowDummy 是否允许 dummy token
  */
 function isValidToken(token: string, allowDummy: boolean): boolean {
+  // 从环境变量获取有效的 AUTH_TOKEN
+  const validAuthToken = process.env.AUTH_TOKEN || Bun?.env?.AUTH_TOKEN || Deno?.env?.get?.('AUTH_TOKEN');
+
+  // 如果环境变量中配置了 AUTH_TOKEN,则必须匹配
+  if (validAuthToken) {
+    return token === validAuthToken;
+  }
+
+  // 向后兼容: 如果没有配置 AUTH_TOKEN,使用旧的验证逻辑
+
   // Claude Code 使用 "dummy" token
   if (allowDummy && token === 'dummy') {
     return true;
@@ -134,7 +144,7 @@ function isValidToken(token: string, allowDummy: boolean): boolean {
 
   // 这里可以添加更复杂的 token 验证逻辑
   // 例如: JWT 验证、数据库查询等
-  
+
   return true;
 }
 
