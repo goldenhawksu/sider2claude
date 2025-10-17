@@ -97,7 +97,7 @@ export class AnthropicApiAdapter {
         throw new Error(`Anthropic API error: ${response.status} ${response.statusText}`);
       }
 
-      const data = await response.json() as AnthropicResponse;
+      const data = await response.json() as any;
 
       // 验证响应结构并防御性处理
       if (!data || typeof data !== 'object') {
@@ -106,6 +106,29 @@ export class AnthropicApiAdapter {
           elapsed: `${elapsed}ms`,
         });
         throw new Error('Invalid response format from Anthropic API');
+      }
+
+      // 检查是否为错误响应 (第三方 API 可能返回 200 + 错误对象)
+      if ('error' in data || 'LocalError' in data) {
+        const errorMsg = data.error?.message || data.LocalError || data.error || 'Unknown API error';
+        console.error('❌ Anthropic API returned error:', {
+          error: errorMsg,
+          statusCode: data.status_code,
+          responseKeys: Object.keys(data),
+          elapsed: `${elapsed}ms`,
+        });
+        throw new Error(`Anthropic API error: ${errorMsg}`);
+      }
+
+      // 验证必需字段存在
+      if (!data.content || !Array.isArray(data.content)) {
+        console.error('❌ Response missing required content array:', {
+          hasContent: !!data.content,
+          contentType: typeof data.content,
+          responseKeys: Object.keys(data),
+          elapsed: `${elapsed}ms`,
+        });
+        throw new Error('Anthropic API response missing content array');
       }
 
       // 防御性访问响应字段
@@ -118,22 +141,13 @@ export class AnthropicApiAdapter {
         elapsed: `${elapsed}ms`,
       };
 
-      // 如果缺少关键字段,记录警告
-      if (!data.content || !Array.isArray(data.content)) {
-        console.warn('⚠️ Response missing content array:', {
-          hasContent: !!data.content,
-          contentType: typeof data.content,
-          responseKeys: Object.keys(data),
-        });
-      }
-
       if (!data.usage) {
         console.warn('⚠️ Response missing usage information');
       }
 
       console.log('✅ Anthropic API response:', responseInfo);
 
-      return data;
+      return data as AnthropicResponse;
 
     } catch (error) {
       const elapsed = Date.now() - startTime;
