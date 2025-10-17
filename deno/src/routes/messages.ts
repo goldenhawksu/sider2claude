@@ -7,13 +7,13 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { requireAuth, getAuthInfo } from '../middleware/auth';
-import type { AnthropicRequest, AnthropicError } from '../types';
-import { convertAnthropicToSider, convertAnthropicToSiderAsync, validateAnthropicRequest } from '../utils/request-converter';
-import { siderClient } from '../utils/sider-client';
-import { convertSiderToAnthropic, createErrorResponse, getSessionHeaders } from '../utils/response-converter';
-import { getConversationStats, cleanupExpiredConversations } from '../utils/conversation-manager';
-import { getSiderSessionStats, cleanupExpiredSiderSessions } from '../utils/sider-session-manager';
+import { requireAuth, getAuthInfo } from '../middleware/auth.ts';
+import type { AnthropicRequest, AnthropicError } from '../types/index.ts';
+import { convertAnthropicToSider, convertAnthropicToSiderAsync, validateAnthropicRequest } from '../utils/request-converter.ts';
+import { siderClient } from '../utils/sider-client.ts';
+import { convertSiderToAnthropic, createErrorResponse, getSessionHeaders } from '../utils/response-converter.ts';
+import { getConversationStats, cleanupExpiredConversations } from '../utils/conversation-manager.ts';
+import { getSiderSessionStats, cleanupExpiredSiderSessions } from '../utils/sider-session-manager.ts';
 import { consola } from 'consola';
 
 const messagesRouter = new Hono();
