@@ -1,10 +1,32 @@
 /**
- * Anthropic API 适配器 (Deno 版本)
+ * Anthropic API 适配器
  * 透传请求到官方 Anthropic API
  */
 
 import type { AnthropicRequest, AnthropicResponse } from '../types/anthropic.ts';
 import type { AnthropicBackendConfig } from '../config/backends.ts';
+
+
+// 模型名称映射 - 将 Claude Code 标准名称映射到第三方 API 支持的名称
+const MODEL_MAPPING: Record<string, string> = {
+  // Claude 4.5 系列
+  'claude-4.5-sonnet': 'claude-sonnet-4-5-20250929',
+  'claude-4-5-sonnet': 'claude-sonnet-4-5-20250929',
+  'claude-sonnet-4.5': 'claude-sonnet-4-5-20250929',
+
+  // Claude 3.5 系列
+  'claude-3.5-sonnet': 'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet-latest': 'claude-3-5-sonnet-20241022',
+
+  // Claude 3 系列保持不变
+  'claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20241022',
+  'claude-3-opus-20240229': 'claude-3-opus-20240229',
+  'claude-3-haiku-20240307': 'claude-3-haiku-20240307',
+
+  // Claude Haiku 4.5
+  'claude-haiku-4.5': 'claude-haiku-4-5-20251001',
+  'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+};
 
 export class AnthropicApiAdapter {
   private baseUrl: string;
@@ -16,16 +38,42 @@ export class AnthropicApiAdapter {
   }
 
   /**
+   * 映射模型名称 - 将标准模型名映射到 API 支持的名称
+   */
+  private mapModelName(model: string): string {
+    // 如果是官方 API,不进行映射
+    if (this.baseUrl.includes('anthropic.com')) {
+      return model;
+    }
+
+    // 使用映射表
+    const mapped = MODEL_MAPPING[model];
+    if (mapped && mapped !== model) {
+      console.info('🔄 Model name mapped:', {
+        from: model,
+        to: mapped,
+      });
+      return mapped;
+    }
+
+    return model;
+  }
+
+  /**
    * 透传请求到官方 Anthropic API
    */
   async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
     const startTime = Date.now();
 
-    console.log('ℹ️ 🚀 Forwarding to Anthropic API:', {
-      model: request.model,
-      messages: request.messages.length,
-      tools: request.tools?.length || 0,
-      stream: request.stream || false,
+    // 映射模型名称
+    const mappedModel = this.mapModelName(request.model);
+    const mappedRequest = { ...request, model: mappedModel };
+
+    console.info('🚀 Forwarding to Anthropic API:', {
+      model: mappedRequest.model,
+      messages: mappedRequest.messages.length,
+      tools: mappedRequest.tools?.length || 0,
+      stream: mappedRequest.stream || false,
     });
 
     try {
@@ -52,7 +100,7 @@ export class AnthropicApiAdapter {
       const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(request),
+        body: JSON.stringify(mappedRequest),
       });
 
       const elapsed = Date.now() - startTime;
@@ -102,7 +150,7 @@ export class AnthropicApiAdapter {
         console.warn('⚠️ Response missing usage information');
       }
 
-      console.log('✅ Anthropic API response:', responseInfo);
+      console.success('✅ Anthropic API response:', responseInfo);
 
       return data;
 
@@ -117,9 +165,9 @@ export class AnthropicApiAdapter {
   }
 
   /**
-   * 流式请求支持(可选实现)
+   * 流式请求支持（可选实现）
    *
-   * 注意:流式响应需要特殊处理,当前先实现非流式版本
+   * 注意：流式响应需要特殊处理，当前先实现非流式版本
    * 未来可以扩展支持 SSE 流式响应
    */
   async sendStreamRequest(
@@ -128,9 +176,13 @@ export class AnthropicApiAdapter {
     onComplete: () => void,
     onError: (error: Error) => void
   ): Promise<void> {
-    console.log('ℹ️ 🌊 Streaming to Anthropic API (SSE)');
+    console.info('🌊 Streaming to Anthropic API (SSE)');
 
     try {
+      // 映射模型名称
+      const mappedModel = this.mapModelName(request.model);
+      const mappedRequest = { ...request, model: mappedModel, stream: true };
+
       const isOfficialApi = this.baseUrl.includes('anthropic.com');
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -150,7 +202,7 @@ export class AnthropicApiAdapter {
       const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ ...request, stream: true }),
+        body: JSON.stringify(mappedRequest),
       });
 
       if (!response.ok) {
@@ -221,7 +273,7 @@ export class AnthropicApiAdapter {
         headers['X-Client-Version'] = '1.0.0';
       }
 
-      // 简单的健康检查:尝试访问 models 端点
+      // 简单的健康检查：尝试访问 models 端点
       const response = await fetch(`${this.baseUrl}/v1/models`, {
         method: 'GET',
         headers,

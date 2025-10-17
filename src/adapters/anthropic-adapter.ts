@@ -7,6 +7,27 @@ import type { AnthropicRequest, AnthropicResponse } from '../types/anthropic';
 import type { AnthropicBackendConfig } from '../config/backends';
 import { consola } from 'consola';
 
+// 模型名称映射 - 将 Claude Code 标准名称映射到第三方 API 支持的名称
+const MODEL_MAPPING: Record<string, string> = {
+  // Claude 4.5 系列
+  'claude-4.5-sonnet': 'claude-sonnet-4-5-20250929',
+  'claude-4-5-sonnet': 'claude-sonnet-4-5-20250929',
+  'claude-sonnet-4.5': 'claude-sonnet-4-5-20250929',
+
+  // Claude 3.5 系列
+  'claude-3.5-sonnet': 'claude-3-5-sonnet-20241022',
+  'claude-3-5-sonnet-latest': 'claude-3-5-sonnet-20241022',
+
+  // Claude 3 系列保持不变
+  'claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20241022',
+  'claude-3-opus-20240229': 'claude-3-opus-20240229',
+  'claude-3-haiku-20240307': 'claude-3-haiku-20240307',
+
+  // Claude Haiku 4.5
+  'claude-haiku-4.5': 'claude-haiku-4-5-20251001',
+  'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
+};
+
 export class AnthropicApiAdapter {
   private baseUrl: string;
   private apiKey: string;
@@ -17,16 +38,42 @@ export class AnthropicApiAdapter {
   }
 
   /**
+   * 映射模型名称 - 将标准模型名映射到 API 支持的名称
+   */
+  private mapModelName(model: string): string {
+    // 如果是官方 API,不进行映射
+    if (this.baseUrl.includes('anthropic.com')) {
+      return model;
+    }
+
+    // 使用映射表
+    const mapped = MODEL_MAPPING[model];
+    if (mapped && mapped !== model) {
+      consola.info('🔄 Model name mapped:', {
+        from: model,
+        to: mapped,
+      });
+      return mapped;
+    }
+
+    return model;
+  }
+
+  /**
    * 透传请求到官方 Anthropic API
    */
   async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
     const startTime = Date.now();
 
+    // 映射模型名称
+    const mappedModel = this.mapModelName(request.model);
+    const mappedRequest = { ...request, model: mappedModel };
+
     consola.info('🚀 Forwarding to Anthropic API:', {
-      model: request.model,
-      messages: request.messages.length,
-      tools: request.tools?.length || 0,
-      stream: request.stream || false,
+      model: mappedRequest.model,
+      messages: mappedRequest.messages.length,
+      tools: mappedRequest.tools?.length || 0,
+      stream: mappedRequest.stream || false,
     });
 
     try {
@@ -53,7 +100,7 @@ export class AnthropicApiAdapter {
       const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(request),
+        body: JSON.stringify(mappedRequest),
       });
 
       const elapsed = Date.now() - startTime;
@@ -132,6 +179,10 @@ export class AnthropicApiAdapter {
     consola.info('🌊 Streaming to Anthropic API (SSE)');
 
     try {
+      // 映射模型名称
+      const mappedModel = this.mapModelName(request.model);
+      const mappedRequest = { ...request, model: mappedModel, stream: true };
+
       const isOfficialApi = this.baseUrl.includes('anthropic.com');
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -151,7 +202,7 @@ export class AnthropicApiAdapter {
       const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ ...request, stream: true }),
+        body: JSON.stringify(mappedRequest),
       });
 
       if (!response.ok) {
