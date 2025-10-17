@@ -6,7 +6,6 @@
  */
 
 import type { Context, Next } from 'hono';
-import { consola } from 'consola';
 
 // 认证错误类型
 export class AuthError extends Error {
@@ -111,7 +110,7 @@ export function createAuthMiddleware(options: {
       } satisfies AuthInfo);
 
       // 日志记录 (不记录完整 token)
-      consola.debug('Auth successful:', {
+      console.log('⚙️ Auth successful:', {
         tokenPrefix: token.substring(0, 8) + '...',
         type,
       });
@@ -119,7 +118,7 @@ export function createAuthMiddleware(options: {
       await next();
     } catch (error) {
       if (error instanceof AuthError) {
-        consola.warn('Authentication failed:', {
+        console.warn('⚠️ Authentication failed:', {
           code: error.code,
           message: error.message,
         });
@@ -134,7 +133,7 @@ export function createAuthMiddleware(options: {
       }
 
       // 其他错误
-      consola.error('Auth middleware error:', error);
+      console.error('❌ Auth middleware error:', error);
       return c.json({
         error: {
           type: 'api_error',
@@ -151,8 +150,8 @@ export function createAuthMiddleware(options: {
  * @param allowDummy 是否允许 dummy token
  */
 function isValidToken(token: string, allowDummy: boolean): boolean {
-  // 从环境变量获取有效的 AUTH_TOKEN
-  const validAuthToken = process.env.AUTH_TOKEN || Bun?.env?.AUTH_TOKEN || Deno?.env?.get?.('AUTH_TOKEN');
+  // 从环境变量获取有效的 AUTH_TOKEN (Deno 版本)
+  const validAuthToken = Deno.env.get('AUTH_TOKEN');
 
   // 如果环境变量中配置了 AUTH_TOKEN,则必须匹配
   if (validAuthToken) {
