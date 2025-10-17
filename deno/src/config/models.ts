@@ -132,13 +132,13 @@ export function mapModelName(anthropicModel: string): string {
     return anthropicModel;
   }
 
-  // 默认返回 claude-3.7-sonnet-think
+  // 默认返回 claude-4.5-sonnet-think
   console.warn('Unknown model, using default:', {
     requested: anthropicModel,
-    fallback: 'claude-3.7-sonnet-think',
+    fallback: 'claude-4.5-sonnet-think',
   });
 
-  return 'claude-3.7-sonnet-think';
+  return 'claude-4.5-sonnet-think';
 }
 
 /**
