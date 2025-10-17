@@ -3,16 +3,16 @@
  * 自动从 API 端点获取模型列表并建立智能映射
  */
 
-import { consola } // from 'consola';
+// Deno 兼容: 使用 console 代替 consola
 
-interface ModelInfo {
+export interface ModelInfo {
   id: string;
   object: string;
   created: number;
   owned_by: string;
 }
 
-interface ModelsListResponse {
+export interface ModelsListResponse {
   data: ModelInfo[];
   object: string;
 }
@@ -121,7 +121,7 @@ export class ModelMapper {
         console.warn('⚠️  No models found, using fallback mapping');
         this.initializeFallbackMapping();
       } else {
-        console.success(`✅ Found ${models.length} available models`);
+        console.log(`✅ Found ${models.length} available models`);
         models.forEach(model => this.availableModels.add(model.id));
 
         // 打印 Claude 模型
