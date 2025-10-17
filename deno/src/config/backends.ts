@@ -130,3 +130,17 @@ function maskToken(token: string): string {
   if (token.length <= 10) return '***';
   return `${token.substring(0, 10)}...${token.substring(token.length - 4)}`;
 }
+
+/**
+ * 获取后端显示名称
+ */
+export function getBackendDisplayName(backend: Backend): string {
+  return backend === 'sider' ? 'Sider AI' : 'Anthropic API';
+}
+
+/**
+ * 检查后端是否可用
+ */
+export function isBackendAvailable(config: BackendConfig, backend: Backend): boolean {
+  return backend === 'sider' ? config.sider.enabled : config.anthropic.enabled;
+}
