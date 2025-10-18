@@ -55,11 +55,11 @@ export function convertAnthropicToSider(
     output_language: 'zh-CN'
   };
 
-  // 3. 如果是多轮对话且有会话ID，尝试获取父消息ID
-  if (conversationId && anthropicRequest.messages.length > 1) {
+  // 3. ✅ 修复：只要有会话ID就尝试获取父消息ID（不再检查消息数量）
+  if (conversationId) {
     try {
       let parentMessageId = '';
-      
+
       if (isContinuousConversation(conversationId)) {
         // 连续对话会话，获取或创建会话状态
         const session = getOrCreateContinuousSession();
@@ -70,7 +70,7 @@ export function convertAnthropicToSider(
         // 真实会话ID，尝试获取父消息ID
         parentMessageId = getNextParentMessageId(conversationId);
       }
-      
+
       if (parentMessageId) {
         siderRequest.parent_message_id = parentMessageId;
         console.log('Using existing conversation with parent message ID:', {

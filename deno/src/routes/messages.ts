@@ -85,7 +85,8 @@ messagesRouter.post('/', async (c: Context) => {
     // 2. 将 Anthropic 请求转换为 Sider 格式
     let siderRequest;
     
-    if (conversationId && anthropicRequest.messages.length > 1) {
+    // ✅ 修复：只要有会话ID就尝试使用异步版本获取历史，不再检查消息数量
+    if (conversationId) {
       // 使用真正的 Sider 会话历史
       consola.info('Attempting to use real conversation history:', {
         conversationId: conversationId.substring(0, 10) + '...',

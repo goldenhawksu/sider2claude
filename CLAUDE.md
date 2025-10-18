@@ -4,128 +4,249 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-**Sider2Claude** 是一个 API 代理服务，将 Sider AI API 转换为完全兼容 Anthropic API 格式的服务，专门为 Claude Code CLI 提供支持。
+**Sider2Claude** 是一个 API 代理服务，将 Sider AI API 转换为完全兼容 Anthropic API 格式的服务，专门为 Claude Code CLI 和其他 Anthropic 客户端提供支持。
 
 **核心技术栈**：
-- **运行时**: Bun v1.0+（高性能 JavaScript 运行时）
+- **运行时**: Bun v1.0+ / Deno（双运行时支持）
 - **Web 框架**: Hono（轻量级、高性能）
 - **语言**: TypeScript（完全类型安全）
-- **构建工具**: tsup
+- **构建工具**: tsup（Bun 版本）
 
 ## 开发命令
 
 ```bash
-# 开发
-bun run dev                    # 开发模式（热重载，监听端口 4141）
+# Bun 运行时
+bun run dev                    # 开发模式 (热重载, 端口 4141)
 bun run build                  # 构建生产版本到 dist/
 bun run start                  # 启动生产版本
 bun run lint                   # ESLint 代码检查
 bun run typecheck              # TypeScript 类型检查
 
-# 依赖管理
-bun install                    # 安装依赖（推荐使用 Bun）
-npm install                    # 或使用 npm
+# Deno 运行时
+cd deno
+deno task dev                  # 开发模式 (端口 4142)
+deno task start                # 生产模式
 
-# 快速测试
-curl http://localhost:4141/health                    # 健康检查
-curl -X POST http://localhost:4141/v1/messages \
-  -H "Authorization: Bearer dummy" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-3.7-sonnet","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}'
+# 测试
+cd test
+bun run quick-test.ts          # 快速测试
+./run-tests.sh all             # 完整测试套件 (Linux/macOS)
+run-tests.bat all              # 完整测试套件 (Windows)
 ```
 
 ## 核心架构
 
-### 1. 会话保持机制（最重要）
+### 1. 双层认证机制
 
-项目实现了两层会话管理，确保多轮对话的上下文连续性：
+项目实现了双层认证，确保安全性和灵活性：
+
+**架构流程**：
+```
+客户端 (Bearer Token: AUTH_TOKEN)
+    ↓ 验证
+中间件 (requireAuth)
+    ↓ 通过
+API 处理 (使用 SIDER_AUTH_TOKEN)
+    ↓ 调用
+Sider AI API
+```
+
+**环境变量**：
+- `AUTH_TOKEN`: 客户端认证 Token（自定义，供 Claude Code 使用）
+- `SIDER_AUTH_TOKEN`: Sider AI 的 JWT Token（从 sider.ai 获取，以 `eyJhbGci` 开头）
+
+**关键代码**：[src/middleware/auth.ts](src/middleware/auth.ts)
+
+### 2. 会话管理（两层机制）
+
+项目实现了智能会话管理，确保多轮对话的上下文连续性：
 
 **优先方案 - 真实会话**：
 - 使用 `convertAnthropicToSiderAsync()` 从 Sider 获取完整会话历史
 - 会话 ID 通过 `cid` query 参数或 `X-Conversation-ID` header 传递
-- 在 SSE `message_start` 事件中捕获真实的 `cid` 和 `parent_message_id`
-- 存储在 `siderSessionStore`（内存）
+- 在 SSE `message_start` 事件中捕获真实的 `cid`、`user_message_id`、`assistant_message_id`
+- 存储在 `siderSessionStore`（内存 Map）
 
-**降级方案 - 本地会话**：
-- 当获取真实历史失败时，使用 `convertAnthropicToSiderSync()`
-- 基于消息内容指纹识别会话
-- 存储在 `conversationStore`（内存）
+**降级方案 - 本地简化会话**：
+- 当获取真实历史失败时，使用 `convertAnthropicToSider()`
+- 从请求中提取最后用户消息和最近历史（最多 2 轮）
+- 使用 `getNextParentMessageId()` 获取父消息 ID
+
+**特殊会话 - 连续对话**：
+- 当检测到多轮对话但无明确会话 ID 时，自动创建 `continuous-conversation` 会话
+- 通过 `getOrCreateContinuousSession()` 维护连续对话状态
+- 自动更新 `assistantMessageId` 作为下次请求的 `parent_message_id`
 
 **关键文件**：
 - [src/utils/sider-session-manager.ts](src/utils/sider-session-manager.ts) - 真实会话管理
-- [src/utils/conversation-manager.ts](src/utils/conversation-manager.ts) - 本地会话管理
+- [src/utils/conversation-manager.ts](src/utils/conversation-manager.ts) - 本地会话管理（降级）
 - [src/utils/request-converter.ts](src/utils/request-converter.ts) - 转换逻辑
+- [src/utils/sider-conversation.ts](src/utils/sider-conversation.ts) - Sider 会话历史获取
 
-### 2. API 流转流程
+### 3. API 流转流程
 
 ```
 客户端请求 (Anthropic 格式)
     ↓
-中间件认证 (Bearer Token)
+中间件认证 (Bearer Token = AUTH_TOKEN)
     ↓
 请求转换 (Anthropic → Sider 格式)
-    ├─ convertAnthropicToSiderAsync() [优先：多轮对话]
-    └─ convertAnthropicToSiderSync() [降级：新会话]
+    ├─ convertAnthropicToSiderAsync() [优先：多轮对话，获取真实历史]
+    └─ convertAnthropicToSider() [降级：新会话或历史获取失败]
     ↓
-Sider API 调用 (SSE 流式)
+Sider API 调用 (使用 SIDER_AUTH_TOKEN, SSE 流式)
     ↓
-SSE 事件解析
-    ├─ message_start → 捕获会话 ID
+SSE 事件解析（实时处理）
+    ├─ credit_info → 配额信息（记录）
+    ├─ message_start → 捕获会话 ID ⭐ 关键
     ├─ reasoning_content → 推理内容（think 模型）
     ├─ text → 最终文本内容
-    └─ tool_call_* → 工具调用事件
+    └─ tool_call_* → 工具调用事件序列
     ↓
 响应转换 (Sider → Anthropic 格式)
     ↓
 客户端响应 + 会话信息响应头
 ```
 
-### 3. 模块职责
+### 4. SSE 流式响应处理
+
+**Sider API 的 SSE 事件类型** ([src/utils/sider-client.ts:175-377](src/utils/sider-client.ts)):
+
+| 事件类型 | 描述 | 处理逻辑 |
+|---------|------|---------|
+| `credit_info` | 配额信息 | 记录日志，不处理 |
+| `message_start` | 消息开始 | **捕获 `cid`、`user_message_id`、`assistant_message_id`** 并保存到会话管理器 |
+| `reasoning_content` | 推理过程 | 保存到 `reasoningParts[]`（think 模型专用） |
+| `text` | 文本内容 | 保存到 `textParts[]`（主要响应内容） |
+| `tool_call_start` | 工具调用开始 | 初始化工具调用记录 |
+| `tool_call_progress` | 工具调用进行中 | 更新工具状态 |
+| `tool_call_result` | 工具调用结果 | 保存最终结果和错误信息 |
+
+**客户端流式响应** ([src/routes/messages.ts:242-346](src/routes/messages.ts)):
+
+当客户端请求 `stream: true` 时，返回标准 Anthropic SSE 格式：
+```
+data: {"type":"message_start",...}
+data: {"type":"content_block_start",...}
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
+...
+data: {"type":"content_block_stop",...}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},...}
+data: {"type":"message_stop"}
+```
+
+**注意**：当前实现为按词分割发送（每 150ms 一个词），用于演示流式效果。
+
+### 5. 模型映射系统
+
+**独立配置**：[src/config/models.ts](src/config/models.ts)
+
+支持的模型及映射关系：
+
+| Anthropic 模型 | Sider 模型 | 说明 |
+|---------------|-----------|------|
+| `claude-3.7-sonnet` | `claude-3.7-sonnet` | Claude 3.7 标准版 |
+| `claude-3-7-sonnet` | `claude-3.7-sonnet-think` | Claude 3.7 思考版 |
+| `claude-4-sonnet` | `claude-4-sonnet` | Claude 4 标准版 |
+| `claude-4-sonnet-think` | `claude-4-sonnet-think` | Claude 4 思考版 |
+| `claude-4.5-sonnet` | `claude-4.5-sonnet` | Claude 4.5 标准版 |
+| `claude-4.5-sonnet-think` | `claude-4.5-sonnet-think` | Claude 4.5 思考版 ⭐ |
+| `claude-haiku-4.5` | `claude-haiku-4.5` | Haiku 4.5 标准版 |
+| `claude-4.1-opus` | `claude-4.1-opus` | Opus 4.1 标准版 |
+
+**默认降级**：未知模型映射到 `claude-3.7-sonnet-think`
+
+**API 端点**：`GET /v1/models` - 列出所有支持的模型
+
+### 6. 工具调用功能
+
+**状态**：✅ 完整实现并启用
+
+**工具转换** ([src/utils/request-converter.ts:333-398](src/utils/request-converter.ts)):
+
+```typescript
+// Anthropic 工具格式 → Sider 工具格式
+buildSafeToolsConfig(anthropicRequest) → SiderTools
+
+// 支持的工具映射
+{
+  'web_search' → 'search',
+  'create_image' → 'create_image',
+  'web_browse' → 'web_browse'
+}
+```
+
+**工具调用流程**：
+```
+1. tool_call_start → 初始化工具记录 (toolResults[])
+2. tool_call_progress → 更新状态和进度
+3. tool_call_result → 保存最终结果或错误
+4. 转换为 Anthropic 格式返回客户端
+```
+
+**关键数据结构**：
+```typescript
+interface SiderParsedResponse {
+  reasoningParts: string[];
+  textParts: string[];
+  toolResults?: ToolResult[];  // 工具调用结果数组
+  model: string;
+  conversationId?: string;
+  messageIds?: { user: string; assistant: string };
+}
+```
+
+### 7. 模块职责
 
 **核心路由** ([src/routes/messages.ts](src/routes/messages.ts)):
 - `POST /v1/messages` - 主 API 端点（Anthropic 兼容）
 - `POST /v1/messages/count_tokens` - Token 计数
-- `GET/POST /v1/messages/conversations` - 本地会话管理
-- `GET/POST /v1/messages/sider-sessions` - Sider 会话管理
+- `GET /v1/messages/conversations` - 本地会话统计
+- `POST /v1/messages/conversations/cleanup` - 清理过期本地会话
+- `GET /v1/messages/sider-sessions` - Sider 会话统计
+- `POST /v1/messages/sider-sessions/cleanup` - 清理过期 Sider 会话
+
+**其他路由**:
+- [src/routes/models.ts](src/routes/models.ts) - `GET /v1/models` - 列出支持的模型
+- [src/routes/health.ts](src/routes/health.ts) - `GET /health` - 健康检查
 
 **类型定义**:
-- [src/types/anthropic.ts](src/types/anthropic.ts) - Anthropic API 完整类型
-- [src/types/sider.ts](src/types/sider.ts) - Sider API 类型
+- [src/types/anthropic.ts](src/types/anthropic.ts) - Anthropic API 完整类型（messages, tools, streaming）
+- [src/types/sider.ts](src/types/sider.ts) - Sider API 类型（request, SSE response）
 
 **工具函数**:
-- [src/utils/request-converter.ts](src/utils/request-converter.ts) - 请求格式转换
-- [src/utils/response-converter.ts](src/utils/response-converter.ts) - 响应格式转换
-- [src/utils/sider-client.ts](src/utils/sider-client.ts) - Sider HTTP 客户端
+- [src/utils/request-converter.ts](src/utils/request-converter.ts) - 请求格式转换（Anthropic → Sider）
+- [src/utils/response-converter.ts](src/utils/response-converter.ts) - 响应格式转换（Sider → Anthropic）
+- [src/utils/sider-client.ts](src/utils/sider-client.ts) - Sider HTTP 客户端和 SSE 解析
 - [src/utils/sider-conversation.ts](src/utils/sider-conversation.ts) - 会话历史获取
 
+**配置文件**:
+- [src/config/models.ts](src/config/models.ts) - 模型映射配置
+
 **中间件**:
-- [src/middleware/auth.ts](src/middleware/auth.ts) - Bearer Token 认证（支持 "dummy" Token）
-
-### 4. 模型映射
-
-```typescript
-// Anthropic 模型 → Sider 模型
-'claude-3.7-sonnet' → 'claude-3.7-sonnet-think'
-'claude-4-sonnet'   → 'claude-4-sonnet-think'
-'claude-3-sonnet'   → 'claude-3.7-sonnet-think'
-```
-
-在 [src/utils/request-converter.ts:mapModelName()](src/utils/request-converter.ts) 中维护此映射。
+- [src/middleware/auth.ts](src/middleware/auth.ts) - Bearer Token 认证（双层认证支持）
 
 ## 开发约束和规范
 
 ### 必须遵守（来自 shrimp-rules.md）
 
 **架构约束**：
-- ✅ 必须使用 Hono 框架和 Bun 运行时
+- ✅ 必须使用 Hono 框架和 Bun/Deno 运行时
 - ✅ 保持 `/v1/messages` 端点签名不变
 - ✅ 保持 Anthropic API 完全兼容
 
 **会话保持规范**：
 - ✅ 优先使用 `convertAnthropicToSiderAsync()` 获取真实会话历史
-- ✅ 失败时自动降级到 `convertAnthropicToSiderSync()`
-- ✅ 在 `message_start` 事件中捕获真实的 `cid` 和 `parent_message_id`
+- ✅ 失败时自动降级到 `convertAnthropicToSider()`
+- ✅ 在 `message_start` 事件中捕获真实的 `cid`、`user_message_id`、`assistant_message_id`
+- ✅ 调用 `saveSiderSession()` 保存会话信息到内存
 - ✅ 响应中包含会话信息 headers（X-Conversation-ID、X-Assistant-Message-ID、X-User-Message-ID）
+
+**工具调用规范**：
+- ✅ `buildSafeToolsConfig()` 已启用完整工具转换
+- ✅ 支持 Anthropic 标准的 `tools` 和 `tool_choice` 参数
+- ✅ 完整的工具调用处理链路（start → progress → result）
+- ✅ 工具调用错误的标准化处理
 
 **AI 决策优先级**：
 1. 保持 Anthropic API 兼容性（绝不破坏 Claude Code 集成）
@@ -151,74 +272,109 @@ SSE 事件解析
 PORT=4141
 NODE_ENV=development
 
+# 双层认证
+AUTH_TOKEN=my-secret-api-key-2025       # 客户端认证 Token
+SIDER_AUTH_TOKEN=eyJhbGci...            # Sider AI JWT Token
+
 # Sider AI API 配置
 SIDER_API_URL=https://sider.ai/api/chat/v1/completions
-SIDER_AUTH_TOKEN=<你的 Sider JWT Token>
 
 # 可选配置
-LOG_LEVEL=debug
-REQUEST_TIMEOUT=30000
+LOG_LEVEL=info                          # debug | info | warn | error
+REQUEST_TIMEOUT=30000                   # 30 秒
 ```
 
 **Claude Code 集成**（见 [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md)）：
 
 ```bash
+# Bun 本地服务器
 export ANTHROPIC_BASE_URL=http://localhost:4141
-export ANTHROPIC_AUTH_TOKEN=dummy
-export ANTHROPIC_MODEL=claude-3.7-sonnet
+export ANTHROPIC_AUTH_TOKEN=my-secret-api-key-2025  # 使用 AUTH_TOKEN
+export ANTHROPIC_MODEL=claude-4.5-sonnet-think
+
+# Deno Deploy 生产环境
+export ANTHROPIC_BASE_URL=https://deno-sider2claude.deno.dev
+export ANTHROPIC_AUTH_TOKEN=my-secret-api-key-2025
+export ANTHROPIC_MODEL=claude-4.5-sonnet-think
 ```
 
 ## 关键实现细节
 
-### SSE 流式响应解析
-
-Sider API 返回 SSE 格式流，事件类型：
-- `credit_info` - 配额信息
-- `message_start` - **重要**：包含 `cid`、`user_message_id`、`assistant_message_id`
-- `reasoning_content` - 推理内容（think 模型）
-- `text` - 最终文本内容
-- `tool_call_start`/`tool_call_progress`/`tool_call_result` - 工具调用事件
-
-解析逻辑在 [src/utils/sider-client.ts:parseSSEResponse()](src/utils/sider-client.ts) 中实现。
-
 ### 会话 ID 获取流程
 
-1. 客户端请求时可选提供 `cid`（query 参数或 header）
+1. 客户端请求时可选提供 `cid`（query 参数或 `X-Conversation-ID` header）
 2. 如果提供了 `cid`，尝试从 `siderSessionStore` 获取会话信息
 3. 如果找到，使用 `getNextParentMessageId()` 获取正确的 `parent_message_id`
-4. 在 SSE `message_start` 事件中，捕获 Sider 返回的真实 `cid`
-5. 调用 `saveSiderSession()` 保存新的会话信息到内存
-6. 在响应 headers 中返回会话信息给客户端
+4. 如果多轮对话但无 `cid`，自动创建 `continuous-conversation` 会话
+5. 在 SSE `message_start` 事件中，捕获 Sider 返回的真实 `cid`、`user_message_id`、`assistant_message_id`
+6. 调用 `saveSiderSession()` 保存新的会话信息到内存
+7. 在响应 headers 中返回会话信息给客户端
 
-### 工具调用功能（部分实现）
+### 工具调用数据流
 
-- `buildSafeToolsConfig()` 已启用工具转换
-- 支持 Anthropic 标准的 `tools` 和 `tool_choice` 参数
-- 完整的工具调用处理链路需要参考 copilot-api 实现
-- 工具调用结果的标准化处理需要增强
+```typescript
+// 1. 客户端请求包含工具定义
+{
+  "tools": [
+    {
+      "name": "web_search",
+      "description": "Search the web",
+      "input_schema": { "type": "object", ... }
+    }
+  ]
+}
+
+// 2. 转换为 Sider 格式
+buildSafeToolsConfig() → {
+  "auto": ["search"],
+  "search": { "enabled": true, "max_results": 10 }
+}
+
+// 3. SSE 事件序列
+message_start → 捕获会话信息
+tool_call_start → 初始化工具调用记录
+tool_call_progress → 更新状态（可选）
+tool_call_result → 保存结果或错误
+text → 最终文本响应
+
+// 4. 转换回 Anthropic 格式
+{
+  "content": [
+    {
+      "type": "tool_use",
+      "id": "toolu_xxx",
+      "name": "web_search",
+      "input": { ... }
+    },
+    {
+      "type": "text",
+      "text": "Based on the search results..."
+    }
+  ]
+}
+```
 
 ## 当前状态
 
-**已实现**：
-- ✅ API 格式转换
-- ✅ 会话保持（两层机制）
-- ✅ SSE 流式响应解析
-- ✅ 认证中间件
-- ✅ 错误处理
+**已完整实现**：
+- ✅ API 格式转换（Anthropic ↔ Sider）
+- ✅ 双层会话管理（真实会话 + 本地降级）
+- ✅ SSE 流式响应解析（完整事件类型）
+- ✅ 双层认证中间件（AUTH_TOKEN + SIDER_AUTH_TOKEN）
+- ✅ 工具调用功能（完整支持）
+- ✅ 模型映射系统（10+ 模型）
 - ✅ Token 计数端点
+- ✅ 错误处理和日志
+- ✅ Deno 运行时支持
 
-**部分实现**：
-- ⚠️ 工具调用功能（基础支持已启用，完整链路待增强）
-- ⚠️ 流式响应（当前为模拟实现，按词分割发送）
-
-**待实现**：
+**未实现**：
 - ⏳ CLI 功能（citty 框架已导入但未使用）
-- ⏳ 精确 Token 计算（使用 gpt-tokenizer）
-- ⏳ 真正的 SSE 流式响应（参考 copilot-api）
+- ⏳ 精确 Token 计算（gpt-tokenizer 已导入但未使用，当前为粗略估算）
 
 **已知限制**：
-- ❌ MCP Server / invoke-agent 功能（详见 [docs/LIMITATIONS.md](docs/LIMITATIONS.md)）
-- ❌ Claude Code 的复杂工具调用工作流
+- ⚠️ 流式响应为按词模拟发送，非真正实时流式（功能正常，但非最优性能）
+- ⚠️ 会话存储为内存 Map，重启后丢失（可升级为 Redis）
+- ⚠️ Token 计数为估算（JSON 长度 ÷ 4），非精确值
 
 ## 调试技巧
 
@@ -236,21 +392,53 @@ Sider API 返回 SSE 格式流，事件类型：
    ```bash
    # 第一轮（获取 cid）
    curl -X POST http://localhost:4141/v1/messages \
-     -H "Authorization: Bearer dummy" \
+     -H "Authorization: Bearer my-secret-api-key-2025" \
      -H "Content-Type: application/json" \
      -d '{"model":"claude-3.7-sonnet","messages":[{"role":"user","content":"Hello"}],"max_tokens":1024}' \
      -v 2>&1 | grep -i "X-Conversation-ID"
 
    # 第二轮（使用 cid）
    curl -X POST "http://localhost:4141/v1/messages?cid=<获取的cid>" \
-     -H "Authorization: Bearer dummy" \
+     -H "Authorization: Bearer my-secret-api-key-2025" \
      -H "Content-Type: application/json" \
      -d '{"model":"claude-3.7-sonnet","messages":[{"role":"user","content":"Continue"}],"max_tokens":1024}'
    ```
 
+5. **测试工具调用**：
+   ```bash
+   curl -X POST http://localhost:4141/v1/messages \
+     -H "Authorization: Bearer my-secret-api-key-2025" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model":"claude-3.7-sonnet",
+       "messages":[{"role":"user","content":"Search for AI news"}],
+       "tools":[{"name":"web_search","description":"Search the web","input_schema":{"type":"object"}}],
+       "max_tokens":1024
+     }'
+   ```
+
 ## 参考文档
 
+**核心文档**：
 - [README.md](README.md) - 项目介绍和快速开始
+- [shrimp-rules.md](shrimp-rules.md) - AI 代理开发规范和约束 ⭐ 重要
+
+**集成指南**：
 - [CLAUDE_CODE_SETUP.md](CLAUDE_CODE_SETUP.md) - Claude Code CLI 集成指南
-- [shrimp-rules.md](shrimp-rules.md) - AI 代理开发规范和约束
+- [docs/new-api-integration.md](docs/new-api-integration.md) - New-API 集成指南
+
+**部署文档**：
+- [DENO-DEPLOY.md](DENO-DEPLOY.md) - Deno Deploy 部署指南
+- [docs/deno-deploy-final-guide.md](docs/deno-deploy-final-guide.md) - 最终部署指南 ⭐
+
+**测试文档**：
+- [docs/TEST-SUMMARY-2025-10-17.md](docs/TEST-SUMMARY-2025-10-17.md) - 最新测试总结（100% 通过）
+- [docs/API-TESTING.md](docs/API-TESTING.md) - 完整测试指南
+
+**故障排除**：
+- [docs/claude-code-fix.md](docs/claude-code-fix.md) - Claude Code 集成问题修复
+- [docs/new-api-troubleshooting.md](docs/new-api-troubleshooting.md) - New-API 401 错误解决
+
+**技术分析**：
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md) - 已知限制和解决方案
+- [docs/feature-models-api.md](docs/feature-models-api.md) - Models API 功能说明
