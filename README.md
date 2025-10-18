@@ -473,7 +473,7 @@ bun run test/02-deno-local.test.ts
 
 ### 选项 1: Railway（当前生产环境）⭐⭐⭐⭐⭐
 
-**Railway 部署**: https://sider2claude.up.railway.app
+**Railway 部署**: https://your-app-name.up.railway.app
 
 **优势**：
 - ✅ 原生 Bun 支持，零配置
@@ -527,7 +527,7 @@ https://dash.deno.com/new
 
 ### 当前部署状态
 
-**Railway 生产环境** ⭐: https://sider2claude.up.railway.app
+**Railway 生产环境** ⭐: https://your-app-name.up.railway.app
 
 **最新测试结果** (2025-10-16 20:39) - 配置真实 Sider Token 后:
 - ✅ 健康检查: 2/2 通过 (100%)

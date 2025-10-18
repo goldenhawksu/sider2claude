@@ -270,6 +270,19 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
     const body = await c.req.json();
 
+    // ✅ 验证请求格式（与主端点一致）
+    try {
+      validateAnthropicRequest(body as AnthropicRequest);
+    } catch (validationError) {
+      return c.json({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: validationError instanceof Error ? validationError.message : 'Invalid request',
+        },
+      } satisfies AnthropicError, 400);
+    }
+
     const totalLength = JSON.stringify(body.messages || []).length;
     const estimatedTokens = Math.ceil(totalLength / 4);
 
