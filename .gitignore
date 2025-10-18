@@ -137,3 +137,14 @@ scripts/convert-to-deno.ts
 test/test-claude-code-tools.ts
 test/test-hybrid-routing.ts
 test/test-third-party-api.ts
+docs/bugfix-session-messages-length-check.md
+docs/bugfix-token-count-validation.md
+docs/CLAUDE-MD-UPDATE-SUMMARY.md
+docs/log-analysis-deno-deploy.md
+test/test-anthropic-endpoint.ts
+test/test-anthropic-with-headers.ts
+test/test-deno-deployment.ts
+test/test-deployment-universal.ts
+test/test-list-models.ts
+test/test-streaming.ts
+test/test-tool-calling.ts
