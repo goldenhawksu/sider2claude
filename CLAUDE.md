@@ -274,10 +274,11 @@ NODE_ENV=development
 
 # 双层认证
 AUTH_TOKEN=my-secret-api-key-2025       # 客户端认证 Token
-SIDER_AUTH_TOKEN=eyJhbGci...            # Sider AI JWT Token
+
 
 # Sider AI API 配置
 SIDER_API_URL=https://sider.ai/api/chat/v1/completions
+SIDER_AUTH_TOKEN=eyJhbGci...            # Sider AI JWT Token
 
 # 可选配置
 LOG_LEVEL=info                          # debug | info | warn | error
@@ -293,7 +294,7 @@ export ANTHROPIC_AUTH_TOKEN=my-secret-api-key-2025  # 使用 AUTH_TOKEN
 export ANTHROPIC_MODEL=claude-4.5-sonnet-think
 
 # Deno Deploy 生产环境
-export ANTHROPIC_BASE_URL=https://deno-sider2claude.deno.dev
+export ANTHROPIC_BASE_URL=https://your-deno-deploy-url.deno.dev
 export ANTHROPIC_AUTH_TOKEN=my-secret-api-key-2025
 export ANTHROPIC_MODEL=claude-4.5-sonnet-think
 ```
