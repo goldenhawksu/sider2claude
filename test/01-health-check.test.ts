@@ -3,8 +3,7 @@
  * 测试 API 基础可用性
  */
 
-const API_BASE_URL = 'http://localhost:4141';
-const AUTH_TOKEN = 'your-custom-auth-token-here';
+import { API_BASE_URL, AUTH_TOKEN, printTestConfig } from './test.config';
 
 interface TestResult {
   name: string;
@@ -107,7 +106,7 @@ async function testCORS(): Promise<TestResult> {
 // 运行所有测试
 async function runAllTests() {
   console.log('🚀 开始健康检查测试...');
-  console.log('📍 API 地址:', API_BASE_URL);
+  printTestConfig();
   console.log('=' .repeat(60));
 
   const results: TestResult[] = [];

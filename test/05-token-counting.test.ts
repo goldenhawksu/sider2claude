@@ -4,8 +4,7 @@
  */
 
 
-const API_BASE_URL = 'http://localhost:4141';
-const AUTH_TOKEN = 'your-custom-auth-token-here';
+import { API_BASE_URL, AUTH_TOKEN, printTestConfig } from './test.config';
 interface TestResult {
   name: string;
   passed: boolean;

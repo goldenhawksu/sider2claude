@@ -284,7 +284,7 @@ export ANTHROPIC_MODEL=claude-3.7-sonnet
 渠道配置:
 ├─ 类型: Anthropic Claude
 ├─ 名称: Sider2Claude
-├─ Base URL: https://deno-sider2claude.deno.dev
+├─ Base URL: https://your-app.deno.dev
 ├─ 密钥: my-secret-api-key-2025  ← 使用 AUTH_TOKEN
 ├─ 优先级: 1
 └─ 状态: ✅ 启用
@@ -606,7 +606,7 @@ https://dash.deno.com/new
    - 确认 Token 是否过期(Sider Token 通常有效期 30 天)
    - 使用 `curl` 测试 Token 有效性:
      ```bash
-     curl -X POST https://deno-sider2claude.deno.dev/v1/messages \
+     curl -X POST https://your-app.deno.dev/v1/messages \
        -H "Authorization: Bearer YOUR_TOKEN" \
        -H "Content-Type: application/json" \
        -d '{"model":"claude-3.7-sonnet","messages":[{"role":"user","content":"test"}],"max_tokens":50}'
@@ -615,7 +615,7 @@ https://dash.deno.com/new
 2. **模型不存在 (404)**
    - 检查可用模型列表:
      ```bash
-     curl https://deno-sider2claude.deno.dev/v1/models
+     curl https://your-app.deno.dev/v1/models
      ```
    - 使用已验证的模型名称
 
