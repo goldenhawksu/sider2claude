@@ -214,7 +214,20 @@ messagesRouter.post('/', async (c: Context) => {
 messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
     const body = await c.req.json();
-    
+
+    // ✅ 验证请求格式（与主端点一致）
+    try {
+      validateAnthropicRequest(body as AnthropicRequest);
+    } catch (validationError) {
+      return c.json({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: validationError instanceof Error ? validationError.message : 'Invalid request',
+        },
+      } satisfies AnthropicError, 400);
+    }
+
     // 简单的 token 计数估算 (后续可以使用 gpt-tokenizer)
     const totalLength = JSON.stringify(body.messages || []).length;
     const estimatedTokens = Math.ceil(totalLength / 4); // 粗略估算
@@ -225,7 +238,7 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
 
   } catch (error) {
     console.error('Token count error:', error);
-    
+
     return c.json({
       type: 'error',
       error: {
