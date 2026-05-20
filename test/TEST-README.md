@@ -109,5 +109,6 @@ test/run-tests-deno-deploy.sh
 - `AUTH_TOKEN` 不一致：返回 401。
 - Sider 配额不足：普通对话可能返回空文本或用量限制。
 - DeepSeek key 未配置或不是官方 DeepSeek key：工具请求会失败或无法补齐 `tool_use`。
-- DeepSeek 返回 `thinking` 内容块：当前 adapter 已支持；如果再次出现未知块类型，应补充类型和确定性测试。
+- DeepSeek 返回 `thinking` 内容块：当前 adapter 已支持响应侧透传。
+- DeepSeek 工具续轮返回 `content[].thinking` passback 400：确认请求侧历史 `thinking` / `tool_use` / `tool_result` 已转录为文本，并运行 `deno/test/deepseek-adapter.test.ts`。
 - 远端部署地址未设置：请用 `TEST_API_BASE_URL` 或 `DENO_DEPLOY_URL` 指定。

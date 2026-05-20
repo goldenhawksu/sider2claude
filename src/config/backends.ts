@@ -174,8 +174,7 @@ Routing:
 }
 
 function maskToken(token: string): string {
-  if (!token || token.length < 20) return '***';
-  return token.substring(0, 10) + '...' + token.substring(token.length - 4);
+  return token ? '[configured]' : '[missing]';
 }
 
 export function getBackendDisplayName(backend: Backend): string {

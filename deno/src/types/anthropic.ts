@@ -1,5 +1,3 @@
-
-
 /**
  * Anthropic API 类型定义
  * 参考: https://docs.anthropic.com/claude/reference/messages_post
@@ -18,7 +16,7 @@ export interface AnthropicTextContent {
   text: string;
 }
 
-// 图片内容类型  
+// 图片内容类型
 export interface AnthropicImageContent {
   type: 'image';
   source: {
@@ -29,11 +27,24 @@ export interface AnthropicImageContent {
 }
 
 // 内容类型 (支持文本、图片和工具调用)
-export type AnthropicContent = 
-  | AnthropicTextContent 
+export type AnthropicContent =
+  | AnthropicTextContent
   | AnthropicImageContent
+  | AnthropicThinkingContent
+  | AnthropicRedactedThinkingContent
   | AnthropicToolUse
   | AnthropicToolResult;
+
+export interface AnthropicThinkingContent {
+  type: 'thinking';
+  thinking: string;
+  signature?: string;
+}
+
+export interface AnthropicRedactedThinkingContent {
+  type: 'redacted_thinking';
+  data: string;
+}
 
 // 请求类型
 export interface AnthropicRequest {
@@ -101,7 +112,13 @@ export interface AnthropicRedactedThinkingResponseContent {
 
 // 流式响应事件类型
 export interface AnthropicStreamEvent {
-  type: 'message_start' | 'content_block_start' | 'content_block_delta' | 'content_block_stop' | 'message_delta' | 'message_stop';
+  type:
+    | 'message_start'
+    | 'content_block_start'
+    | 'content_block_delta'
+    | 'content_block_stop'
+    | 'message_delta'
+    | 'message_stop';
   message?: Partial<AnthropicResponse>;
   content_block?: AnthropicResponseContent;
   delta?: {
@@ -127,7 +144,14 @@ export interface AnthropicStreamEvent {
 export interface AnthropicError {
   type: 'error';
   error: {
-    type: 'invalid_request_error' | 'authentication_error' | 'permission_error' | 'not_found_error' | 'rate_limit_error' | 'api_error' | 'overloaded_error';
+    type:
+      | 'invalid_request_error'
+      | 'authentication_error'
+      | 'permission_error'
+      | 'not_found_error'
+      | 'rate_limit_error'
+      | 'api_error'
+      | 'overloaded_error';
     message: string;
   };
 }
@@ -155,7 +179,7 @@ export interface AnthropicTool {
   };
 }
 
-export type AnthropicToolChoice = 
+export type AnthropicToolChoice =
   | { type: 'auto' }
   | { type: 'any' }
   | { type: 'tool'; name: string };
@@ -170,6 +194,6 @@ export interface AnthropicToolUse {
 export interface AnthropicToolResult {
   type: 'tool_result';
   tool_use_id: string;
-  content?: AnthropicContent[];
+  content?: string | AnthropicContent[];
   is_error?: boolean;
 }

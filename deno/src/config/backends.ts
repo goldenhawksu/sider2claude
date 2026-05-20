@@ -138,7 +138,9 @@ function validateConfig(config: BackendConfig): void {
   }
 
   if (config.routing.defaultBackend === 'deepseek' && !config.deepseek.enabled) {
-    console.warn('Default backend is DeepSeek, but DeepSeek is not configured. Switching to Sider.');
+    console.warn(
+      'Default backend is DeepSeek, but DeepSeek is not configured. Switching to Sider.',
+    );
     config.routing.defaultBackend = 'sider';
   }
 }
@@ -165,9 +167,7 @@ function logConfigSummary(config: BackendConfig): void {
 }
 
 function maskToken(token: string): string {
-  if (!token) return '';
-  if (token.length <= 10) return '***';
-  return `${token.substring(0, 10)}...${token.substring(token.length - 4)}`;
+  return token ? '[configured]' : '[missing]';
 }
 
 export function getBackendDisplayName(backend: Backend): string {

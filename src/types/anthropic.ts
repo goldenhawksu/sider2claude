@@ -32,8 +32,21 @@ export interface AnthropicImageContent {
 export type AnthropicContent = 
   | AnthropicTextContent 
   | AnthropicImageContent
+  | AnthropicThinkingContent
+  | AnthropicRedactedThinkingContent
   | AnthropicToolUse
   | AnthropicToolResult;
+
+export interface AnthropicThinkingContent {
+  type: 'thinking';
+  thinking: string;
+  signature?: string;
+}
+
+export interface AnthropicRedactedThinkingContent {
+  type: 'redacted_thinking';
+  data: string;
+}
 
 // 请求类型
 export interface AnthropicRequest {
@@ -170,6 +183,6 @@ export interface AnthropicToolUse {
 export interface AnthropicToolResult {
   type: 'tool_result';
   tool_use_id: string;
-  content?: AnthropicContent[];
+  content?: string | AnthropicContent[];
   is_error?: boolean;
 }

@@ -148,3 +148,101 @@ Deno.test('DeepSeek 适配器：兼容真实上游返回的 thinking 内容块',
     globalThis.fetch = originalFetch;
   }
 });
+
+Deno.test('DeepSeek 适配器：转发工具历史时转录工具上下文以避免上游 thinking passback 400', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ body: AnthropicRequest & Record<string, unknown> }> = [];
+
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init?.body as string) as AnthropicRequest & Record<string, unknown>;
+    calls.push({ body });
+
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: 'msg_deepseek_sanitized_1',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content: [{
+            type: 'tool_use',
+            id: 'toolu_2',
+            name: 'Bash',
+            input: { command: 'pwd' },
+          }],
+          stop_reason: 'tool_use',
+          usage: { input_tokens: 12, output_tokens: 4 },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'deepseek-token',
+      model: 'deepseek-v4-flash',
+    });
+
+    await adapter.sendRequest({
+      model: 'claude-4.1-opus-think',
+      messages: [{
+        role: 'assistant',
+        content: [{
+          type: 'thinking',
+          thinking: '历史推理',
+          signature: 'sig_2',
+        }, {
+          type: 'tool_use',
+          id: 'toolu_1',
+          name: 'Bash',
+          input: { command: 'pwd' },
+        }],
+      }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_1',
+          content: [{ type: 'text', text: '/repo' }],
+        }],
+      }],
+      max_tokens: 128,
+      tools: [{
+        name: 'Bash',
+        description: 'Run shell',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+      thinking: { type: 'enabled', budget_tokens: 1024 },
+    } as unknown as AnthropicRequest);
+
+    assertEquals(calls.length, 1);
+    assertEquals(calls[0].body.model, 'deepseek-v4-flash');
+    assertEquals(calls[0].body.thinking, undefined);
+
+    const assistantContent = calls[0].body.messages[0].content;
+    if (typeof assistantContent !== 'string') {
+      throw new Error('断言失败：期望 assistant content 被转录为文本');
+    }
+    assertEquals(assistantContent.includes('thinking'), false);
+    assertEquals(assistantContent.includes('[tool_use:Bash]'), true);
+
+    const userContent = calls[0].body.messages[1].content;
+    if (typeof userContent !== 'string') {
+      throw new Error('断言失败：期望 user content 被转录为文本');
+    }
+    assertEquals(userContent.includes('[tool_result]'), true);
+    assertEquals(userContent.includes('/repo'), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

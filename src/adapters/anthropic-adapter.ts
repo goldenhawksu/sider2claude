@@ -6,6 +6,8 @@
  */
 
 import type {
+  AnthropicContent,
+  AnthropicMessage,
   AnthropicRequest,
   AnthropicResponse,
   AnthropicResponseContent,
@@ -29,11 +31,7 @@ export class AnthropicApiAdapter {
   async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
-    const upstreamRequest: AnthropicRequest = {
-      ...request,
-      model: this.upstreamModel,
-      stream: false,
-    };
+    const upstreamRequest = this.buildUpstreamRequest(request);
 
     consola.info('Forwarding Anthropic-compatible request:', {
       provider: this.provider,
@@ -94,6 +92,82 @@ export class AnthropicApiAdapter {
       'X-Client-Name': 'claude-code',
       'X-Client-Version': '1.0.0',
     };
+  }
+
+  private buildUpstreamRequest(request: AnthropicRequest): AnthropicRequest {
+    const upstreamRequest = {
+      ...request,
+      model: this.upstreamModel,
+      stream: false,
+      messages: this.sanitizeMessagesForUpstream(request.messages),
+    } as AnthropicRequest & Record<string, unknown>;
+
+    // DeepSeek 的 Anthropic 兼容端会强制要求完整回传 thinking 块。
+    // Claude Code 工具循环里历史 thinking 可能被压缩或重建，历史工具交互因此转成文本转录。
+    delete upstreamRequest.thinking;
+
+    return upstreamRequest as AnthropicRequest;
+  }
+
+  private sanitizeMessagesForUpstream(messages: AnthropicRequest['messages']): AnthropicRequest['messages'] {
+    return messages.flatMap((message) => {
+      if (!Array.isArray(message.content)) {
+        return [message];
+      }
+
+      const textParts = message.content.flatMap((block) => this.contentBlockToText(block));
+      const text = textParts.join('\n').trim();
+
+      if (!text) {
+        return [];
+      }
+
+      return [{
+        role: message.role,
+        content: text,
+      } satisfies AnthropicMessage];
+    });
+  }
+
+  private contentBlockToText(block: AnthropicContent): string[] {
+    if (block.type === 'text') {
+      return block.text ? [block.text] : [];
+    }
+
+    if (block.type === 'image') {
+      return ['[image content omitted]'];
+    }
+
+    if (block.type === 'tool_use') {
+      return [
+        `[tool_use:${block.name}] id=${block.id} input=${JSON.stringify(block.input ?? {})}`,
+      ];
+    }
+
+    if (block.type === 'tool_result') {
+      const content = this.toolResultContentToText(block.content);
+      return [
+        `[tool_result] tool_use_id=${block.tool_use_id}${block.is_error ? ' is_error=true' : ''}`
+          + (content ? `\n${content}` : ''),
+      ];
+    }
+
+    return [];
+  }
+
+  private toolResultContentToText(content: string | AnthropicContent[] | undefined): string {
+    if (!content) {
+      return '';
+    }
+
+    if (typeof content === 'string') {
+      return content;
+    }
+
+    return content
+      .flatMap((block) => this.contentBlockToText(block))
+      .join('\n')
+      .trim();
   }
 
   private normalizeResponse(data: unknown, outwardModel: string): AnthropicResponse {

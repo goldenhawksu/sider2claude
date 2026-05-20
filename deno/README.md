@@ -7,7 +7,8 @@
 - 普通 Claude 对话走 Sider。
 - Claude Code 工具、MCP 工具、自定义 `tool_use` 走 DeepSeek Anthropic 兼容接口。
 - DeepSeek 默认模型为 `deepseek-v4-flash`。
-- DeepSeek 的 `thinking`、`redacted_thinking`、`tool_use` 内容块会按 Anthropic Messages 结构透传。
+- DeepSeek 的响应侧 `thinking`、`redacted_thinking`、`tool_use` 内容块会按 Anthropic Messages 结构透传。
+- 发往 DeepSeek 的历史工具轮会先转录为文本，避免上游要求完整 `content[].thinking` passback 而返回 400。
 
 ## 快速启动
 
@@ -73,6 +74,12 @@ tool_result continuation    -> 上一回合后端
 Sider native tools only     -> Sider，可 fallback
 ```
 
+DeepSeek 工具续轮注意事项：
+
+- 新工具请求保留 `tools`，由 DeepSeek 原生返回 `tool_use`。
+- 历史 `thinking` / `redacted_thinking` / `tool_use` / `tool_result` 内容块转发前转录为普通文本。
+- 响应侧仍透传结构化 `thinking` 和 `tool_use`，供 Claude Code 继续解析。
+
 ## Probe
 
 运行 Sider 能力探测：
@@ -106,7 +113,7 @@ deno task regression
 npm run test:regression
 ```
 
-真实服务级集成测试中，健康检查、模型列表、基础消息、流式响应、token 计数和 DeepSeek 工具路径应通过。`03-session-persistence` 的多轮语义断言依赖 Sider 上游是否复述测试上下文，可能出现模型行为层面的波动。
+真实服务级集成测试中，健康检查、模型列表、基础消息、流式响应、token 计数和 DeepSeek 工具路径应通过。DeepSeek 工具路径还应覆盖带历史 `tool_use` / `tool_result` 的续轮请求。`03-session-persistence` 的多轮语义断言依赖 Sider 上游是否复述测试上下文，可能出现模型行为层面的波动。
 
 服务级集成测试需要先启动服务，然后在另一个终端运行：
 
