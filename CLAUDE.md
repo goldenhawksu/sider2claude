@@ -12,6 +12,7 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 2. Claude Code 工具、MCP 工具、自定义 `tool_use` 等 Sider 不支持或不稳定支持的能力由 DeepSeek Anthropic 兼容端补齐。
 3. DeepSeek 默认上游模型为 `deepseek-v4-flash`。
 4. 对外始终保留客户端请求中的 Claude 模型名。
+5. DeepSeek 返回的 `thinking`、`redacted_thinking`、`tool_use` 内容块必须按 Anthropic Messages 结构透传。
 
 ## 开发命令
 
@@ -100,6 +101,7 @@ RouterEngine
 - 出现 `mcp__...` 或未知自定义工具必须走 DeepSeek。
 - `tool_result` 回合优先延续上一回合后端，避免工具调用上下文断裂。
 - 普通对话允许 fallback；工具请求不应 fallback 到 Sider，因为 Sider probe 未证明其支持 Anthropic `tool_use`。
+- DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
 
 ## 模型清单
 
@@ -165,6 +167,8 @@ npm run test:regression
 bun run dev
 npm run test:integration
 ```
+
+真实外部集成测试允许记录上游行为波动：Sider 配额、active request、timeout 或模型没有复述会话上下文时，要在报告里区分“外部服务行为”与“本服务格式/路由错误”。
 
 ## 维护约束
 

@@ -77,11 +77,26 @@ export interface AnthropicResponse {
 }
 
 // 响应内容类型
-export type AnthropicResponseContent = AnthropicTextResponseContent | AnthropicToolUse;
+export type AnthropicResponseContent =
+  | AnthropicTextResponseContent
+  | AnthropicThinkingResponseContent
+  | AnthropicRedactedThinkingResponseContent
+  | AnthropicToolUse;
 
 export interface AnthropicTextResponseContent {
   type: 'text';
   text: string;
+}
+
+export interface AnthropicThinkingResponseContent {
+  type: 'thinking';
+  thinking: string;
+  signature?: string;
+}
+
+export interface AnthropicRedactedThinkingResponseContent {
+  type: 'redacted_thinking';
+  data: string;
 }
 
 // 流式响应事件类型
@@ -92,6 +107,15 @@ export interface AnthropicStreamEvent {
   delta?: {
     type: 'text_delta';
     text: string;
+  } | {
+    type: 'thinking_delta';
+    thinking: string;
+  } | {
+    type: 'signature_delta';
+    signature: string;
+  } | {
+    type: 'input_json_delta';
+    partial_json: string;
   };
   usage?: {
     input_tokens: number;

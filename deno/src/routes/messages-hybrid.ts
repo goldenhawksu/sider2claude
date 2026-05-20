@@ -426,6 +426,47 @@ function streamContentBlock(
     return;
   }
 
+  if (block.type === 'thinking') {
+    send({
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'thinking',
+        thinking: '',
+        ...(block.signature ? { signature: block.signature } : {}),
+      },
+    });
+
+    if (block.thinking) {
+      send({
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'thinking_delta', thinking: block.thinking },
+      });
+    }
+
+    if (block.signature) {
+      send({
+        type: 'content_block_delta',
+        index,
+        delta: { type: 'signature_delta', signature: block.signature },
+      });
+    }
+
+    send({ type: 'content_block_stop', index });
+    return;
+  }
+
+  if (block.type === 'redacted_thinking') {
+    send({
+      type: 'content_block_start',
+      index,
+      content_block: { type: 'redacted_thinking', data: block.data },
+    });
+    send({ type: 'content_block_stop', index });
+    return;
+  }
+
   send({
     type: 'content_block_start',
     index,

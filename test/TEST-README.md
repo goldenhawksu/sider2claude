@@ -69,6 +69,8 @@ npm run test:integration
 | `04-streaming.test.ts` | Anthropic SSE 流式响应 |
 | `05-token-counting.test.ts` | `/v1/messages/count_tokens` |
 
+`03-session-persistence.test.ts` 的多轮语义断言会检查 Sider 上游是否在第二轮复述测试上下文。即使服务端已拿到会话 ID 且 `sider-sessions` 记录了多条消息，上游模型仍可能不按测试预期回答；报告中应单独标注这类外部语义波动。
+
 统一 runner：
 
 ```bash
@@ -107,4 +109,5 @@ test/run-tests-deno-deploy.sh
 - `AUTH_TOKEN` 不一致：返回 401。
 - Sider 配额不足：普通对话可能返回空文本或用量限制。
 - DeepSeek key 未配置或不是官方 DeepSeek key：工具请求会失败或无法补齐 `tool_use`。
+- DeepSeek 返回 `thinking` 内容块：当前 adapter 已支持；如果再次出现未知块类型，应补充类型和确定性测试。
 - 远端部署地址未设置：请用 `TEST_API_BASE_URL` 或 `DENO_DEPLOY_URL` 指定。

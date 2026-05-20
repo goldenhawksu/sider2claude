@@ -140,6 +140,21 @@ export class AnthropicApiAdapter {
         };
       }
 
+      if (item.type === 'thinking') {
+        return {
+          type: 'thinking',
+          thinking: typeof item.thinking === 'string' ? item.thinking : '',
+          ...(typeof item.signature === 'string' ? { signature: item.signature } : {}),
+        };
+      }
+
+      if (item.type === 'redacted_thinking') {
+        return {
+          type: 'redacted_thinking',
+          data: typeof item.data === 'string' ? item.data : '',
+        };
+      }
+
       if (item.type === 'tool_use') {
         return {
           type: 'tool_use',

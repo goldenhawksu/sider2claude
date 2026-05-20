@@ -7,6 +7,7 @@
 - 普通 Claude 对话走 Sider。
 - Claude Code 工具、MCP 工具、自定义 `tool_use` 走 DeepSeek Anthropic 兼容接口。
 - DeepSeek 默认模型为 `deepseek-v4-flash`。
+- DeepSeek 的 `thinking`、`redacted_thinking`、`tool_use` 内容块会按 Anthropic Messages 结构透传。
 
 ## 快速启动
 
@@ -104,6 +105,8 @@ deno task regression
 ```bash
 npm run test:regression
 ```
+
+真实服务级集成测试中，健康检查、模型列表、基础消息、流式响应、token 计数和 DeepSeek 工具路径应通过。`03-session-persistence` 的多轮语义断言依赖 Sider 上游是否复述测试上下文，可能出现模型行为层面的波动。
 
 服务级集成测试需要先启动服务，然后在另一个终端运行：
 
