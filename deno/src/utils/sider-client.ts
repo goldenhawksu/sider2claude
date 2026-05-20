@@ -1,15 +1,14 @@
-
-
 /**
  * Sider API 客户端
  * 处理向 Sider AI 的 HTTP 请求和 SSE 响应
  */
 
-import type { SiderRequest, SiderSSEResponse, SiderParsedResponse } from '../types.ts';
-import { saveSiderSession, getOrCreateContinuousSession } from './sider-session-manager.ts';
+import type { SiderParsedResponse, SiderRequest, SiderSSEResponse } from '../types/index.ts';
+import { getOrCreateContinuousSession, saveSiderSession } from './sider-session-manager.ts';
+import { getEnv } from './env.ts';
 
 // Sider API 配置
-const SIDER_API_URL = 'https://sider.ai/api/chat/v1/completions';
+const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
 
 /**
  * Sider API 客户端类
@@ -36,8 +35,8 @@ export class SiderClient {
       hasAuth: !!authToken,
     });
 
-    console.log("@@@ request", request);
-    
+    console.log('@@@ request', request);
+
     try {
       // 构建请求
       const response = await fetch(this.baseURL, {
@@ -46,7 +45,8 @@ export class SiderClient {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${authToken}`,
           'Origin': 'chrome-extension://dhoenijjpgpeimemopealfcbiecgceod',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
           'X-Time-Zone': 'Asia/Shanghai',
           'X-App-Version': '5.13.0',
           'X-App-Name': 'ChitChat_Edge_Ext',
@@ -67,7 +67,6 @@ export class SiderClient {
 
       // 解析 SSE 流
       return await this.parseSSEResponse(response);
-
     } catch (error) {
       console.error('Sider API call failed:', error);
       throw error;
@@ -100,7 +99,7 @@ export class SiderClient {
 
         // 解码数据块
         buffer += decoder.decode(value, { stream: true });
-        
+
         // 按行分割处理
         const lines = buffer.split('\n');
         buffer = lines.pop() || ''; // 保留最后一个不完整的行
@@ -114,7 +113,6 @@ export class SiderClient {
       if (buffer.trim()) {
         await this.processSSELine(buffer.trim(), result);
       }
-
     } finally {
       reader.releaseLock();
     }
@@ -127,11 +125,11 @@ export class SiderClient {
       textContent: result.textParts.join(''),
       conversationId: result.conversationId,
       // 工具调用详细信息
-      toolSummary: result.toolResults?.map(t => ({
+      toolSummary: result.toolResults?.map((t) => ({
         name: t.toolName,
         status: t.status,
-        hasError: !!t.error
-      })) || []
+        hasError: !!t.error,
+      })) || [],
     });
 
     // 如果没有文本内容，记录警告
@@ -141,26 +139,26 @@ export class SiderClient {
 
     // 检查工具调用完整性
     if (result.toolResults && result.toolResults.length > 0) {
-      const incompleteTools = result.toolResults.filter(t => t.status !== 'finish');
+      const incompleteTools = result.toolResults.filter((t) => t.status !== 'finish');
       if (incompleteTools.length > 0) {
         console.warn('Some tool calls did not complete:', {
           incompleteCount: incompleteTools.length,
-          incompleteTools: incompleteTools.map(t => ({
+          incompleteTools: incompleteTools.map((t) => ({
             name: t.toolName,
             id: t.toolId.substring(0, 12) + '...',
-            status: t.status
-          }))
+            status: t.status,
+          })),
         });
       }
 
-      const failedTools = result.toolResults.filter(t => t.error);
+      const failedTools = result.toolResults.filter((t) => t.error);
       if (failedTools.length > 0) {
         console.warn('Some tool calls failed:', {
           failedCount: failedTools.length,
-          failedTools: failedTools.map(t => ({
+          failedTools: failedTools.map((t) => ({
             name: t.toolName,
-            error: t.error
-          }))
+            error: t.error,
+          })),
         });
       }
     }
@@ -180,7 +178,7 @@ export class SiderClient {
     // 处理 data: 行
     if (line.startsWith('data:')) {
       const dataStr = line.substring(5).trim();
-      
+
       // 检查结束标记
       if (dataStr === '[DONE]') {
         console.debug('SSE stream completed');
@@ -190,7 +188,7 @@ export class SiderClient {
       try {
         const data = JSON.parse(dataStr) as SiderSSEResponse;
         // console.debug('Parsed SSE data:', { type: data.data?.type, hasText: !!(data.data as any)?.text });
-        
+
         if (data.code !== 0) {
           console.warn('Sider API warning:', { code: data.code, msg: data.msg });
           return;
@@ -207,7 +205,7 @@ export class SiderClient {
             // 消息开始 - 保存真实的会话信息
             if (data.data.message_start) {
               const { cid, user_message_id, assistant_message_id } = data.data.message_start;
-              
+
               // 保存到结果对象
               result.conversationId = cid;
               result.messageIds = {
@@ -215,10 +213,10 @@ export class SiderClient {
                 assistant: assistant_message_id,
               };
               result.model = data.data.model;
-              
+
               // 保存到会话管理器
               saveSiderSession(cid, user_message_id, assistant_message_id, data.data.model);
-              
+
               // 如果是连续对话会话，也更新连续对话状态
               if (cid === 'continuous-conversation' || cid === '') {
                 // 更新连续对话会话状态
@@ -228,14 +226,14 @@ export class SiderClient {
                 continuousSession.model = data.data.model;
                 continuousSession.lastActivity = Date.now();
                 continuousSession.messageCount += 1;
-                
+
                 console.log('Updated continuous conversation session:', {
                   userMsgId: user_message_id.substring(0, 12) + '...',
                   assistantMsgId: assistant_message_id.substring(0, 12) + '...',
                   messageCount: continuousSession.messageCount,
                 });
               }
-              
+
               console.log('Real Sider session captured:', {
                 cid: cid.substring(0, 12) + '...',
                 userMsgId: user_message_id.substring(0, 12) + '...',
@@ -272,22 +270,22 @@ export class SiderClient {
               console.log('Tool call started:', {
                 toolId: toolCall.id.substring(0, 12) + '...',
                 toolName: toolCall.name,
-                status: toolCall.status
+                status: toolCall.status,
               });
-              
+
               // 初始化工具调用结果（如果不存在）
               if (!result.toolResults) {
                 result.toolResults = [];
               }
-              
+
               // 查找现有的工具调用记录或创建新的
-              let existingTool = result.toolResults.find(t => t.toolId === toolCall.id);
+              let existingTool = result.toolResults.find((t) => t.toolId === toolCall.id);
               if (!existingTool) {
                 existingTool = {
                   toolName: toolCall.name,
                   toolId: toolCall.id,
                   result: null,
-                  status: 'start'
+                  status: 'start',
                 };
                 result.toolResults.push(existingTool);
               }
@@ -305,12 +303,12 @@ export class SiderClient {
                 toolId: toolCall.id.substring(0, 12) + '...',
                 toolName: toolCall.name,
                 status: toolCall.status,
-                hasProgress: !!toolCall.progress
+                hasProgress: !!toolCall.progress,
               });
-              
+
               // 更新现有工具调用状态
               if (result.toolResults) {
-                const existingTool = result.toolResults.find(t => t.toolId === toolCall.id);
+                const existingTool = result.toolResults.find((t) => t.toolId === toolCall.id);
                 if (existingTool) {
                   existingTool.status = 'processing';
                   // 如果有进度信息，可以记录到result中
@@ -333,12 +331,12 @@ export class SiderClient {
                 toolName: toolCall.name,
                 status: toolCall.status,
                 hasResult: !!toolCall.result,
-                hasError: !!toolCall.error
+                hasError: !!toolCall.error,
               });
-              
+
               // 更新最终工具调用结果
               if (result.toolResults) {
-                const existingTool = result.toolResults.find(t => t.toolId === toolCall.id);
+                const existingTool = result.toolResults.find((t) => t.toolId === toolCall.id);
                 if (existingTool) {
                   existingTool.status = 'finish';
                   existingTool.result = toolCall.result;
@@ -346,7 +344,7 @@ export class SiderClient {
                     existingTool.error = toolCall.error;
                     console.warn('Tool call failed:', {
                       toolName: toolCall.name,
-                      error: toolCall.error
+                      error: toolCall.error,
                     });
                   }
                 } else {
@@ -357,7 +355,7 @@ export class SiderClient {
                     toolId: toolCall.id,
                     result: toolCall.result,
                     status: 'finish',
-                    ...(toolCall.error && { error: toolCall.error }) // 只在有错误时添加error字段
+                    ...(toolCall.error && { error: toolCall.error }), // 只在有错误时添加error字段
                   });
                 }
               }
@@ -368,7 +366,6 @@ export class SiderClient {
           default:
             console.debug('Unknown SSE event type:', (data.data as any).type);
         }
-
       } catch (error) {
         console.warn('Failed to parse SSE data:', { line: dataStr, error });
       }

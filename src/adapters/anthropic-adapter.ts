@@ -1,268 +1,216 @@
 /**
- * Anthropic API 适配器
- * 透传请求到官方 Anthropic API
+ * Anthropic Messages 兼容后端适配器。
+ *
+ * 当前用于 DeepSeek 的 /anthropic 兼容入口。它对上游使用 DeepSeek 模型，
+ * 对下游仍保持 Claude Code 请求里的 Claude 模型名。
  */
 
-import type { AnthropicRequest, AnthropicResponse } from '../types/anthropic';
+import type {
+  AnthropicRequest,
+  AnthropicResponse,
+  AnthropicResponseContent,
+} from '../types/anthropic';
 import type { AnthropicBackendConfig } from '../config/backends';
 import { consola } from 'consola';
-import { ModelMapper } from '../utils/model-mapper';
 
 export class AnthropicApiAdapter {
   private baseUrl: string;
   private apiKey: string;
-  private modelMapper: ModelMapper | null = null;
+  private upstreamModel: string;
+  private provider: AnthropicBackendConfig['provider'];
 
   constructor(config: AnthropicBackendConfig) {
-    this.baseUrl = config.baseUrl;
+    this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.apiKey = config.apiKey;
-
-    // 如果不是官方 API,初始化模型映射器
-    if (!this.baseUrl.includes('anthropic.com')) {
-      this.modelMapper = new ModelMapper(this.baseUrl, this.apiKey);
-      // 异步初始化 (不阻塞构造)
-      this.modelMapper.initialize().catch(error => {
-        consola.warn('Model mapper initialization failed:', error);
-      });
-    }
+    this.upstreamModel = config.model;
+    this.provider = config.provider;
   }
 
-  /**
-   * 映射模型名称 - 使用动态映射器
-   */
-  private async mapModelName(model: string): Promise<string> {
-    // 如果是官方 API或没有映射器,直接返回
-    if (!this.modelMapper) {
-      return model;
-    }
-
-    // 使用动态映射
-    return await this.modelMapper.mapModel(model);
-  }
-
-  /**
-   * 透传请求到官方 Anthropic API
-   */
   async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
     const startTime = Date.now();
+    const outwardModel = request.model;
+    const upstreamRequest: AnthropicRequest = {
+      ...request,
+      model: this.upstreamModel,
+      stream: false,
+    };
 
-    // 映射模型名称 (异步)
-    const mappedModel = await this.mapModelName(request.model);
-    const mappedRequest = { ...request, model: mappedModel };
-
-    consola.info('🚀 Forwarding to Anthropic API:', {
-      model: mappedRequest.model,
-      messages: mappedRequest.messages.length,
-      tools: mappedRequest.tools?.length || 0,
-      stream: mappedRequest.stream || false,
+    consola.info('Forwarding Anthropic-compatible request:', {
+      provider: this.provider,
+      upstreamModel: upstreamRequest.model,
+      outwardModel,
+      messages: upstreamRequest.messages.length,
+      tools: upstreamRequest.tools?.length || 0,
+      requestedStream: !!request.stream,
     });
 
-    try {
-      // 根据 base URL 决定使用哪种认证方式
-      const isOfficialApi = this.baseUrl.includes('anthropic.com');
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'anthropic-version': '2023-06-01',
-      };
+    const response = await fetch(`${this.baseUrl}/v1/messages`, {
+      method: 'POST',
+      headers: this.buildHeaders(),
+      body: JSON.stringify(upstreamRequest),
+    });
 
-      if (isOfficialApi) {
-        // 官方 API 使用 x-api-key
-        headers['x-api-key'] = this.apiKey;
-      } else {
-        // 第三方 API 使用 Authorization header + 模拟 Claude Code 客户端
-        headers['Authorization'] = `Bearer ${this.apiKey}`;
-
-        // 添加 Claude Code 客户端标识,绕过第三方 API 的来源检查
-        headers['User-Agent'] = 'Claude-Code/1.0.0';
-        headers['X-Client-Name'] = 'claude-code';
-        headers['X-Client-Version'] = '1.0.0';
-      }
-
-      const response = await fetch(`${this.baseUrl}/v1/messages`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(mappedRequest),
-      });
-
-      const elapsed = Date.now() - startTime;
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        consola.error('❌ Anthropic API error:', {
-          status: response.status,
-          statusText: response.statusText,
-          error: errorText.substring(0, 200),
-          elapsed: `${elapsed}ms`,
-        });
-        throw new Error(`Anthropic API error: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json() as AnthropicResponse;
-
-      // 验证响应结构并防御性处理
-      if (!data || typeof data !== 'object') {
-        consola.error('❌ Invalid response format from Anthropic API:', {
-          received: typeof data,
-          elapsed: `${elapsed}ms`,
-        });
-        throw new Error('Invalid response format from Anthropic API');
-      }
-
-      // 防御性访问响应字段
-      const responseInfo = {
-        id: data.id || 'unknown',
-        stopReason: data.stop_reason || 'unknown',
-        contentBlocks: data.content?.length || 0,
-        inputTokens: data.usage?.input_tokens || 0,
-        outputTokens: data.usage?.output_tokens || 0,
-        elapsed: `${elapsed}ms`,
-      };
-
-      // 如果缺少关键字段,记录警告
-      if (!data.content || !Array.isArray(data.content)) {
-        consola.warn('⚠️ Response missing content array:', {
-          hasContent: !!data.content,
-          contentType: typeof data.content,
-          responseKeys: Object.keys(data),
-        });
-      }
-
-      if (!data.usage) {
-        consola.warn('⚠️ Response missing usage information');
-      }
-
-      consola.success('✅ Anthropic API response:', responseInfo);
-
-      return data;
-
-    } catch (error) {
-      const elapsed = Date.now() - startTime;
-      consola.error('❌ Anthropic API call failed:', {
-        error: error instanceof Error ? error.message : 'Unknown error',
+    const elapsed = Date.now() - startTime;
+    if (!response.ok) {
+      const errorText = await response.text();
+      consola.error('Anthropic-compatible backend error:', {
+        provider: this.provider,
+        status: response.status,
+        statusText: response.statusText,
+        preview: errorText.substring(0, 300),
         elapsed: `${elapsed}ms`,
       });
-      throw error;
+      throw new Error(`${this.provider} API error: ${response.status} ${response.statusText}`);
     }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const responseText = await response.text();
+      throw new Error(
+        `${this.provider} API returned non-JSON response: ${contentType || 'unknown'} ${responseText.substring(0, 120)}`,
+      );
+    }
+
+    const data = await response.json() as unknown;
+    const normalized = this.normalizeResponse(data, outwardModel);
+
+    consola.success('Anthropic-compatible backend response:', {
+      provider: this.provider,
+      id: normalized.id,
+      stopReason: normalized.stop_reason,
+      contentBlocks: normalized.content.length,
+      elapsed: `${elapsed}ms`,
+    });
+
+    return normalized;
   }
 
-  /**
-   * 流式请求支持（可选实现）
-   *
-   * 注意：流式响应需要特殊处理，当前先实现非流式版本
-   * 未来可以扩展支持 SSE 流式响应
-   */
+  private buildHeaders(): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${this.apiKey}`,
+      'anthropic-version': '2023-06-01',
+      'User-Agent': 'Claude-Code/1.0.0',
+      'X-Client-Name': 'claude-code',
+      'X-Client-Version': '1.0.0',
+    };
+  }
+
+  private normalizeResponse(data: unknown, outwardModel: string): AnthropicResponse {
+    if (!data || typeof data !== 'object') {
+      throw new Error(`${this.provider} API returned invalid response format`);
+    }
+
+    const raw = data as Record<string, unknown>;
+    if ('error' in raw || 'LocalError' in raw) {
+      const error = raw.error as { message?: string } | string | undefined;
+      const message = typeof error === 'string'
+        ? error
+        : error?.message || String(raw.LocalError || 'Unknown backend error');
+      throw new Error(`${this.provider} API error: ${message}`);
+    }
+
+    return {
+      id: typeof raw.id === 'string' ? raw.id : `msg_${Date.now()}`,
+      type: 'message',
+      role: 'assistant',
+      content: this.normalizeContent(raw.content),
+      model: outwardModel,
+      stop_reason: this.normalizeStopReason(raw.stop_reason),
+      ...(typeof raw.stop_sequence === 'string' ? { stop_sequence: raw.stop_sequence } : {}),
+      usage: this.normalizeUsage(raw.usage),
+    };
+  }
+
+  private normalizeContent(content: unknown): AnthropicResponseContent[] {
+    if (!Array.isArray(content) || content.length === 0) {
+      throw new Error(`${this.provider} API response missing content array`);
+    }
+
+    return content.map((block): AnthropicResponseContent => {
+      if (!block || typeof block !== 'object') {
+        throw new Error(`${this.provider} API returned invalid content block`);
+      }
+
+      const item = block as Record<string, unknown>;
+      if (item.type === 'text') {
+        return {
+          type: 'text',
+          text: typeof item.text === 'string' ? item.text : '',
+        };
+      }
+
+      if (item.type === 'tool_use') {
+        return {
+          type: 'tool_use',
+          id: typeof item.id === 'string' ? item.id : `toolu_${crypto.randomUUID()}`,
+          name: typeof item.name === 'string' ? item.name : '',
+          input: this.asRecord(item.input),
+        };
+      }
+
+      throw new Error(`${this.provider} API returned unsupported content block type: ${String(item.type)}`);
+    });
+  }
+
+  private normalizeUsage(usage: unknown): { input_tokens: number; output_tokens: number } {
+    if (!usage || typeof usage !== 'object') {
+      return { input_tokens: 0, output_tokens: 0 };
+    }
+
+    const raw = usage as Record<string, unknown>;
+    return {
+      input_tokens: typeof raw.input_tokens === 'number' ? raw.input_tokens : 0,
+      output_tokens: typeof raw.output_tokens === 'number' ? raw.output_tokens : 0,
+    };
+  }
+
+  private normalizeStopReason(value: unknown): AnthropicResponse['stop_reason'] {
+    if (
+      value === 'end_turn' ||
+      value === 'max_tokens' ||
+      value === 'stop_sequence' ||
+      value === 'tool_use' ||
+      value === null
+    ) {
+      return value;
+    }
+
+    return 'end_turn';
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return {};
+    }
+
+    return value as Record<string, unknown>;
+  }
+
   async sendStreamRequest(
     request: AnthropicRequest,
-    onChunk: (chunk: any) => void,
+    onChunk: (chunk: unknown) => void,
     onComplete: () => void,
-    onError: (error: Error) => void
+    onError: (error: Error) => void,
   ): Promise<void> {
-    consola.info('🌊 Streaming to Anthropic API (SSE)');
-
     try {
-      // 映射模型名称 (异步)
-      const mappedModel = await this.mapModelName(request.model);
-      const mappedRequest = { ...request, model: mappedModel, stream: true };
-
-      const isOfficialApi = this.baseUrl.includes('anthropic.com');
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        'anthropic-version': '2023-06-01',
-      };
-
-      if (isOfficialApi) {
-        headers['x-api-key'] = this.apiKey;
-      } else {
-        headers['Authorization'] = `Bearer ${this.apiKey}`;
-        // 模拟 Claude Code 客户端
-        headers['User-Agent'] = 'Claude-Code/1.0.0';
-        headers['X-Client-Name'] = 'claude-code';
-        headers['X-Client-Version'] = '1.0.0';
-      }
-
-      const response = await fetch(`${this.baseUrl}/v1/messages`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(mappedRequest),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Anthropic API error: ${response.status} ${errorText}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.substring(6).trim();
-              if (data === '[DONE]') {
-                onComplete();
-                continue;
-              }
-
-              try {
-                const parsed = JSON.parse(data);
-                onChunk(parsed);
-              } catch (error) {
-                consola.warn('Failed to parse SSE chunk:', data.substring(0, 100));
-              }
-            }
-          }
-        }
-      } finally {
-        reader.releaseLock();
-      }
-
+      const response = await this.sendRequest({ ...request, stream: false });
+      onChunk({ type: 'message_start', message: response });
+      onComplete();
     } catch (error) {
       onError(error instanceof Error ? error : new Error('Stream error'));
     }
   }
 
-  /**
-   * 健康检查
-   */
   async healthCheck(): Promise<boolean> {
     try {
-      const isOfficialApi = this.baseUrl.includes('anthropic.com');
-      const headers: Record<string, string> = {
-        'anthropic-version': '2023-06-01',
-      };
-
-      if (isOfficialApi) {
-        headers['x-api-key'] = this.apiKey;
-      } else {
-        headers['Authorization'] = `Bearer ${this.apiKey}`;
-        // 模拟 Claude Code 客户端
-        headers['User-Agent'] = 'Claude-Code/1.0.0';
-        headers['X-Client-Name'] = 'claude-code';
-        headers['X-Client-Version'] = '1.0.0';
-      }
-
-      // 简单的健康检查：尝试访问 models 端点
       const response = await fetch(`${this.baseUrl}/v1/models`, {
         method: 'GET',
-        headers,
+        headers: this.buildHeaders(),
       });
-
       return response.ok;
     } catch (error) {
-      consola.error('Anthropic API health check failed:', error);
+      consola.error('Anthropic-compatible backend health check failed:', error);
       return false;
     }
   }

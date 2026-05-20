@@ -61,7 +61,12 @@ export function parseCompletePrompt(prompt: string): { role: 'user' | 'assistant
   const parts = text.split(/\n\n(Human|Assistant):\s*/);
 
   for (let i = 1; i < parts.length; i += 2) {
-    const role = parts[i].toLowerCase() as 'human' | 'assistant';
+    const marker = parts[i];
+    if (!marker) {
+      continue;
+    }
+
+    const role = marker.toLowerCase() as 'human' | 'assistant';
     const content = parts[i + 1]?.trim() || '';
 
     if (content) {
@@ -81,8 +86,8 @@ export function parseCompletePrompt(prompt: string): { role: 'user' | 'assistant
   }
 
   // 移除最后的 "Assistant:" 提示（如果存在）
-  if (messages.length > 0) {
-    const lastMsg = messages[messages.length - 1];
+  const lastMsg = messages.at(-1);
+  if (lastMsg) {
     if (lastMsg.role === 'user' && lastMsg.content.endsWith('Assistant:')) {
       lastMsg.content = lastMsg.content.replace(/\s*Assistant:\s*$/, '').trim();
     }

@@ -8,9 +8,10 @@
 import type { SiderRequest, SiderSSEResponse, SiderParsedResponse } from '../types';
 import { consola } from 'consola';
 import { saveSiderSession, getOrCreateContinuousSession } from './sider-session-manager.js';
+import { getEnv } from './env';
 
 // Sider API 配置
-const SIDER_API_URL = 'https://sider.ai/api/chat/v1/completions';
+const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
 
 /**
  * Sider API 客户端类

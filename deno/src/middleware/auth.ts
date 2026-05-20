@@ -1,18 +1,17 @@
-
-
 /**
  * 认证中间件
  * 处理 Bearer token 认证，支持 Claude Code CLI 集成
  */
 
 import type { Context, Next } from 'hono';
+import { getEnv } from '../utils/env.ts';
 
 // 认证错误类型
 export class AuthError extends Error {
   constructor(
     message: string,
     public statusCode: number = 401,
-    public code: string = 'AUTH_ERROR'
+    public code: string = 'AUTH_ERROR',
   ) {
     super(message);
     this.name = 'AuthError';
@@ -36,7 +35,11 @@ export function extractBearerToken(authHeader: string | undefined): string {
   // 验证格式: "Bearer <token>" 或 "bearer <token>"
   const match = authHeader.match(/^bearer\s+(.+)$/i);
   if (!match) {
-    throw new AuthError('Invalid Authorization header format. Expected: Bearer <token>', 401, 'INVALID_AUTH_FORMAT');
+    throw new AuthError(
+      'Invalid Authorization header format. Expected: Bearer <token>',
+      401,
+      'INVALID_AUTH_FORMAT',
+    );
   }
 
   const token = match[1]?.trim();
@@ -57,7 +60,7 @@ export function extractAuthToken(c: Context): { token: string; type: 'bearer' | 
   if (xApiKey?.trim()) {
     return {
       token: xApiKey.trim(),
-      type: 'x-api-key'
+      type: 'x-api-key',
     };
   }
 
@@ -67,12 +70,16 @@ export function extractAuthToken(c: Context): { token: string; type: 'bearer' | 
     const token = extractBearerToken(authHeader);
     return {
       token,
-      type: 'bearer'
+      type: 'bearer',
     };
   }
 
   // 3. 都没有，抛出错误
-  throw new AuthError('Missing authentication. Provide either "Authorization: Bearer <token>" or "x-api-key: <token>" header', 401, 'MISSING_AUTH');
+  throw new AuthError(
+    'Missing authentication. Provide either "Authorization: Bearer <token>" or "x-api-key: <token>" header',
+    401,
+    'MISSING_AUTH',
+  );
 }
 
 /**
@@ -104,10 +111,13 @@ export function createAuthMiddleware(options: {
       }
 
       // 将认证信息存储到 context
-      c.set('auth', {
-        token,
-        type,
-      } satisfies AuthInfo);
+      c.set(
+        'auth',
+        {
+          token,
+          type,
+        } satisfies AuthInfo,
+      );
 
       // 日志记录 (不记录完整 token)
       console.log('⚙️ Auth successful:', {
@@ -156,7 +166,7 @@ function isValidToken(token: string, allowDummy: boolean): boolean {
   }
 
   // 从环境变量获取有效的 AUTH_TOKEN (Deno 版本)
-  const validAuthToken = Deno.env.get('AUTH_TOKEN');
+  const validAuthToken = getEnv('AUTH_TOKEN');
 
   // 如果环境变量中配置了 AUTH_TOKEN,则必须匹配
   if (validAuthToken) {

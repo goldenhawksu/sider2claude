@@ -1,5 +1,8 @@
 #!/bin/bash
 # 测试 Bun 本地服务器 (localhost:4141)
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 echo "========================================"
 echo "测试 Bun 本地服务器"
@@ -9,4 +12,4 @@ echo "========================================"
 echo
 
 export TEST_ENV=bun-local
-bun run run-all-tests.ts
+bun run test/run-all-tests.ts

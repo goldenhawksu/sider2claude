@@ -3,6 +3,9 @@
     "dev": "deno run --allow-net --allow-env --allow-read --watch deno/main.ts",
     "start": "deno run --allow-net --allow-env --allow-read deno/main.ts",
     "check": "deno check deno/main.ts",
+    "test": "deno test --allow-env deno/test",
+    "regression": "deno test --allow-env deno/test && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts",
+    "probe:sider": "deno run --allow-net --allow-env --allow-read --allow-write deno/tools/probe-sider-capabilities.ts",
     "lint": "deno lint deno/",
     "fmt": "deno fmt deno/"
   },

@@ -60,7 +60,7 @@ export interface AnthropicResponse {
   role: 'assistant';
   content: AnthropicResponseContent[];
   model: string;
-  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | null;
+  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
   stop_sequence?: string;
   usage: {
     input_tokens: number;
@@ -77,7 +77,9 @@ export interface AnthropicResponse {
 }
 
 // 响应内容类型
-export interface AnthropicResponseContent {
+export type AnthropicResponseContent = AnthropicTextResponseContent | AnthropicToolUse;
+
+export interface AnthropicTextResponseContent {
   type: 'text';
   text: string;
 }

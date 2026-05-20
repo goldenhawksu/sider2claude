@@ -1,11 +1,15 @@
 /**
- * 后端配置管理
- * 支持 Sider AI 和 Anthropic API 双后端
+ * 后端配置管理。
+ *
+ * Sider 提供 Claude 对话模型；DeepSeek Anthropic 兼容端补齐工具调用等能力。
  */
 
 import { consola } from 'consola';
+import { getEnv } from '../utils/env';
 
-export type Backend = 'sider' | 'anthropic';
+export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash';
+
+export type Backend = 'sider' | 'deepseek';
 
 export interface SiderBackendConfig {
   enabled: boolean;
@@ -15,8 +19,10 @@ export interface SiderBackendConfig {
 
 export interface AnthropicBackendConfig {
   enabled: boolean;
+  provider: 'deepseek' | 'anthropic-compatible';
   baseUrl: string;
   apiKey: string;
+  model: string;
 }
 
 export interface RoutingConfig {
@@ -28,109 +34,137 @@ export interface RoutingConfig {
 
 export interface BackendConfig {
   sider: SiderBackendConfig;
-  anthropic: AnthropicBackendConfig;
+  deepseek: AnthropicBackendConfig;
   routing: RoutingConfig;
 }
 
-/**
- * 从环境变量加载后端配置
- */
 export function loadBackendConfig(): BackendConfig {
+  const deepseekBaseUrl = resolveDeepSeekBaseUrl();
+  const deepseekApiKey = resolveDeepSeekApiKey();
+
   const config: BackendConfig = {
     sider: {
       enabled: false,
-      apiUrl: process.env.SIDER_API_URL || 'https://sider.ai/api/chat/v1/completions',
-      authToken: process.env.SIDER_AUTH_TOKEN || '',
+      apiUrl: getEnv('SIDER_API_URL') || 'https://sider.ai/api/chat/v1/completions',
+      authToken: getEnv('SIDER_AUTH_TOKEN') || '',
     },
-    anthropic: {
+    deepseek: {
       enabled: false,
-      baseUrl: process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
-      apiKey: process.env.ANTHROPIC_API_KEY || '',
+      provider: deepseekBaseUrl.includes('deepseek.com') ? 'deepseek' : 'anthropic-compatible',
+      baseUrl: deepseekBaseUrl,
+      apiKey: deepseekApiKey,
+      model: getEnv('DEEPSEEK_MODEL') || DEFAULT_DEEPSEEK_MODEL,
     },
     routing: {
-      defaultBackend: (process.env.DEFAULT_BACKEND as Backend) || 'sider',
-      autoFallback: process.env.AUTO_FALLBACK !== 'false',
-      preferSiderForSimpleChat: process.env.PREFER_SIDER_FOR_CHAT !== 'false',
-      debugMode: process.env.DEBUG_ROUTING === 'true',
+      defaultBackend: parseDefaultBackend(getEnv('DEFAULT_BACKEND')),
+      autoFallback: getEnv('AUTO_FALLBACK') !== 'false',
+      preferSiderForSimpleChat: getEnv('PREFER_SIDER_FOR_CHAT') !== 'false',
+      debugMode: getEnv('DEBUG_ROUTING') === 'true',
     },
   };
 
-  // 检测 Sider AI 是否可用
-  if (config.sider.authToken) {
-    config.sider.enabled = true;
-  }
+  config.sider.enabled = !!config.sider.authToken;
+  config.deepseek.enabled = !!config.deepseek.apiKey;
 
-  // 检测 Anthropic API 是否可用
-  if (config.anthropic.apiKey) {
-    config.anthropic.enabled = true;
-  }
-
-  // 验证配置
   validateConfig(config);
-
-  // 打印配置信息（脱敏）
   logConfigSummary(config);
 
   return config;
 }
 
-/**
- * 验证配置
- */
+function resolveDeepSeekBaseUrl(): string {
+  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
+  if (explicitDeepSeekUrl) {
+    return explicitDeepSeekUrl;
+  }
+
+  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
+  if (legacyAnthropicUrl?.includes('deepseek.com')) {
+    return legacyAnthropicUrl;
+  }
+
+  return 'https://api.deepseek.com/anthropic';
+}
+
+function resolveDeepSeekApiKey(): string {
+  const explicitDeepSeekKey = getEnv('DEEPSEEK_API_KEY');
+  if (explicitDeepSeekKey) {
+    return explicitDeepSeekKey;
+  }
+
+  const legacyAnthropicKey = getEnv('ANTHROPIC_API_KEY');
+  if (!legacyAnthropicKey) {
+    return '';
+  }
+
+  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
+  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
+  if (explicitDeepSeekUrl || !legacyAnthropicUrl || legacyAnthropicUrl.includes('deepseek.com')) {
+    return legacyAnthropicKey;
+  }
+
+  return '';
+}
+
+function parseDefaultBackend(value?: string): Backend {
+  if (value === 'deepseek' || value === 'sider') {
+    return value;
+  }
+
+  if (value === 'anthropic') {
+    return 'deepseek';
+  }
+
+  return 'sider';
+}
+
 function validateConfig(config: BackendConfig): void {
   const errors: string[] = [];
 
-  // 至少需要一个后端可用
-  if (!config.sider.enabled && !config.anthropic.enabled) {
-    errors.push('❌ No backend available. Please configure SIDER_AUTH_TOKEN or ANTHROPIC_API_KEY');
+  if (!config.sider.enabled && !config.deepseek.enabled) {
+    errors.push('No backend available. Configure SIDER_AUTH_TOKEN or DEEPSEEK_API_KEY.');
   }
 
-  // 如果默认后端不可用，给出警告
   if (config.routing.defaultBackend === 'sider' && !config.sider.enabled) {
-    consola.warn('⚠️ Default backend is "sider" but Sider AI is not configured');
-    if (config.anthropic.enabled) {
-      consola.info('→ Will use Anthropic API as fallback');
-      config.routing.defaultBackend = 'anthropic';
+    consola.warn('Default backend is Sider, but Sider is not configured.');
+    if (config.deepseek.enabled) {
+      config.routing.defaultBackend = 'deepseek';
     }
   }
 
-  if (config.routing.defaultBackend === 'anthropic' && !config.anthropic.enabled) {
-    consola.warn('⚠️ Default backend is "anthropic" but Anthropic API is not configured');
+  if (config.routing.defaultBackend === 'deepseek' && !config.deepseek.enabled) {
+    consola.warn('Default backend is DeepSeek, but DeepSeek is not configured.');
     if (config.sider.enabled) {
-      consola.info('→ Will use Sider AI as fallback');
       config.routing.defaultBackend = 'sider';
     }
   }
 
   if (errors.length > 0) {
-    consola.error('Configuration errors:');
-    errors.forEach(error => consola.error(error));
+    errors.forEach((error) => consola.error(error));
     throw new Error('Invalid backend configuration');
   }
 }
 
-/**
- * 打印配置摘要（脱敏）
- */
 function logConfigSummary(config: BackendConfig): void {
   consola.box({
-    title: '🔧 Backend Configuration',
+    title: 'Backend Configuration',
     message: `
-📡 Sider AI:
-   Status: ${config.sider.enabled ? '✅ Enabled' : '❌ Disabled'}
-   ${config.sider.enabled ? `URL: ${config.sider.apiUrl}` : ''}
-   ${config.sider.enabled ? `Token: ${maskToken(config.sider.authToken)}` : ''}
+Sider:
+  Status: ${config.sider.enabled ? 'enabled' : 'disabled'}
+  ${config.sider.enabled ? `URL: ${config.sider.apiUrl}` : ''}
+  ${config.sider.enabled ? `Token: ${maskToken(config.sider.authToken)}` : ''}
 
-🤖 Anthropic API:
-   Status: ${config.anthropic.enabled ? '✅ Enabled' : '❌ Disabled'}
-   ${config.anthropic.enabled ? `Base URL: ${config.anthropic.baseUrl}` : ''}
-   ${config.anthropic.enabled ? `API Key: ${maskToken(config.anthropic.apiKey)}` : ''}
+DeepSeek:
+  Status: ${config.deepseek.enabled ? 'enabled' : 'disabled'}
+  ${config.deepseek.enabled ? `Base URL: ${config.deepseek.baseUrl}` : ''}
+  ${config.deepseek.enabled ? `Model: ${config.deepseek.model}` : ''}
+  ${config.deepseek.enabled ? `API Key: ${maskToken(config.deepseek.apiKey)}` : ''}
 
-🎯 Routing:
-   Default Backend: ${config.routing.defaultBackend}
-   Auto Fallback: ${config.routing.autoFallback ? 'ON' : 'OFF'}
-   Prefer Sider for Chat: ${config.routing.preferSiderForSimpleChat ? 'ON' : 'OFF'}
-   Debug Mode: ${config.routing.debugMode ? 'ON' : 'OFF'}
+Routing:
+  Default Backend: ${config.routing.defaultBackend}
+  Auto Fallback: ${config.routing.autoFallback ? 'on' : 'off'}
+  Prefer Sider for Chat: ${config.routing.preferSiderForSimpleChat ? 'on' : 'off'}
+  Debug Mode: ${config.routing.debugMode ? 'on' : 'off'}
     `.trim(),
     style: {
       borderColor: 'cyan',
@@ -139,24 +173,15 @@ function logConfigSummary(config: BackendConfig): void {
   });
 }
 
-/**
- * 脱敏处理 Token
- */
 function maskToken(token: string): string {
   if (!token || token.length < 20) return '***';
   return token.substring(0, 10) + '...' + token.substring(token.length - 4);
 }
 
-/**
- * 获取后端显示名称
- */
 export function getBackendDisplayName(backend: Backend): string {
-  return backend === 'sider' ? 'Sider AI' : 'Anthropic API';
+  return backend === 'sider' ? 'Sider AI' : 'DeepSeek';
 }
 
-/**
- * 检查后端是否可用
- */
 export function isBackendAvailable(config: BackendConfig, backend: Backend): boolean {
-  return backend === 'sider' ? config.sider.enabled : config.anthropic.enabled;
+  return backend === 'sider' ? config.sider.enabled : config.deepseek.enabled;
 }

@@ -15,9 +15,10 @@ import { hybridMessagesRouter } from './routes/messages-hybrid'; // 使用混合
 import modelsRouter from './routes/models';
 import completeRouter from './routes/complete';
 import { router } from './routes';
+import { getEnv } from './utils/env';
 
 const app = new Hono();
-const PORT = process.env.PORT || 4141;
+const PORT = getEnv('PORT', '4141');
 
 // 中间件
 app.use('*', cors({
@@ -52,6 +53,12 @@ app.get('/', (c) => {
       messages: '/v1/messages',
       complete: '/v1/complete',
       count_tokens: '/v1/messages/count_tokens',
+      backends_status: '/v1/messages/backends/status',
+    },
+    features: {
+      hybrid_routing: true,
+      backends: ['sider', 'deepseek'],
+      capability_fallback: 'deepseek',
     },
 
   });

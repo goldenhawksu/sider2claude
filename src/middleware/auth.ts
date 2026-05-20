@@ -7,6 +7,7 @@
 
 import type { Context, Next } from 'hono';
 import { consola } from 'consola';
+import { getEnv } from '../utils/env';
 
 // 认证错误类型
 export class AuthError extends Error {
@@ -157,7 +158,7 @@ function isValidToken(token: string, allowDummy: boolean): boolean {
   }
 
   // 从环境变量获取有效的 AUTH_TOKEN
-  const validAuthToken = process.env.AUTH_TOKEN || Bun?.env?.AUTH_TOKEN || Deno?.env?.get?.('AUTH_TOKEN');
+  const validAuthToken = getEnv('AUTH_TOKEN');
 
   // 如果环境变量中配置了 AUTH_TOKEN,则必须匹配
   if (validAuthToken) {

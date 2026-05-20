@@ -12,18 +12,22 @@ import { logger } from 'hono/logger';
 import { hybridMessagesRouter } from './src/routes/messages-hybrid.ts';
 import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
+import { getEnv } from './src/utils/env.ts';
 
 const app = new Hono();
 
 // 环境变量 - Deno Deploy 方式
-const PORT = parseInt(Deno.env.get('PORT') || '8000');
+const PORT = parseInt(getEnv('PORT', '8000'), 10);
 
 // 中间件
-app.use('*', cors({
-  origin: '*',
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization'],
-}));
+app.use(
+  '*',
+  cors({
+    origin: '*',
+    allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowHeaders: ['Content-Type', 'Authorization'],
+  }),
+);
 
 app.use('*', logger());
 
@@ -55,18 +59,19 @@ app.get('/', (c) => {
       count_tokens: '/v1/messages/count_tokens',
       conversations: '/v1/messages/conversations',
       sider_sessions: '/v1/messages/sider-sessions',
-      backends_status: '/v1/messages/backends/status',  // 新增混合路由状态端点
+      backends_status: '/v1/messages/backends/status', // 新增混合路由状态端点
     },
     features: {
-      hybrid_routing: true,  // 启用混合路由
-      backends: ['sider', 'anthropic'],
+      hybrid_routing: true, // 启用混合路由
+      backends: ['sider', 'deepseek'],
+      capability_fallback: 'deepseek',
     },
   });
 });
 
 // 注册 API 路由
 app.route('/v1/models', modelsRouter);
-app.route('/v1/messages', hybridMessagesRouter);  // 使用混合路由
+app.route('/v1/messages', hybridMessagesRouter); // 使用混合路由
 app.route('/v1/complete', completeRouter);
 
 // 404 处理

@@ -362,7 +362,7 @@ async function testInvalidRequest(): Promise<TestResult> {
 async function runAllTests() {
   console.log('🚀 开始基础消息 API 测试...');
   console.log('📍 API 地址:', API_BASE_URL);
-  console.log('🔑 认证 Token:', AUTH_TOKEN);
+  console.log('🔑 认证 Token:', AUTH_TOKEN.length > 10 ? `${AUTH_TOKEN.slice(0, 8)}...${AUTH_TOKEN.slice(-4)}` : '***');
   console.log('='.repeat(60));
 
   const results: TestResult[] = [];

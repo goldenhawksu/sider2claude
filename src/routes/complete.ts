@@ -16,8 +16,11 @@ import {
 } from '../utils/complete-converter';
 import { siderClient } from '../utils/sider-client';
 import { convertAnthropicToSiderSync } from '../utils/request-converter';
+import type { AnthropicResponse } from '../types/anthropic';
+import { loadBackendConfig } from '../config/backends';
 
 const app = new Hono();
+const config = loadBackendConfig();
 
 // 应用认证中间件
 app.use('*', requireAuth);
@@ -75,16 +78,13 @@ app.post('/', async (c) => {
     }
 
     // 6. 调用 Sider API
-    const siderAuthToken = process.env.SIDER_AUTH_TOKEN ||
-                          Bun?.env?.SIDER_AUTH_TOKEN ||
-                          Deno?.env?.get?.('SIDER_AUTH_TOKEN') ||
-                          auth.token;
+    const siderAuthToken = config.sider.authToken || auth.token;
 
     // siderClient.chat() 返回已解析的 SiderParsedResponse
     const siderParsedResponse = await siderClient.chat(siderRequest, siderAuthToken);
 
     // 7. 处理响应 - 构建 Messages API 格式的响应
-    const messagesResponse = {
+    const messagesResponse: AnthropicResponse = {
       id: `msg_${Date.now()}`,
       type: 'message' as const,
       role: 'assistant' as const,
@@ -94,7 +94,6 @@ app.post('/', async (c) => {
       }],
       model: siderParsedResponse.model,
       stop_reason: 'end_turn' as const,
-      stop_sequence: null,
       usage: {
         input_tokens: 0,
         output_tokens: 0

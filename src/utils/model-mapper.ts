@@ -22,7 +22,7 @@ interface ModelsListResponse {
  */
 function extractDate(modelName: string): number {
   const match = modelName.match(/(\d{8})/);
-  return match ? parseInt(match[1]) : 0;
+  return match?.[1] ? parseInt(match[1], 10) : 0;
 }
 
 /**
@@ -181,7 +181,7 @@ export class ModelMapper {
       'claude-3-haiku': ['claude-3-haiku-20240307'],
     };
 
-    Object.entries(fallbackMappings).forEach(([standard, candidates]) => {
+    Object.values(fallbackMappings).forEach((candidates) => {
       candidates.forEach(candidate => this.availableModels.add(candidate));
     });
 
@@ -246,14 +246,19 @@ export class ModelMapper {
       return b.date - a.date;
     });
 
-    const bestMatch = candidates[0].model;
-    const bestScore = candidates[0].score;
+    const bestCandidate = candidates[0];
+    if (!bestCandidate) {
+      return requestedModel;
+    }
+
+    const bestMatch = bestCandidate.model;
+    const bestScore = bestCandidate.score;
 
     consola.info('🔄 Model mapped:', {
       from: requestedModel,
       to: bestMatch,
       similarity: (bestScore * 100).toFixed(1) + '%',
-      date: candidates[0].date || 'N/A',
+      date: bestCandidate.date || 'N/A',
     });
 
     this.mappingCache.set(requestedModel, bestMatch);

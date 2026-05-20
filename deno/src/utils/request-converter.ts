@@ -5,7 +5,7 @@
  * 将 Anthropic API 请求转换为 Sider API 格式
  */
 
-import type { AnthropicRequest, SiderRequest } from '../types.ts';
+import type { AnthropicRequest, SiderRequest } from '../types/index.ts';
 import type { SiderTools } from '../types/sider.ts';
 // import { getOrCreateConversation, getParentMessageId } from './conversation-manager.ts'; // Fallback functions, not used in current version
 import { siderConversationClient } from './sider-conversation.ts';

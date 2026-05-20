@@ -20,6 +20,8 @@ project_document/
 # Logs
 logs
 *.log
+sider-*-results.json
+sider-capability-probe-*.json
 
 # Runtime data
 pids
@@ -99,9 +101,6 @@ test/generate-report.ts
 test/new-api-channel-test.ts
 test/new-api-channel-types-comparison.ts
 test/quick-test.ts
-test/run-all-tests.ts
-test/run-tests.bat
-test/run-tests.sh
 test/test-both-auth-headers.ts
 test/TEST-SUMMARY.md
 test/verify-bugfix.bat
@@ -140,3 +139,8 @@ test/test-deployment-universal.ts
 test/test-list-models.ts
 test/test-streaming.ts
 test/test-tool-calling.ts
+docs/BUG-FIXES-SUMMARY.md
+docs/BUN-COMPLETE-TEST-REPORT-2025-10-18.md
+docs/BUN-TEST-REPORT-2025-10-18.md
+docs/DENO-DEPLOY-TEST-REPORT-2025-10-18.md
+docs/FINAL-TEST-REPORT-2025-10-18.md

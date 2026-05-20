@@ -15,6 +15,9 @@
     "start": "NODE_ENV=production bun run ./src/main.ts",
     "lint": "eslint . --cache",
     "typecheck": "tsc",
+    "test:unit": "deno test --allow-env deno/test",
+    "test:integration": "bun run test/run-all-tests.ts",
+    "test:regression": "deno task test && deno task check && deno check deno/tools/probe-sider-capabilities.ts && npm run typecheck",
     "prepack": "bun run build"
   },
   "keywords": [

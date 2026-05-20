@@ -1,265 +1,110 @@
 # 测试套件使用指南
 
-## 📋 测试配置
+本目录保留服务级黑盒集成测试；Deno 确定性单测位于 `deno/test`。
 
-测试套件现在支持三种环境的自动切换：
+## 测试分层
 
-| 环境 | API 地址 | 认证 Token | 说明 |
-|------|---------|-----------|------|
-| `bun-local` | http://localhost:4141 | your-custom-auth-token-here | Bun 本地开发服务器（默认） |
-| `deno-local` | http://localhost:4142 | your-custom-auth-token-here | Deno 本地开发服务器 |
-| `deno-deploy` | https://your-app.deno.dev | sk-this-is-deno-key | Deno Deploy 生产环境 |
+| 层级 | 命令 | 是否需要服务 | 说明 |
+| --- | --- | --- | --- |
+| Deno 单测 | `deno task test` | 否 | 路由、模型映射、DeepSeek adapter |
+| Deno 检查 | `deno task check` | 否 | Deno 主入口类型检查 |
+| Probe 检查 | `deno check deno/tools/probe-sider-capabilities.ts` | 否 | probe 脚本类型检查 |
+| Node/Bun 类型检查 | `npm run typecheck` | 否 | `src/` TypeScript 检查 |
+| 完整确定性回归 | `npm run test:regression` | 否 | 以上四项串联 |
+| 服务级集成 | `npm run test:integration` | 是 | 调用已启动的 HTTP 服务 |
 
-配置文件位置：`test/test.config.ts`
+## 服务级集成测试
 
----
-
-## 🚀 快速运行测试
-
-### Windows
-
-```bash
-# 测试 Bun 本地服务器
-cd test
-run-tests-bun.bat
-
-# 测试 Deno 本地服务器
-run-tests-deno-local.bat
-
-# 测试 Deno Deploy 生产环境
-run-tests-deno-deploy.bat
-```
-
-### Linux / macOS
+先启动服务：
 
 ```bash
-# 测试 Bun 本地服务器
-cd test
-./run-tests-bun.sh
-
-# 测试 Deno 本地服务器
-./run-tests-deno-local.sh
-
-# 测试 Deno Deploy 生产环境
-./run-tests-deno-deploy.sh
-```
-
----
-
-## 🔧 手动指定环境
-
-### 方法 1: 使用环境变量
-
-```bash
-# Windows
-set TEST_ENV=deno-local
-bun run run-all-tests.ts
-
-# Linux/macOS
-export TEST_ENV=deno-local
-bun run run-all-tests.ts
-```
-
-### 方法 2: 运行单个测试文件
-
-```bash
-# Windows
-set TEST_ENV=bun-local
-bun run 01-health-check.test.ts
-
-# Linux/macOS
-export TEST_ENV=bun-local
-bun run 01-health-check.test.ts
-```
-
----
-
-## 📦 测试文件列表
-
-| 文件 | 描述 | 测试数量 |
-|------|------|---------|
-| `01-health-check.test.ts` | 健康检查和 CORS 配置 | 2 |
-| `02-basic-messages.test.ts` | 基础消息 API 功能 | 5 |
-| `03-session-persistence.test.ts` | 会话保持和多轮对话 | 3 |
-| `04-streaming.test.ts` | 流式响应功能 | 3 |
-| `05-token-counting.test.ts` | Token 计数端点 | 5 |
-
-**总计**: 18 个测试用例
-
----
-
-## 🛠️ 测试前准备
-
-### 1. 启动被测试的服务器
-
-**Bun 版本**:
-```bash
-cd c:/github-repo/sider2claude
+# Bun，默认 http://localhost:4141
 bun run dev
-# 服务器将在 http://localhost:4141 运行
 ```
 
-**Deno 版本**:
+再运行：
+
 ```bash
-cd c:/github-repo/sider2claude/deno
+npm run test:integration
+```
+
+Deno 本地服务：
+
+```bash
+# 终端 1
 deno task dev
-# 服务器将在 http://localhost:4142 运行
+
+# 终端 2
+$env:TEST_ENV="deno-local"
+$env:TEST_API_BASE_URL="http://localhost:8000"
+npm run test:integration
 ```
 
-### 2. 确认环境变量
+## 环境配置
 
-确保服务器已正确配置环境变量（`.env` 文件）：
+测试配置读取优先级：
+
+1. 运行时环境变量
+2. 根目录 `.env`
+3. 测试默认值
+
+常用变量：
+
+| 变量 | 说明 |
+| --- | --- |
+| `TEST_ENV` | `bun-local`、`deno-local`、`deno-deploy` |
+| `TEST_API_BASE_URL` | 覆盖 API 地址 |
+| `TEST_AUTH_TOKEN` | 覆盖测试请求 token |
+| `AUTH_TOKEN` | 未设置 `TEST_AUTH_TOKEN` 时作为测试 token |
+
+测试日志只输出 token 掩码。
+
+## 测试文件
+
+| 文件 | 覆盖内容 |
+| --- | --- |
+| `01-health-check.test.ts` | 健康检查、CORS |
+| `02-basic-messages.test.ts` | 模型列表、基础消息、认证、无效请求 |
+| `03-session-persistence.test.ts` | 会话创建、多轮对话、会话端点 |
+| `04-streaming.test.ts` | Anthropic SSE 流式响应 |
+| `05-token-counting.test.ts` | `/v1/messages/count_tokens` |
+
+统一 runner：
 
 ```bash
-# 必需
-AUTH_TOKEN=your-custom-auth-token-here
-SIDER_AUTH_TOKEN=eyJhbGci...
-
-# 可选（启用混合路由时需要）
-ANTHROPIC_API_KEY=sk-ant-...
+bun run test/run-all-tests.ts
 ```
 
----
-
-## 📊 测试输出示例
-
-```
-🚀 Sider2Claude 完整测试套件
-⏰ 开始时间: 2025/10/18 10:50:00
-🌍 测试环境: bun-local
-💡 提示: 使用 TEST_ENV=deno-local 或 TEST_ENV=deno-deploy 切换环境
-======================================================================
-
-📋 找到 5 个测试文件:
-
-   1. 01-health-check.test.ts
-   2. 02-basic-messages.test.ts
-   3. 03-session-persistence.test.ts
-   4. 04-streaming.test.ts
-   5. 05-token-counting.test.ts
-
-======================================================================
-🧪 运行测试文件: 01-health-check.test.ts
-======================================================================
-🚀 开始健康检查测试...
-📍 测试配置:
-   环境: bun-local
-   说明: Bun 本地开发服务器 (端口 4141)
-   API 地址: http://localhost:4141
-   认证 Token: your-custom-auth-tok...
-============================================================
-
-...
-
-======================================================================
-📊 测试总结
-======================================================================
-
-测试结果:
-  1. ✅ 01-health-check.test.ts
-     通过 | 耗时: 0.05s
-  2. ✅ 02-basic-messages.test.ts
-     通过 | 耗时: 15.23s
-  3. ✅ 03-session-persistence.test.ts
-     通过 | 耗时: 7.51s
-  4. ✅ 04-streaming.test.ts
-     通过 | 耗时: 35.12s
-  5. ✅ 05-token-counting.test.ts
-     通过 | 耗时: 0.08s
-
-统计:
-  通过: 5/5
-  失败: 0/5
-  成功率: 100.0%
-  总耗时: 57.99s
-
-⏰ 结束时间: 2025/10/18 10:51:00
-
-✅ 所有测试通过！
-```
-
----
-
-## 🔍 故障排查
-
-### 测试失败常见原因
-
-1. **服务器未启动**
-   - 错误：`fetch failed` 或 `ECONNREFUSED`
-   - 解决：启动对应的服务器（Bun 或 Deno）
-
-2. **认证失败 (401)**
-   - 错误：`401 Unauthorized`
-   - 解决：检查服务器 `.env` 中的 `AUTH_TOKEN` 与测试配置是否一致
-
-3. **端口冲突**
-   - 错误：`EADDRINUSE`
-   - 解决：检查端口 4141 (Bun) 或 4142 (Deno) 是否被占用
-
-4. **Sider API 配额不足**
-   - 错误：`Response received but no text content`
-   - 解决：等待 Sider AI 配额重置或更换 Token
-
-### 查看后台服务器日志
-
-如果服务器在后台运行：
+只跑指定文件：
 
 ```bash
-# 查看 Bun 服务器输出
-# (在启动服务器的终端查看)
-
-# 或者重新前台启动查看日志
-bun run dev
+bun run test/run-all-tests.ts 01-health-check.test.ts 05-token-counting.test.ts
 ```
 
----
+## 批处理入口
 
-## 📝 修改测试配置
+Windows：
 
-编辑 `test/test.config.ts` 文件：
-
-```typescript
-const configs: Record<string, TestConfig> = {
-  'bun-local': {
-    apiBaseUrl: 'http://localhost:4141',  // 修改端口
-    authToken: 'your-token-here',         // 修改 Token
-    environment: 'bun-local',
-    description: 'Bun 本地开发服务器',
-  },
-  // ... 其他配置
-};
+```bat
+test\run-tests.bat
+test\run-tests-bun.bat
+test\run-tests-deno-local.bat
+test\run-tests-deno-deploy.bat
 ```
 
----
-
-## 🎯 持续集成 (CI)
-
-在 CI 环境中运行测试：
+Linux/macOS：
 
 ```bash
-# GitHub Actions / GitLab CI 示例
-- name: Run Tests
-  run: |
-    cd test
-    export TEST_ENV=deno-deploy
-    bun run run-all-tests.ts
+test/run-tests.sh
+test/run-tests-bun.sh
+test/run-tests-deno-local.sh
+test/run-tests-deno-deploy.sh
 ```
 
----
+## 常见失败原因
 
-## ✅ 验证修复
-
-运行特定测试验证 Bug 修复：
-
-```bash
-# 验证会话保持修复
-bun run 03-session-persistence.test.ts
-
-# 验证 Token 计数修复
-bun run 05-token-counting.test.ts
-```
-
----
-
-**最后更新**: 2025-10-18
-**维护者**: Claude Code AI Agent
+- 服务未启动：`ECONNREFUSED`。
+- `AUTH_TOKEN` 不一致：返回 401。
+- Sider 配额不足：普通对话可能返回空文本或用量限制。
+- DeepSeek key 未配置或不是官方 DeepSeek key：工具请求会失败或无法补齐 `tool_use`。
+- 远端部署地址未设置：请用 `TEST_API_BASE_URL` 或 `DENO_DEPLOY_URL` 指定。

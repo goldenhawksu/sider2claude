@@ -9,7 +9,7 @@ import type {
   SiderParsedResponse, 
   AnthropicResponse, 
   AnthropicResponseContent 
-} from '../types.ts';
+} from '../types/index.ts';
 
 /**
  * 转换 Sider 响应到 Anthropic 格式

@@ -133,10 +133,19 @@ messagesRouter.post('/', async (c: Context) => {
     consola.info('Calling Sider API...');
 
     // 使用环境变量中的 SIDER_AUTH_TOKEN (如果配置了),否则使用客户端提供的 token
-    const siderAuthToken = process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN') || auth.token;
+    const runtime = globalThis as typeof globalThis & {
+      Bun?: { env?: Record<string, string | undefined> };
+      Deno?: { env?: { get?: (key: string) => string | undefined } };
+    };
+    const siderAuthToken = process.env.SIDER_AUTH_TOKEN ||
+      runtime.Bun?.env?.SIDER_AUTH_TOKEN ||
+      runtime.Deno?.env?.get?.('SIDER_AUTH_TOKEN') ||
+      auth.token;
 
     consola.debug('Using Sider auth token:', {
-      fromEnv: !!(process.env.SIDER_AUTH_TOKEN || Bun?.env?.SIDER_AUTH_TOKEN || Deno?.env?.get?.('SIDER_AUTH_TOKEN')),
+      fromEnv: !!(process.env.SIDER_AUTH_TOKEN ||
+        runtime.Bun?.env?.SIDER_AUTH_TOKEN ||
+        runtime.Deno?.env?.get?.('SIDER_AUTH_TOKEN')),
       tokenPrefix: siderAuthToken.substring(0, 8) + '...'
     });
 
