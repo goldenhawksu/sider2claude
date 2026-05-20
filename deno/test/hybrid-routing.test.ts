@@ -163,6 +163,29 @@ Deno.test('配置加载：非 DeepSeek 的旧 ANTHROPIC_BASE_URL 会阻止旧 ke
   });
 });
 
+Deno.test('配置加载：同一环境只加载一次，环境变化时重新加载', () => {
+  withEnv({
+    SIDER_AUTH_TOKEN: 'sider-token',
+    DEEPSEEK_API_KEY: 'deepseek-token',
+    DEEPSEEK_BASE_URL: undefined,
+    DEEPSEEK_MODEL: undefined,
+    ANTHROPIC_API_KEY: undefined,
+    ANTHROPIC_BASE_URL: undefined,
+    DEFAULT_BACKEND: undefined,
+  }, () => {
+    const first = loadBackendConfig();
+    const second = loadBackendConfig();
+
+    assertEquals(first === second, true);
+
+    Deno.env.set('DEEPSEEK_MODEL', 'deepseek-v4-flash-next');
+    const changed = loadBackendConfig();
+
+    assertEquals(changed === first, false);
+    assertEquals(changed.deepseek.model, 'deepseek-v4-flash-next');
+  });
+});
+
 Deno.test('模型清单：暴露 18 个 Anthropic 模型/别名，并统一映射到 Sider 模型', () => {
   const models = getAllModels();
 

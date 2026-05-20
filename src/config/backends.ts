@@ -38,7 +38,29 @@ export interface BackendConfig {
   routing: RoutingConfig;
 }
 
+const CONFIG_SIGNATURE_KEYS = [
+  'SIDER_API_URL',
+  'SIDER_AUTH_TOKEN',
+  'DEEPSEEK_BASE_URL',
+  'DEEPSEEK_API_KEY',
+  'DEEPSEEK_MODEL',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_API_KEY',
+  'DEFAULT_BACKEND',
+  'AUTO_FALLBACK',
+  'PREFER_SIDER_FOR_CHAT',
+  'DEBUG_ROUTING',
+] as const;
+
+let cachedConfig: BackendConfig | undefined;
+let cachedConfigSignature = '';
+
 export function loadBackendConfig(): BackendConfig {
+  const signature = buildConfigSignature();
+  if (cachedConfig && cachedConfigSignature === signature) {
+    return cachedConfig;
+  }
+
   const deepseekBaseUrl = resolveDeepSeekBaseUrl();
   const deepseekApiKey = resolveDeepSeekApiKey();
 
@@ -69,7 +91,14 @@ export function loadBackendConfig(): BackendConfig {
   validateConfig(config);
   logConfigSummary(config);
 
+  cachedConfig = config;
+  cachedConfigSignature = signature;
+
   return config;
+}
+
+function buildConfigSignature(): string {
+  return JSON.stringify(CONFIG_SIGNATURE_KEYS.map((key) => [key, getEnv(key)]));
 }
 
 function resolveDeepSeekBaseUrl(): string {
