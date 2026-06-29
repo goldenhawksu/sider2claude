@@ -1,4 +1,8 @@
 {
+  "deploy": {
+    "project": "sider2claude",
+    "entrypoint": "deno/main.ts"
+  },
   "tasks": {
     "dev": "deno run --allow-net --allow-env --allow-read --watch deno/main.ts",
     "start": "deno run --allow-net --allow-env --allow-read deno/main.ts",
