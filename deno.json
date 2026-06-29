@@ -25,6 +25,7 @@
     "strict": true,
     "allowJs": false
   },
+  "nodeModulesDir": "auto",
   "fmt": {
     "useTabs": false,
     "lineWidth": 100,
