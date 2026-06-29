@@ -5,7 +5,7 @@
  * 可通过 TEST_ENV 切换到 deno-local 或 deno-deploy。
  */
 
-import { readdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getTestConfig, printTestConfig } from './test.config';
