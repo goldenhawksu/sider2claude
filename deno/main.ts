@@ -85,13 +85,14 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal Server Error', message: err.message }, 500);
 });
 
-// Deno Deploy 导出
+// Deno Deploy 导出（新平台不接受显式端口，由平台自动分配）
 export default {
   fetch: app.fetch,
 };
 
 // 本地开发服务器
 if (import.meta.main) {
+  const PORT = parseInt(getEnv('PORT', '8000'), 10);
   console.log(`🚀 Sider2Claude server starting on port ${PORT}`);
   console.log(`📋 Health check: http://localhost:${PORT}/health`);
   console.log(`📖 API info: http://localhost:${PORT}/`);
