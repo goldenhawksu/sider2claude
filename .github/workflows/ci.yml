@@ -1,0 +1,76 @@
+name: CI / Deterministic Regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Deno 确定性回归 ──
+  deno-regression:
+    name: Deno — 确定性回归
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Deno check (主入口)
+        run: deno check deno/main.ts
+
+      - name: Deno test (单元测试)
+        run: deno test --allow-env deno/test
+
+      - name: Deno check (sider probe)
+        run: deno check deno/tools/probe-sider-capabilities.ts
+
+  # ── Bun/Node 类型检查 ──
+  bun-typecheck:
+    name: Bun — TypeScript 检查
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: TypeScript 类型检查
+        run: bun run typecheck
+
+  # ── 汇总 ──
+  summary:
+    name: ✅ CI 汇总
+    needs: [deno-regression, bun-typecheck]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: 报告结果
+        run: |
+          echo "## CI 结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | 结果 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| deno-regression | ${{ needs.deno-regression.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "| bun-typecheck | ${{ needs.bun-typecheck.result }}" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.deno-regression.result }}" != "success" ]] || [[ "${{ needs.bun-typecheck.result }}" != "success" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ 确定性回归未全部通过，请检查上方失败项。" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ 全部确定性回归通过。" >> $GITHUB_STEP_SUMMARY

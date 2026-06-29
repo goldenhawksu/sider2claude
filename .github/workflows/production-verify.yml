@@ -1,0 +1,169 @@
+name: 生产环境验证
+
+# 手动触发：推送部署完成后验证远端服务
+# 或在 CI 确定性回归通过后自动触发（main 分支推送）
+on:
+  workflow_run:
+    workflows: ["CI / Deterministic Regression"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: '远端部署地址 (如 https://deno-sider2claude.example.com)'
+        required: true
+        type: string
+        default: ''
+      run_integration:
+        description: '是否运行集成回归测试 (消耗上游配额)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # ── 冒烟验证（零上游成本） ──
+  smoke-verify:
+    name: 冒烟验证
+    runs-on: ubuntu-latest
+    # 仅 CI 通过后才运行；手动触发时始终运行
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: 确定目标地址
+        id: target
+        run: |
+          if [[ -n "${{ github.event.inputs.target_url }}" ]]; then
+            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ secrets.DEPLOY_URL }}" ]]; then
+            echo "url=${{ secrets.DEPLOY_URL }}" >> $GITHUB_OUTPUT
+          else
+            echo "::error::未设置目标地址，请通过 workflow_dispatch 手动触发并填写 target_url 或设置 DEPLOY_URL secret"
+            exit 1
+          fi
+
+      - name: 健康检查
+        run: |
+          echo "🔍 检查目标服务: ${{ steps.target.outputs.url }}"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.target.outputs.url }}/health" || echo "000")
+          echo "HTTP 状态码: $STATUS"
+          if [[ "$STATUS" != "200" ]]; then
+            echo "❌ 服务不可达"
+            exit 1
+          fi
+          echo "✅ 服务可达"
+
+      - name: 模型列表验证
+        run: |
+          echo "📋 检查模型列表..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" "${{ steps.target.outputs.url }}/v1/models")
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [[ "$HTTP_CODE" != "200" ]]; then
+            echo "❌ GET /v1/models 返回 $HTTP_CODE"
+            exit 1
+          fi
+
+          MODEL_COUNT=$(echo "$BODY" | grep -o '"id"' | wc -l || echo "0")
+          echo "   模型数: $MODEL_COUNT"
+          if [[ "$MODEL_COUNT" -lt 1 ]]; then
+            echo "❌ 模型列表为空"
+            exit 1
+          fi
+          echo "✅ 模型列表正常"
+
+      - name: 认证测试
+        run: |
+          echo "🔒 检查认证保护..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ steps.target.outputs.url }}/v1/messages" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":10}')
+          if [[ "$STATUS" != "401" ]]; then
+            echo "❌ 缺少 token 时应返回 401，实际: $STATUS"
+            exit 1
+          fi
+          echo "✅ 认证保护正常 (401)"
+
+      - name: CORS 检查
+        run: |
+          echo "🌐 检查 CORS 配置..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X OPTIONS "${{ steps.target.outputs.url }}/health" \
+            -H "Origin: http://localhost:3000" \
+            -H "Access-Control-Request-Method: POST")
+          echo "   OPTIONS 状态码: $STATUS"
+          echo "✅ CORS 配置可访问"
+
+  # ── 集成回归测试（消耗上游配额，仅手动触发时可选） ──
+  integration-regression:
+    name: 集成回归测试
+    runs-on: ubuntu-latest
+    needs: [smoke-verify]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_integration == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: 确定目标地址
+        id: target
+        run: |
+          if [[ -n "${{ github.event.inputs.target_url }}" ]]; then
+            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ secrets.DEPLOY_URL }}" ]]; then
+            echo "url=${{ secrets.DEPLOY_URL }}" >> $GITHUB_OUTPUT
+          else
+            echo "url=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 运行集成测试
+        env:
+          TEST_ENV: deno-deploy
+          TEST_API_BASE_URL: ${{ steps.target.outputs.url }}
+          TEST_AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: bun run test:integration
+
+  # ── 汇总 ──
+  summary:
+    name: ✅ 生产验证汇总
+    needs: [smoke-verify, integration-regression]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: 报告结果
+        run: |
+          echo "## 生产环境验证结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | 结果 | 说明 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| smoke-verify | ${{ needs.smoke-verify.result }} | 零上游消耗冒烟测试 |" >> $GITHUB_STEP_SUMMARY
+          echo "| integration-regression | ${{ needs.integration-regression.result }} | 集成回归 (可选) |" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.smoke-verify.result }}" != "success" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ 冒烟测试未通过，远端服务可能有问题。" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ 生产验证通过。" >> $GITHUB_STEP_SUMMARY

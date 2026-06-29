@@ -4,14 +4,38 @@
 
 ## 测试分层
 
-| 层级 | 命令 | 是否需要服务 | 说明 |
-| --- | --- | --- | --- |
-| Deno 单测 | `deno task test` | 否 | 路由、模型映射、DeepSeek adapter |
-| Deno 检查 | `deno task check` | 否 | Deno 主入口类型检查 |
-| Probe 检查 | `deno check deno/tools/probe-sider-capabilities.ts` | 否 | probe 脚本类型检查 |
-| Node/Bun 类型检查 | `npm run typecheck` | 否 | `src/` TypeScript 检查 |
-| 完整确定性回归 | `npm run test:regression` | 否 | 以上四项串联 |
-| 服务级集成 | `npm run test:integration` | 是 | 调用已启动的 HTTP 服务 |
+| 层级 | 命令 | 是否需要服务 | 消耗上游 | 说明 |
+| --- | --- | --- | --- | --- |
+| Deno 单测 | `deno task test` | 否 | 否 | 路由、模型映射、DeepSeek adapter |
+| Deno 检查 | `deno task check` | 否 | 否 | Deno 主入口类型检查 |
+| Probe 检查 | `deno check deno/tools/probe-sider-capabilities.ts` | 否 | 否 | probe 脚本类型检查 |
+| Node/Bun 类型检查 | `npm run typecheck` | 否 | 否 | `src/` TypeScript 检查 |
+| 完整确定性回归 | `npm run test:regression` | 否 | 否 | 以上四项串联 |
+| 冒烟测试 | `npm run test:smoke` | 是 | **否** | 零上游消耗快速验证 |
+| 服务级集成 | `npm run test:integration` | 是 | 是 | 调用已启动的 HTTP 服务 |
+
+### CI/CD 工作流
+
+| 工作流 | 触发条件 | 内容 |
+|--------|---------|------|
+| `ci.yml` | push/PR 到 main | 确定性回归 (Deno 单测 + 类型检查) |
+| `production-verify.yml` | CI 通过后自动 / 手动触发 | 冒烟 + 可选集成回归 |
+
+### 冒烟测试
+
+零上游消耗，只验证服务基础可用性：
+
+```bash
+# 默认测试 Bun 本地服务
+bun run test/smoke-test.ts
+
+# 测试远端部署
+$env:TEST_ENV="deno-deploy"
+$env:TEST_API_BASE_URL="https://your-url"
+bun run test/smoke-test.ts
+```
+
+覆盖：健康检查、CORS、模型列表格式、认证 401、请求校验 400、404 处理、Token 计数端点。
 
 ## 服务级集成测试
 
