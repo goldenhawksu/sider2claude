@@ -12,6 +12,9 @@ export interface RequestAnalysis {
   hasClaudeCodeTools: boolean;
   hasMcpTools: boolean;
   hasSiderTools: boolean;
+  hasLongFormGenerationIntent: boolean;
+  longFormSignals: string[];
+  inputCharCount: number;
   toolNames: string[];
   claudeCodeToolNames: string[];  // Claude Code 工具名称
   mcpToolNames: string[];          // MCP 工具名称
@@ -66,11 +69,16 @@ export class RequestAnalyzer {
    * 分析请求特征
    */
   analyze(request: AnthropicRequest): RequestAnalysis {
+    const inputText = this.extractRequestText(request);
+    const longFormSignals = this.detectLongFormSignals(inputText, request);
     const analysis: RequestAnalysis = {
       type: this.detectRequestType(request),
       hasClaudeCodeTools: false,
       hasMcpTools: false,
       hasSiderTools: false,
+      hasLongFormGenerationIntent: longFormSignals.length > 0,
+      longFormSignals,
+      inputCharCount: inputText.length,
       toolNames: [],
       claudeCodeToolNames: [],
       mcpToolNames: [],
@@ -101,6 +109,98 @@ export class RequestAnalyzer {
     }
 
     return analysis;
+  }
+
+  private extractRequestText(request: AnthropicRequest): string {
+    const parts: string[] = [];
+
+    if (typeof request.system === 'string') {
+      parts.push(request.system);
+    }
+
+    for (const message of request.messages) {
+      parts.push(this.extractContentText(message.content));
+    }
+
+    return parts.join('\n').trim();
+  }
+
+  private extractContentText(content: unknown): string {
+    if (typeof content === 'string') {
+      return content;
+    }
+
+    if (!Array.isArray(content)) {
+      return '';
+    }
+
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') {
+          return '';
+        }
+
+        const block = item as {
+          type?: string;
+          text?: string;
+          thinking?: string;
+          content?: unknown;
+        };
+
+        if (typeof block.text === 'string') {
+          return block.text;
+        }
+
+        if (typeof block.thinking === 'string') {
+          return block.thinking;
+        }
+
+        if (block.type === 'tool_result') {
+          return this.extractContentText(block.content);
+        }
+
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private detectLongFormSignals(text: string, request: AnthropicRequest): string[] {
+    const signals = new Set<string>();
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const lowerText = normalized.toLowerCase();
+
+    const asksToCreate =
+      /(做|制作|生成|输出|撰写|写|整理|设计|创建|起草|拟|改写|扩写|转换|转成|做成|生成一个|做一个)/.test(normalized) ||
+      /\b(create|generate|write|draft|compose|prepare|turn into|convert into|make)\b/i.test(normalized);
+    const hasSourceMaterial =
+      /(用以下内容|基于以下|根据以下|以下内容|素材如下|内容如下|source material|based on the following)/i.test(normalized);
+    const presentationTarget =
+      /\b(ppt|powerpoint|slide deck|slides?|presentation deck|presentation)\b/i.test(normalized) ||
+      /(幻灯片|演示文稿|课件|汇报材料|路演材料)/.test(normalized);
+    const longFormTarget =
+      /(PPT|ppt|幻灯片|演示文稿|课件|报告|文档|方案|大纲|讲稿|演讲稿|文章|长文|白皮书|脚本|提纲|邮件|README|readme)/.test(normalized) ||
+      /\b(report|document|doc|proposal|outline|article|essay|brief|script|deck|slides?)\b/i.test(normalized);
+
+    if (presentationTarget && (asksToCreate || hasSourceMaterial || (request.max_tokens || 0) >= 1024)) {
+      signals.add('presentation');
+    }
+
+    if (asksToCreate && longFormTarget) {
+      signals.add('long_form_creation');
+    }
+
+    const longInputThreshold = request.max_tokens && request.max_tokens >= 1024 ? 300 : 500;
+    if (hasSourceMaterial && asksToCreate && normalized.length >= longInputThreshold) {
+      signals.add('source_material_generation');
+    }
+
+    if (lowerText.includes('<ide_opened_file>')) {
+      signals.delete('long_form_creation');
+      signals.delete('source_material_generation');
+    }
+
+    return [...signals];
   }
 
   /**

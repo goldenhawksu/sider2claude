@@ -59,6 +59,10 @@ export interface AnthropicRequest {
   system?: string;
   tools?: AnthropicTool[];
   tool_choice?: AnthropicToolChoice;
+  thinking?: {
+    type: 'enabled' | 'disabled';
+    budget_tokens?: number;
+  };
   metadata?: {
     user_id?: string;
   };

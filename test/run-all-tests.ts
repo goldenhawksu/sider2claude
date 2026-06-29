@@ -52,7 +52,43 @@ console.log(`失败: ${failed}/${results.length}`);
 console.log(`总耗时: ${totalDurationMs}ms`);
 console.log(`结束时间: ${new Date().toLocaleString()}`);
 
+writeReport();
 process.exit(failed > 0 ? 1 : 0);
+
+function writeReport(): void {
+  const reportsDir = join(testDir, 'reports');
+  mkdirSync(reportsDir, { recursive: true });
+
+  const now = new Date();
+  const ts = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-` +
+    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+  const lines = [
+    `# Sider2Claude 集成测试报告 ${ts}`,
+    '',
+    `- 环境: ${config.environment}`,
+    `- 目标: ${config.apiBaseUrl}`,
+    `- 通过: ${passed}/${results.length}　失败: ${failed}/${results.length}`,
+    `- 总耗时: ${totalDurationMs}ms`,
+    '',
+    '## 明细',
+    '',
+    '| 文件 | 结果 | 耗时(ms) | 退出码 |',
+    '|---|---|---|---|',
+    ...results.map((r) =>
+      `| ${basename(r.file)} | ${r.passed ? 'PASS' : 'FAIL'} | ${r.durationMs} | ${r.exitCode ?? '-'} |`
+    ),
+    '',
+  ];
+
+  const reportPath = join(reportsDir, `integration-${ts}.md`);
+  writeFileSync(reportPath, lines.join('\n'), 'utf8');
+  console.log(`📄 报告已生成: ${reportPath}`);
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, '0');
+}
 
 function resolveTestFiles(): string[] {
   if (requestedFiles.length > 0) {

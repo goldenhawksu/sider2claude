@@ -16,7 +16,8 @@ import type {
  */
 export function convertSiderToAnthropic(
   siderResponse: SiderParsedResponse,
-  originalModel: string
+  originalModel: string,
+  options: { includeThinking?: boolean } = {}
 ): AnthropicResponse {
   // 合并所有文本内容
   const fullText = combineTextParts(siderResponse);
@@ -27,15 +28,28 @@ export function convertSiderToAnthropic(
   // 生成响应 ID
   const responseId = generateResponseId();
 
+  // 构建内容块：仅当请求显式开启 extended thinking 时，才把 think 模型的思维链
+  // 作为 thinking 块透传（遵循 Anthropic 约定，避免给未开启的客户端塞入意外块）。
+  // Sider 不提供 signature，故不附带该字段。
+  const content: AnthropicResponseContent[] = [];
+  const thinkingText = siderResponse.reasoningParts.join('').trim();
+  if (options.includeThinking && thinkingText) {
+    content.push({
+      type: 'thinking',
+      thinking: thinkingText,
+    });
+  }
+  content.push({
+    type: 'text',
+    text: fullText,
+  });
+
   // 构建 Anthropic 响应
   const anthropicResponse: AnthropicResponse = {
     id: responseId,
     type: 'message',
     role: 'assistant',
-    content: [{
-      type: 'text',
-      text: fullText,
-    }] satisfies AnthropicResponseContent[],
+    content,
     model: originalModel, // 使用原始请求的模型名
     stop_reason: 'end_turn', // 正常结束
     usage: usage,

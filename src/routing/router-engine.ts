@@ -111,6 +111,28 @@ export class RouterEngine {
       }
     }
 
+    if (analysis.type === 'simple_chat' && analysis.hasLongFormGenerationIntent) {
+      if (this.config.deepseek.enabled) {
+        return {
+          backend: 'deepseek',
+          reason: `Long-form generation is better handled by DeepSeek: ${analysis.longFormSignals.join(', ')}`,
+          confidence: 0.85,
+          allowFallback: true,
+          ruleId: 'rule_5_long_form_generation',
+        };
+      }
+
+      if (this.config.sider.enabled) {
+        return {
+          backend: 'sider',
+          reason: 'Long-form generation detected, but DeepSeek is not configured.',
+          confidence: 0.45,
+          allowFallback: false,
+          ruleId: 'rule_5_long_form_generation_fallback_sider',
+        };
+      }
+    }
+
     if (analysis.type === 'simple_chat') {
       if (this.config.routing.preferSiderForSimpleChat && this.config.sider.enabled) {
         return {
@@ -205,6 +227,7 @@ Context:
   Claude Code Tools: ${analysis.claudeCodeToolNames.join(', ') || 'none'}
   MCP Tools: ${analysis.mcpToolNames.join(', ') || 'none'}
   Sider Tools: ${analysis.siderToolNames.join(', ') || 'none'}
+  Long-form Signals: ${analysis.longFormSignals.join(', ') || 'none'}
       `.trim(),
       style: {
         borderColor: 'green',

@@ -36,9 +36,10 @@ export class SiderClient {
       model: request.model,
       contentLength: request.multi_content[0]?.text?.length || 0,
       hasAuth: !!authToken,
+      conversationId: maskId(request.cid),
+      hasParentMessage: !!request.parent_message_id,
+      toolCount: request.tools?.auto?.length || 0,
     });
-
-    consola.info("@@@ request", request);
     
     try {
       // 构建请求
@@ -126,8 +127,8 @@ export class SiderClient {
       reasoningParts: result.reasoningParts.length,
       textParts: result.textParts.length,
       toolResults: result.toolResults?.length || 0, // 工具调用数量
-      textContent: result.textParts.join(''),
-      conversationId: result.conversationId,
+      textLength: result.textParts.join('').length,
+      conversationId: maskId(result.conversationId),
       // 工具调用详细信息
       toolSummary: result.toolResults?.map(t => ({
         name: t.toolName,
@@ -201,8 +202,11 @@ export class SiderClient {
         // 处理不同类型的响应数据
         switch (data.data.type) {
           case 'credit_info':
-            // 配额信息，记录但不处理
-            consola.debug('Credit info received');
+            // 配额信息和心跳事件属于 Sider 常规流控事件，静默跳过。
+            break;
+
+          case 'pulse':
+          case 'tag_stream':
             break;
 
           case 'message_start':
@@ -368,14 +372,27 @@ export class SiderClient {
             break;
 
           default:
-            consola.debug('Unknown SSE event type:', (data.data as any).type);
+            consola.debug('Unknown Sider SSE event type:', {
+              type: (data.data as any).type || 'unknown',
+            });
         }
 
       } catch (error) {
-        consola.warn('Failed to parse SSE data:', { line: dataStr, error });
+        consola.warn('Failed to parse Sider SSE data:', {
+          dataLength: dataStr.length,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
   }
+}
+
+function maskId(id?: string): string {
+  if (!id) {
+    return 'new';
+  }
+
+  return id.length > 12 ? `${id.substring(0, 12)}...` : id;
 }
 
 /**

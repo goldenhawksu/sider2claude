@@ -69,7 +69,8 @@ export type SiderResponseData =
   | SiderTextContent
   | SiderToolCallStart
   | SiderToolCallProgress
-  | SiderToolCallResult;
+  | SiderToolCallResult
+  | SiderIgnoredEvent;
 
 // 配额信息类型
 export interface SiderCreditInfo {
@@ -115,6 +116,12 @@ export interface SiderTextContent {
   type: 'text';
   model: string;
   text: string;
+}
+
+export interface SiderIgnoredEvent {
+  type: 'pulse' | 'tag_stream';
+  model?: string;
+  [key: string]: unknown;
 }
 
 // 解析后的完整响应类型

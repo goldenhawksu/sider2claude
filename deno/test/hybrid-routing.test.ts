@@ -206,6 +206,26 @@ Deno.test('路由策略：普通 Claude 对话由 Sider 提供', () => {
   assertEquals(decision.ruleId, 'rule_5_simple_chat_prefer_sider');
 });
 
+Deno.test('路由策略：PPT/长文档生成请求直接由 DeepSeek 处理，避免 Sider 长等待后回退', () => {
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(request({
+    max_tokens: 4096,
+    messages: [{
+      role: 'user',
+      content: `做一个PPT，用以下内容：
+一个伪心理师的呓语：
+她的心里住着两个小可爱，一个叫菲卡，另一个叫查乃。
+
+请整理为 8 页幻灯片，每页包含标题、正文要点和演讲备注。`,
+    }],
+  }));
+
+  assertEquals(decision.backend, 'deepseek');
+  assertEquals(decision.ruleId, 'rule_5_long_form_generation');
+  assertEquals(decision.allowFallback, true);
+});
+
 Deno.test('路由策略：Claude Code 工具能力由 DeepSeek 补齐', () => {
   const router = new RouterEngine(baseConfig());
 

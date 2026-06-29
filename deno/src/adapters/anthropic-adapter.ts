@@ -31,7 +31,7 @@ export class AnthropicApiAdapter {
   async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
-    const upstreamRequest = this.buildUpstreamRequest(request);
+    const upstreamRequest = this.buildUpstreamRequest(request, false);
 
     console.info('Forwarding Anthropic-compatible request:', {
       provider: this.provider,
@@ -96,11 +96,11 @@ export class AnthropicApiAdapter {
     };
   }
 
-  private buildUpstreamRequest(request: AnthropicRequest): AnthropicRequest {
+  private buildUpstreamRequest(request: AnthropicRequest, stream: boolean): AnthropicRequest {
     const upstreamRequest = {
       ...request,
       model: this.upstreamModel,
-      stream: false,
+      stream,
       messages: this.sanitizeMessagesForUpstream(request.messages),
     } as AnthropicRequest & Record<string, unknown>;
 
@@ -294,13 +294,91 @@ export class AnthropicApiAdapter {
     onComplete: () => void,
     onError: (error: Error) => void,
   ): Promise<void> {
+    const outwardModel = request.model;
+    const upstreamRequest = this.buildUpstreamRequest(request, true);
+
     try {
-      const response = await this.sendRequest({ ...request, stream: false });
-      onChunk({ type: 'message_start', message: response });
+      const response = await fetch(`${this.baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(upstreamRequest),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Anthropic-compatible backend stream error:', {
+          provider: this.provider,
+          status: response.status,
+          statusText: response.statusText,
+          preview: errorText.substring(0, 300),
+        });
+        throw new Error(`${this.provider} API error: ${response.status} ${response.statusText}`);
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error(`${this.provider} API returned no response body`);
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            this.forwardSSELine(line.trim(), outwardModel, onChunk);
+          }
+        }
+
+        if (buffer.trim()) {
+          this.forwardSSELine(buffer.trim(), outwardModel, onChunk);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
       onComplete();
     } catch (error) {
       onError(error instanceof Error ? error : new Error('Stream error'));
     }
+  }
+
+  /**
+   * 透传一行上游 SSE 事件。DeepSeek 输出已是 Anthropic SSE 格式，仅在 message_start
+   * 把上游模型名改回对外 Claude 模型名，其余（thinking_delta / input_json_delta 等）原样透传。
+   */
+  private forwardSSELine(
+    line: string,
+    outwardModel: string,
+    onChunk: (chunk: unknown) => void,
+  ): void {
+    if (!line.startsWith('data:')) {
+      return;
+    }
+    const dataStr = line.substring(5).trim();
+    if (!dataStr || dataStr === '[DONE]') {
+      return;
+    }
+
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(dataStr) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+
+    if (event.type === 'message_start' && event.message && typeof event.message === 'object') {
+      (event.message as Record<string, unknown>).model = outwardModel;
+    }
+
+    onChunk(event);
   }
 
   async healthCheck(): Promise<boolean> {

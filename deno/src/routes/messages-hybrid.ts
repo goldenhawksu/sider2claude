@@ -13,8 +13,8 @@ import type {
   AnthropicError,
   AnthropicRequest,
   AnthropicResponse,
-  AnthropicResponseContent,
 } from '../types/anthropic.ts';
+import type { SiderRequest } from '../types/sider.ts';
 import {
   convertAnthropicToSider,
   convertAnthropicToSiderAsync,
@@ -83,6 +83,19 @@ messagesRouter.post('/', async (c: Context) => {
     }
 
     const decision = routerEngine.decide(anthropicRequest, conversationId);
+
+    // 流式请求走端到端真流式路径。SSE 一旦开始吐字无法换后端，故流式不做后端 fallback
+    // （延迟优先，这是 SSE 代理的通行做法）；上游失败时在流内发 error 事件。
+    if (anthropicRequest.stream) {
+      return await handleStreamingRequest(
+        anthropicRequest,
+        auth.token,
+        decision.backend,
+        conversationId,
+        parentMessageId,
+      );
+    }
+
     let selectedBackend: Backend = decision.backend;
     let response: AnthropicResponse;
 
@@ -134,10 +147,6 @@ messagesRouter.post('/', async (c: Context) => {
       } else {
         throw error;
       }
-    }
-
-    if (anthropicRequest.stream) {
-      return createStreamingResponse(response);
     }
 
     const jsonResponse = c.json(response);
@@ -318,13 +327,17 @@ messagesRouter.post('/sider-sessions/cleanup', (c: Context) => {
   }
 });
 
-async function callSider(
+function isThinkingEnabled(request: AnthropicRequest): boolean {
+  return request.thinking?.type === 'enabled';
+}
+
+async function buildSiderRequest(
   anthropicRequest: AnthropicRequest,
   authToken: string,
   conversationId?: string,
   parentMessageId?: string,
-): Promise<AnthropicResponse> {
-  let siderRequest;
+): Promise<{ siderRequest: SiderRequest; siderAuthToken: string }> {
+  let siderRequest: SiderRequest;
   const siderAuthToken = config.sider.authToken || authToken;
 
   if (conversationId) {
@@ -346,146 +359,263 @@ async function callSider(
     siderRequest.parent_message_id = parentMessageId;
   }
 
-  const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
-  return convertSiderToAnthropic(siderResponse, anthropicRequest.model);
+  return { siderRequest, siderAuthToken };
 }
 
-function createStreamingResponse(response: AnthropicResponse) {
+async function callSider(
+  anthropicRequest: AnthropicRequest,
+  authToken: string,
+  conversationId?: string,
+  parentMessageId?: string,
+): Promise<AnthropicResponse> {
+  const { siderRequest, siderAuthToken } = await buildSiderRequest(
+    anthropicRequest,
+    authToken,
+    conversationId,
+    parentMessageId,
+  );
+
+  const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
+  return convertSiderToAnthropic(siderResponse, anthropicRequest.model, {
+    includeThinking: isThinkingEnabled(anthropicRequest),
+  });
+}
+
+const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-store, must-revalidate',
+  'Connection': 'keep-alive',
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'X-Accel-Buffering': 'no',
+};
+
+function generateStreamMessageId(): string {
+  return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+}
+
+/**
+ * 流式请求分流：按路由决策选定后端，进入对应的真流式实现。
+ */
+async function handleStreamingRequest(
+  anthropicRequest: AnthropicRequest,
+  authToken: string,
+  backend: Backend,
+  conversationId?: string,
+  parentMessageId?: string,
+): Promise<Response> {
+  if (backend === 'deepseek') {
+    if (!capabilityAdapter) {
+      throw new Error('DeepSeek capability backend is not configured');
+    }
+    if (conversationId) {
+      routerEngine.recordSessionBackend(conversationId, 'deepseek');
+    }
+    return createDeepSeekStreamingResponse(capabilityAdapter, anthropicRequest);
+  }
+
+  if (conversationId) {
+    routerEngine.recordSessionBackend(conversationId, 'sider');
+  }
+
+  const { siderRequest, siderAuthToken } = await buildSiderRequest(
+    anthropicRequest,
+    authToken,
+    conversationId,
+    parentMessageId,
+  );
+
+  return createTrueSiderStreamingResponse(
+    siderRequest,
+    siderAuthToken,
+    anthropicRequest.model,
+    isThinkingEnabled(anthropicRequest),
+  );
+}
+
+/**
+ * Sider 真流式：用 content block 状态机把 Sider SSE 事件实时映射为 Anthropic SSE。
+ * reasoning_content -> thinking 块（仅在请求开启 thinking 时）；text -> text 块。
+ */
+function createTrueSiderStreamingResponse(
+  siderRequest: SiderRequest,
+  siderAuthToken: string,
+  outwardModel: string,
+  includeThinking: boolean,
+): Response {
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
-    start(controller) {
+    async start(controller) {
+      let closed = false;
       const send = (event: unknown) => {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
       };
+      const safeClose = () => {
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      };
 
-      try {
+      const messageId = generateStreamMessageId();
+      let started = false;
+      let blockIndex = -1;
+      let currentBlock: 'thinking' | 'text' | null = null;
+      let outputChars = 0;
+
+      const ensureStart = () => {
+        if (started) return;
+        started = true;
         send({
           type: 'message_start',
           message: {
-            id: response.id,
+            id: messageId,
             type: 'message',
             role: 'assistant',
             content: [],
-            model: response.model,
+            model: outwardModel,
             stop_reason: null,
-            usage: { input_tokens: response.usage.input_tokens, output_tokens: 0 },
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+      };
+
+      const closeBlock = () => {
+        if (currentBlock !== null) {
+          send({ type: 'content_block_stop', index: blockIndex });
+          currentBlock = null;
+        }
+      };
+
+      const openBlock = (type: 'thinking' | 'text') => {
+        closeBlock();
+        blockIndex += 1;
+        currentBlock = type;
+        send({
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: type === 'thinking'
+            ? { type: 'thinking', thinking: '' }
+            : { type: 'text', text: '' },
+        });
+      };
+
+      try {
+        await siderClient.chatStream(siderRequest, siderAuthToken, {
+          onMessageStart() {
+            ensureStart();
+          },
+          onReasoningContent(data) {
+            if (!includeThinking) return;
+            const text = data.reasoning_content?.text;
+            if (!text) return;
+            ensureStart();
+            if (currentBlock !== 'thinking') {
+              openBlock('thinking');
+            }
+            send({
+              type: 'content_block_delta',
+              index: blockIndex,
+              delta: { type: 'thinking_delta', thinking: text },
+            });
+          },
+          onText(data) {
+            if (!data.text) return;
+            ensureStart();
+            if (currentBlock !== 'text') {
+              openBlock('text');
+            }
+            outputChars += data.text.length;
+            send({
+              type: 'content_block_delta',
+              index: blockIndex,
+              delta: { type: 'text_delta', text: data.text },
+            });
           },
         });
 
-        response.content.forEach((block, index) => {
-          streamContentBlock(block, index, send);
-        });
-
+        // 流正常结束：极端情况下没有任何事件，也要先发 message_start。
+        ensureStart();
+        closeBlock();
         send({
           type: 'message_delta',
-          delta: { stop_reason: response.stop_reason || 'end_turn' },
-          usage: { output_tokens: response.usage.output_tokens },
+          delta: { stop_reason: 'end_turn' },
+          usage: { output_tokens: Math.ceil(outputChars / 4) },
         });
         send({ type: 'message_stop' });
-        controller.close();
+        safeClose();
       } catch (error) {
-        controller.error(error);
+        console.error('Sider streaming failed:', error);
+        ensureStart();
+        closeBlock();
+        send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: error instanceof Error ? error.message : 'Sider streaming error',
+          },
+        });
+        safeClose();
       }
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'X-Accel-Buffering': 'no',
-    },
-  });
+  return new Response(stream, { headers: SSE_HEADERS });
 }
 
-function streamContentBlock(
-  block: AnthropicResponseContent,
-  index: number,
-  send: (event: unknown) => void,
-) {
-  if (block.type === 'text') {
-    send({
-      type: 'content_block_start',
-      index,
-      content_block: { type: 'text', text: '' },
-    });
+/**
+ * DeepSeek 真流式：DeepSeek 的 /v1/messages 原生输出 Anthropic SSE，直接透传上游事件。
+ */
+function createDeepSeekStreamingResponse(
+  adapter: AnthropicApiAdapter,
+  request: AnthropicRequest,
+): Response {
+  const encoder = new TextEncoder();
 
-    if (block.text) {
-      send({
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'text_delta', text: block.text },
-      });
-    }
+  const stream = new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      const send = (event: unknown) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
+      const safeClose = () => {
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      };
 
-    send({ type: 'content_block_stop', index });
-    return;
-  }
-
-  if (block.type === 'thinking') {
-    send({
-      type: 'content_block_start',
-      index,
-      content_block: {
-        type: 'thinking',
-        thinking: '',
-        ...(block.signature ? { signature: block.signature } : {}),
-      },
-    });
-
-    if (block.thinking) {
-      send({
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'thinking_delta', thinking: block.thinking },
-      });
-    }
-
-    if (block.signature) {
-      send({
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'signature_delta', signature: block.signature },
-      });
-    }
-
-    send({ type: 'content_block_stop', index });
-    return;
-  }
-
-  if (block.type === 'redacted_thinking') {
-    send({
-      type: 'content_block_start',
-      index,
-      content_block: { type: 'redacted_thinking', data: block.data },
-    });
-    send({ type: 'content_block_stop', index });
-    return;
-  }
-
-  send({
-    type: 'content_block_start',
-    index,
-    content_block: {
-      type: 'tool_use',
-      id: block.id,
-      name: block.name,
-      input: {},
+      try {
+        await adapter.sendStreamRequest(
+          request,
+          (chunk) => send(chunk),
+          () => safeClose(),
+          (error) => {
+            send({
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message: error.message,
+              },
+            });
+            safeClose();
+          },
+        );
+      } catch (error) {
+        send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: error instanceof Error ? error.message : 'DeepSeek streaming error',
+          },
+        });
+        safeClose();
+      }
     },
   });
-  send({
-    type: 'content_block_delta',
-    index,
-    delta: {
-      type: 'input_json_delta',
-      partial_json: JSON.stringify(block.input || {}),
-    },
-  });
-  send({ type: 'content_block_stop', index });
+
+  return new Response(stream, { headers: SSE_HEADERS });
 }
 
 export { messagesRouter as hybridMessagesRouter };

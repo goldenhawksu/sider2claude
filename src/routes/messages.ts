@@ -50,7 +50,7 @@ messagesRouter.post('/', async (c: Context) => {
       toolCount: anthropicRequest.tools?.length || 0,
       hasSystem: !!anthropicRequest.system,
       stream: !!anthropicRequest.stream,
-    },"@@@",anthropicRequest);
+    });
 
     // 打印会话历史摘要（用于调试会话保持）
     if (anthropicRequest.messages.length > 1) {

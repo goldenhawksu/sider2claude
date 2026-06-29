@@ -104,7 +104,12 @@ export async function convertAnthropicToSiderAsync(
   authToken: string,
   conversationId?: string
 ): Promise<SiderRequest> {
-  consola.info("@@@ anthropicRequest", anthropicRequest);
+  consola.info('Converting Anthropic request to Sider async format:', {
+    model: anthropicRequest.model,
+    messageCount: anthropicRequest.messages.length,
+    toolCount: anthropicRequest.tools?.length || 0,
+    hasConversationId: !!conversationId,
+  });
 
   // 1. 提取最后一条用户消息（当前输入）
   const userMessages = anthropicRequest.messages.filter(msg => msg.role === 'user');
