@@ -112,7 +112,7 @@ RouterEngine
 - `src/config/models.ts`
 - `deno/src/config/models.ts`
 
-当前对外暴露 18 个 Claude 模型/别名。新增、删除或改映射时，必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`。
+当前对外暴露 22 个 Claude 模型/别名。新增、删除或改映射时，必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`。
 
 未知 Claude 模型按家族保守映射：
 
