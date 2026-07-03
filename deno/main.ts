@@ -12,6 +12,7 @@ import { logger } from 'hono/logger';
 import { hybridMessagesRouter } from './src/routes/messages-hybrid.ts';
 import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
+import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
 
 const app = new Hono();
@@ -55,6 +56,10 @@ app.get('/', (c) => {
       health: '/health',
       models: '/v1/models',
       messages: '/v1/messages',
+      openai_chat_completions: '/v1/chat/completions',
+      openai_responses: '/v1/responses',
+      gemini_generate_content: '/v1beta/models/{model}:generateContent',
+      gemini_stream_generate_content: '/v1beta/models/{model}:streamGenerateContent',
       complete: '/v1/complete',
       count_tokens: '/v1/messages/count_tokens',
       conversations: '/v1/messages/conversations',
@@ -73,6 +78,7 @@ app.get('/', (c) => {
 app.route('/v1/models', modelsRouter);
 app.route('/v1/messages', hybridMessagesRouter); // 使用混合路由
 app.route('/v1/complete', completeRouter);
+app.route('/', protocolRouter);
 
 // 404 处理
 app.notFound((c) => {

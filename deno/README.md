@@ -7,8 +7,10 @@
 - 普通 Claude 对话走 Sider。
 - Claude Code 工具、MCP 工具、自定义 `tool_use` 走 DeepSeek Anthropic 兼容接口。
 - DeepSeek 默认模型为 `deepseek-v4-flash`。
-- DeepSeek 的响应侧 `thinking`、`redacted_thinking`、`tool_use` 内容块会按 Anthropic Messages 结构透传。
-- 发往 DeepSeek 的历史工具轮会先转录为文本，避免上游要求完整 `content[].thinking` passback 而返回 400。
+- DeepSeek 的响应侧 `thinking`、`redacted_thinking`、`tool_use` 内容块会按 Anthropic Messages
+  结构透传。
+- 发往 DeepSeek 的历史工具轮会先转录为文本，避免上游要求完整 `content[].thinking` passback 而返回
+  400。
 
 ## 快速启动
 
@@ -42,24 +44,25 @@ curl http://localhost:8000/v1/messages/backends/status \
 
 ## 环境变量
 
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `AUTH_TOKEN` | 客户端访问本服务的 token | 无 |
-| `SIDER_AUTH_TOKEN` | 访问 Sider 的 JWT | 无 |
-| `SIDER_API_URL` | Sider completions 端点 | `https://sider.ai/api/chat/v1/completions` |
-| `DEEPSEEK_BASE_URL` | DeepSeek Anthropic 兼容入口 | `https://api.deepseek.com/anthropic` |
-| `DEEPSEEK_API_KEY` | DeepSeek API Key | 无 |
-| `DEEPSEEK_MODEL` | DeepSeek 工具能力补齐模型 | `deepseek-v4-flash` |
-| `DEFAULT_BACKEND` | 默认后端，支持 `sider` / `deepseek` | `sider` |
-| `AUTO_FALLBACK` | 普通对话失败时是否自动降级 | `true` |
-| `PREFER_SIDER_FOR_CHAT` | 普通对话是否优先 Sider | `true` |
-| `DEBUG_ROUTING` | 是否输出详细路由决策 | `false` |
-| `REQUEST_TIMEOUT` | 请求超时毫秒数 | `30000` |
+| 变量                    | 说明                                | 默认值                                     |
+| ----------------------- | ----------------------------------- | ------------------------------------------ |
+| `AUTH_TOKEN`            | 客户端访问本服务的 token            | 无                                         |
+| `SIDER_AUTH_TOKEN`      | 访问 Sider 的 JWT                   | 无                                         |
+| `SIDER_API_URL`         | Sider completions 端点              | `https://sider.ai/api/chat/v1/completions` |
+| `DEEPSEEK_BASE_URL`     | DeepSeek Anthropic 兼容入口         | `https://api.deepseek.com/anthropic`       |
+| `DEEPSEEK_API_KEY`      | DeepSeek API Key                    | 无                                         |
+| `DEEPSEEK_MODEL`        | DeepSeek 工具能力补齐模型           | `deepseek-v4-flash`                        |
+| `DEFAULT_BACKEND`       | 默认后端，支持 `sider` / `deepseek` | `sider`                                    |
+| `AUTO_FALLBACK`         | 普通对话失败时是否自动降级          | `true`                                     |
+| `PREFER_SIDER_FOR_CHAT` | 普通对话是否优先 Sider              | `true`                                     |
+| `DEBUG_ROUTING`         | 是否输出详细路由决策                | `false`                                    |
+| `REQUEST_TIMEOUT`       | 请求超时毫秒数                      | `30000`                                    |
 
 兼容旧部署变量：
 
 - `ANTHROPIC_BASE_URL` 仅在指向 `deepseek.com` 时作为 `DEEPSEEK_BASE_URL` 旧别名。
-- `ANTHROPIC_API_KEY` 仅在没有非 DeepSeek 的 `ANTHROPIC_BASE_URL` 干扰时作为 `DEEPSEEK_API_KEY` 旧别名。
+- `ANTHROPIC_API_KEY` 仅在没有非 DeepSeek 的 `ANTHROPIC_BASE_URL` 干扰时作为 `DEEPSEEK_API_KEY`
+  旧别名。
 - `DEFAULT_BACKEND=anthropic` 会兼容映射为 `deepseek`。
 
 推荐使用 `DEEPSEEK_*` 显式配置工具能力兜底，避免和 Claude Code 客户端变量混淆。
@@ -113,7 +116,10 @@ deno task regression
 npm run test:regression
 ```
 
-真实服务级集成测试中，健康检查、模型列表、基础消息、流式响应、token 计数和 DeepSeek 工具路径应通过。DeepSeek 工具路径还应覆盖带历史 `tool_use` / `tool_result` 的续轮请求。`03-session-persistence` 的多轮语义断言依赖 Sider 上游是否复述测试上下文，可能出现模型行为层面的波动。
+真实服务级集成测试中，健康检查、模型列表、基础消息、流式响应、token 计数和 DeepSeek
+工具路径应通过。DeepSeek 工具路径还应覆盖带历史 `tool_use` / `tool_result`
+的续轮请求。`03-session-persistence` 的多轮语义断言依赖 Sider
+上游是否复述测试上下文，可能出现模型行为层面的波动。
 
 服务级集成测试需要先启动服务，然后在另一个终端运行：
 

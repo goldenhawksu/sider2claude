@@ -3,13 +3,14 @@
  * 将 Anthropic API 请求转换为 Sider API 格式
  */
 
-import type { AnthropicContent, AnthropicRequest, SiderRequest } from '../types';
+import type { AnthropicRequest, SiderRequest } from '../types';
 import type { SiderTools } from '../types/sider';
 import { consola } from 'consola';
 // import { getOrCreateConversation, getParentMessageId } from './conversation-manager.js'; // Fallback functions, not used in current version
 import { siderConversationClient } from './sider-conversation.js';
 import { getNextParentMessageId, isContinuousConversation } from './sider-session-manager.js';
 import { mapModelName } from '../config/models';
+import { buildSiderMessageText } from './message-format';
 
 /**
  * 转换 Anthropic 请求到 Sider 格式（同步版本，用于新会话）
@@ -257,11 +258,11 @@ function buildRequestText(
   currentUserInput: string,
   conversationId?: string,
 ): string {
-  if (hasRealSiderConversation(conversationId) || anthropicRequest.messages.length === 1) {
-    return buildSingleTurnText(anthropicRequest, currentUserInput);
-  }
-
-  return buildInlineHistoryText(anthropicRequest);
+  return buildSiderMessageText(anthropicRequest, {
+    currentUserInput,
+    includeHistory: !hasRealSiderConversation(conversationId) &&
+      anthropicRequest.messages.length > 1,
+  });
 }
 
 function hasRealSiderConversation(conversationId?: string): boolean {
@@ -270,78 +271,6 @@ function hasRealSiderConversation(conversationId?: string): boolean {
 
 function getRealSiderConversationId(conversationId?: string): string {
   return hasRealSiderConversation(conversationId) ? conversationId! : '';
-}
-
-function buildSingleTurnText(
-  anthropicRequest: AnthropicRequest,
-  currentUserInput: string,
-): string {
-  if (anthropicRequest.system && anthropicRequest.messages.length === 1) {
-    return `${anthropicRequest.system}\n\n${currentUserInput}`;
-  }
-
-  return currentUserInput;
-}
-
-function buildInlineHistoryText(anthropicRequest: AnthropicRequest): string {
-  const parts: string[] = [];
-
-  if (anthropicRequest.system) {
-    parts.push(`System: ${anthropicRequest.system}`);
-  }
-
-  for (const message of anthropicRequest.messages) {
-    const text = contentToTranscript(message.content).trim();
-    if (!text) {
-      continue;
-    }
-
-    const role = message.role === 'assistant' ? 'Assistant' : 'User';
-    parts.push(`${role}: ${text}`);
-  }
-
-  parts.push('Assistant:');
-  return parts.join('\n\n');
-}
-
-function contentToTranscript(content: string | AnthropicContent[]): string {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  return content
-    .flatMap((block) => contentBlockToTranscript(block))
-    .join('\n')
-    .trim();
-}
-
-function contentBlockToTranscript(block: AnthropicContent): string[] {
-  if (block.type === 'text') {
-    return block.text ? [block.text] : [];
-  }
-
-  if (block.type === 'tool_use') {
-    return [
-      `[tool_use:${block.name || 'unknown'}] id=${block.id || ''} input=${
-        JSON.stringify(block.input ?? {})
-      }`,
-    ];
-  }
-
-  if (block.type === 'tool_result') {
-    const content = typeof block.content === 'string'
-      ? block.content
-      : Array.isArray(block.content)
-      ? contentToTranscript(block.content)
-      : '';
-    return [
-      `[tool_result] tool_use_id=${block.tool_use_id || ''}${
-        block.is_error ? ' is_error=true' : ''
-      }${content ? `\n${content}` : ''}`,
-    ];
-  }
-
-  return [];
 }
 
 // 模型映射函数已移至 ../config/models.ts，通过 import 引入

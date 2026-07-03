@@ -14,6 +14,7 @@ import { consola } from 'consola';
 import { hybridMessagesRouter } from './routes/messages-hybrid'; // 使用混合路由
 import modelsRouter from './routes/models';
 import completeRouter from './routes/complete';
+import protocolRouter from './routes/protocols';
 import { router } from './routes';
 import { getEnv } from './utils/env';
 
@@ -51,6 +52,10 @@ app.get('/', (c) => {
       health: '/health',
       models: '/v1/models',
       messages: '/v1/messages',
+      openai_chat_completions: '/v1/chat/completions',
+      openai_responses: '/v1/responses',
+      gemini_generate_content: '/v1beta/models/{model}:generateContent',
+      gemini_stream_generate_content: '/v1beta/models/{model}:streamGenerateContent',
       complete: '/v1/complete',
       count_tokens: '/v1/messages/count_tokens',
       backends_status: '/v1/messages/backends/status',
@@ -68,6 +73,7 @@ app.get('/', (c) => {
 app.route('/v1/models', modelsRouter);
 app.route('/v1/messages', hybridMessagesRouter); // 使用混合路由
 app.route('/v1/complete', completeRouter);
+app.route('/', protocolRouter);
 app.route('/api', router); // 测试路由
 
 // 404 处理
