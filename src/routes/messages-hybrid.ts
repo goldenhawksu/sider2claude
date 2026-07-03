@@ -8,7 +8,7 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import { requireAuth, getAuthInfo } from '../middleware/auth';
+import { getAuthInfo, requireAuth } from '../middleware/auth';
 import type {
   AnthropicError,
   AnthropicRequest,
@@ -21,35 +21,19 @@ import {
   validateAnthropicRequest,
 } from '../utils/request-converter';
 import { siderClient } from '../utils/sider-client';
-import {
-  convertSiderToAnthropic,
-  createErrorResponse,
-  getSessionHeaders,
-} from '../utils/response-converter';
-import {
-  cleanupExpiredConversations,
-  getConversationStats,
-} from '../utils/conversation-manager';
-import {
-  cleanupExpiredSiderSessions,
-  getSiderSessionStats,
-} from '../utils/sider-session-manager';
-import {
-  getBackendDisplayName,
-  loadBackendConfig,
-  type Backend,
-} from '../config/backends';
+import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
+import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
+import { cleanupExpiredSiderSessions, getSiderSessionStats } from '../utils/sider-session-manager';
+import { type Backend, getBackendDisplayName, loadBackendConfig } from '../config/backends';
 import { RouterEngine } from '../routing/router-engine';
-import { AnthropicApiAdapter } from '../adapters/anthropic-adapter';
+import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter';
 import { consola } from 'consola';
 
 const messagesRouter = new Hono();
 
 const config = loadBackendConfig();
 const routerEngine = new RouterEngine(config);
-const capabilityAdapter = config.deepseek.enabled
-  ? new AnthropicApiAdapter(config.deepseek)
-  : null;
+const capabilityAdapter = config.deepseek.enabled ? new AnthropicApiAdapter(config.deepseek) : null;
 
 messagesRouter.use('*', requireAuth);
 
@@ -57,13 +41,16 @@ messagesRouter.post('/', async (c: Context) => {
   try {
     const auth = getAuthInfo(c);
     if (!auth) {
-      return c.json({
-        type: 'error',
-        error: {
-          type: 'authentication_error',
-          message: 'Authentication required',
-        },
-      } satisfies AnthropicError, 401);
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'authentication_error',
+            message: 'Authentication required',
+          },
+        } satisfies AnthropicError,
+        401,
+      );
     }
 
     const anthropicRequest = await c.req.json() as AnthropicRequest;
@@ -168,33 +155,84 @@ messagesRouter.post('/', async (c: Context) => {
   } catch (error) {
     consola.error('Messages API error:', error);
 
-    if (error instanceof Error && (
-      error.message.includes('Missing required field') ||
-      error.message.includes('Invalid') ||
-      error.message.includes('cannot be empty')
-    )) {
-      return c.json({
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          message: error.message,
-        },
-      } satisfies AnthropicError, 400);
+    if (
+      error instanceof Error && (
+        error.message.includes('Missing required field') ||
+        error.message.includes('Invalid') ||
+        error.message.includes('cannot be empty')
+      )
+    ) {
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: error.message,
+          },
+        } satisfies AnthropicError,
+        400,
+      );
+    }
+
+    if (error instanceof AnthropicBackendError) {
+      const status = normalizeErrorStatus(error.statusCode);
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: mapErrorStatusToType(error.statusCode),
+            message: error.message,
+          },
+        } satisfies AnthropicError,
+        status,
+      );
     }
 
     if (error instanceof Error) {
-      return c.json(createErrorResponse(error, 'unknown'), 500);
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: error.message,
+          },
+        } satisfies AnthropicError,
+        500,
+      );
     }
 
-    return c.json({
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: 'Internal server error',
-      },
-    } satisfies AnthropicError, 500);
+    return c.json(
+      {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: 'Internal server error',
+        },
+      } satisfies AnthropicError,
+      500,
+    );
   }
 });
+
+function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 503 {
+  if (statusCode === 400) return 400;
+  if (statusCode === 401) return 401;
+  if (statusCode === 403) return 403;
+  if (statusCode === 404) return 404;
+  if (statusCode === 429) return 429;
+  if (statusCode === 503) return 503;
+  return 500;
+}
+
+function mapErrorStatusToType(statusCode: number): AnthropicError['error']['type'] {
+  if (statusCode === 400) return 'invalid_request_error';
+  if (statusCode === 401) return 'authentication_error';
+  if (statusCode === 403) return 'permission_error';
+  if (statusCode === 404) return 'not_found_error';
+  if (statusCode === 429) return 'rate_limit_error';
+  if (statusCode === 503) return 'overloaded_error';
+  return 'api_error';
+}
 
 messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
@@ -203,13 +241,16 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
     try {
       validateAnthropicRequest(body as AnthropicRequest);
     } catch (validationError) {
-      return c.json({
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          message: validationError instanceof Error ? validationError.message : 'Invalid request',
-        },
-      } satisfies AnthropicError, 400);
+      return c.json(
+        {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            message: validationError instanceof Error ? validationError.message : 'Invalid request',
+          },
+        } satisfies AnthropicError,
+        400,
+      );
     }
 
     const totalLength = JSON.stringify(body.messages || []).length;
@@ -218,13 +259,16 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
     });
   } catch (error) {
     consola.error('Token count error:', error);
-    return c.json({
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: 'Token counting failed',
-      },
-    } satisfies AnthropicError, 500);
+    return c.json(
+      {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: 'Token counting failed',
+        },
+      } satisfies AnthropicError,
+      500,
+    );
   }
 });
 

@@ -1,4 +1,4 @@
-import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter.ts';
+import { AnthropicApiAdapter, AnthropicBackendError } from '../src/adapters/anthropic-adapter.ts';
 import type { AnthropicRequest } from '../src/types/anthropic.ts';
 
 function assertEquals<T>(actual: T, expected: T) {
@@ -222,12 +222,14 @@ Deno.test('DeepSeek 适配器：转发工具历史时转录工具上下文以避
           required: ['command'],
         },
       }],
+      tool_choice: { type: 'tool', name: 'Bash' },
       thinking: { type: 'enabled', budget_tokens: 1024 },
     } as unknown as AnthropicRequest);
 
     assertEquals(calls.length, 1);
     assertEquals(calls[0].body.model, 'deepseek-v4-flash');
     assertEquals(calls[0].body.thinking, undefined);
+    assertEquals(calls[0].body.tool_choice, undefined);
 
     const assistantContent = calls[0].body.messages[0].content;
     if (typeof assistantContent !== 'string') {
@@ -242,6 +244,47 @@ Deno.test('DeepSeek 适配器：转发工具历史时转录工具上下文以避
     }
     assertEquals(userContent.includes('[tool_result]'), true);
     assertEquals(userContent.includes('/repo'), true);
+    assertEquals(userContent.includes('Tool choice requirement: call the tool named "Bash"'), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('DeepSeek 适配器：上游错误保留状态码用于路由层透传', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = (() => {
+    return Promise.resolve(
+      new Response('bad tool_choice', {
+        status: 400,
+        statusText: 'Bad Request',
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'deepseek-token',
+      model: 'deepseek-v4-flash',
+    });
+
+    try {
+      await adapter.sendRequest({
+        model: 'claude-sonnet-4.6',
+        messages: [{ role: 'user', content: 'hello' }],
+        max_tokens: 128,
+      });
+      throw new Error('断言失败：期望抛出 AnthropicBackendError');
+    } catch (error) {
+      if (!(error instanceof AnthropicBackendError)) {
+        throw error;
+      }
+      assertEquals(error.statusCode, 400);
+      assertEquals(error.provider, 'deepseek');
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }

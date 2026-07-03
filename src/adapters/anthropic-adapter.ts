@@ -15,6 +15,17 @@ import type {
 import type { AnthropicBackendConfig } from '../config/backends';
 import { consola } from 'consola';
 
+export class AnthropicBackendError extends Error {
+  constructor(
+    message: string,
+    public statusCode: number,
+    public provider: AnthropicBackendConfig['provider'],
+  ) {
+    super(message);
+    this.name = 'AnthropicBackendError';
+  }
+}
+
 export class AnthropicApiAdapter {
   private baseUrl: string;
   private apiKey: string;
@@ -58,14 +69,20 @@ export class AnthropicApiAdapter {
         preview: errorText.substring(0, 300),
         elapsed: `${elapsed}ms`,
       });
-      throw new Error(`${this.provider} API error: ${response.status} ${response.statusText}`);
+      throw new AnthropicBackendError(
+        `${this.provider} API error: ${response.status} ${response.statusText}`,
+        response.status,
+        this.provider,
+      );
     }
 
     const contentType = response.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
       const responseText = await response.text();
       throw new Error(
-        `${this.provider} API returned non-JSON response: ${contentType || 'unknown'} ${responseText.substring(0, 120)}`,
+        `${this.provider} API returned non-JSON response: ${contentType || 'unknown'} ${
+          responseText.substring(0, 120)
+        }`,
       );
     }
 
@@ -95,21 +112,75 @@ export class AnthropicApiAdapter {
   }
 
   private buildUpstreamRequest(request: AnthropicRequest): AnthropicRequest {
+    const messages = this.applyToolChoiceInstruction(
+      this.sanitizeMessagesForUpstream(request.messages),
+      request.tool_choice,
+    );
+
     const upstreamRequest = {
       ...request,
       model: this.upstreamModel,
       stream: false,
-      messages: this.sanitizeMessagesForUpstream(request.messages),
+      messages,
     } as AnthropicRequest & Record<string, unknown>;
 
     // DeepSeek 的 Anthropic 兼容端会强制要求完整回传 thinking 块。
     // Claude Code 工具循环里历史 thinking 可能被压缩或重建，历史工具交互因此转成文本转录。
     delete upstreamRequest.thinking;
+    // DeepSeek 当前会拒绝 Anthropic 的强制 tool_choice；用提示保留意图，避免 400。
+    delete upstreamRequest.tool_choice;
 
     return upstreamRequest as AnthropicRequest;
   }
 
-  private sanitizeMessagesForUpstream(messages: AnthropicRequest['messages']): AnthropicRequest['messages'] {
+  private applyToolChoiceInstruction(
+    messages: AnthropicRequest['messages'],
+    toolChoice: AnthropicRequest['tool_choice'],
+  ): AnthropicRequest['messages'] {
+    const instruction = this.toolChoiceToInstruction(toolChoice);
+    if (!instruction) {
+      return messages;
+    }
+
+    const nextMessages = [...messages];
+    let lastUserIndex = -1;
+    for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+      if (nextMessages[index]?.role === 'user') {
+        lastUserIndex = index;
+        break;
+      }
+    }
+
+    if (lastUserIndex === -1) {
+      return [...nextMessages, { role: 'user', content: instruction }];
+    }
+
+    const message = nextMessages[lastUserIndex]!;
+    const instructionBlock: AnthropicContent = { type: 'text', text: instruction };
+    const content = typeof message.content === 'string'
+      ? `${message.content}\n\n${instruction}`
+      : [...message.content, instructionBlock];
+    nextMessages[lastUserIndex] = { role: message.role, content };
+    return nextMessages;
+  }
+
+  private toolChoiceToInstruction(
+    toolChoice: AnthropicRequest['tool_choice'],
+  ): string | undefined {
+    if (!toolChoice || toolChoice.type === 'auto') {
+      return undefined;
+    }
+
+    if (toolChoice.type === 'any') {
+      return 'Tool choice requirement: call one of the available tools for this turn.';
+    }
+
+    return `Tool choice requirement: call the tool named "${toolChoice.name}" for this turn.`;
+  }
+
+  private sanitizeMessagesForUpstream(
+    messages: AnthropicRequest['messages'],
+  ): AnthropicRequest['messages'] {
     return messages.flatMap((message) => {
       if (!Array.isArray(message.content)) {
         return [message];
@@ -122,10 +193,12 @@ export class AnthropicApiAdapter {
         return [];
       }
 
-      return [{
-        role: message.role,
-        content: text,
-      } satisfies AnthropicMessage];
+      return [
+        {
+          role: message.role,
+          content: text,
+        } satisfies AnthropicMessage,
+      ];
     });
   }
 
@@ -147,8 +220,8 @@ export class AnthropicApiAdapter {
     if (block.type === 'tool_result') {
       const content = this.toolResultContentToText(block.content);
       return [
-        `[tool_result] tool_use_id=${block.tool_use_id}${block.is_error ? ' is_error=true' : ''}`
-          + (content ? `\n${content}` : ''),
+        `[tool_result] tool_use_id=${block.tool_use_id}${block.is_error ? ' is_error=true' : ''}` +
+        (content ? `\n${content}` : ''),
       ];
     }
 
@@ -238,7 +311,9 @@ export class AnthropicApiAdapter {
         };
       }
 
-      throw new Error(`${this.provider} API returned unsupported content block type: ${String(item.type)}`);
+      throw new Error(
+        `${this.provider} API returned unsupported content block type: ${String(item.type)}`,
+      );
     });
   }
 
