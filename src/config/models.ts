@@ -56,6 +56,8 @@ const CLAUDE_MODELS: ModelInfo[] = [
   model('claude-4.5-sonnet-think'),
   model('claude-sonnet-4.6'),
   model('claude-sonnet-4.6-think'),
+  model('claude-sonnet-5'),
+  model('claude-sonnet-5-think'),
 
   // Haiku 系列
   model('claude-haiku-4.5'),
