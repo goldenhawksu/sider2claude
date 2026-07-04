@@ -7,7 +7,9 @@ set "ROOT=%ROOT:~0,-1%"
 set "ENV_FILE=%ROOT%\.env"
 set "ENV_EXAMPLE=%ROOT%\deno\.env.example"
 set "DENO_MAIN=%ROOT%\deno\main.ts"
+set "DENO_SERVE_MAIN=%ROOT%\deno\serve.ts"
 set "BUN_MAIN=%ROOT%\src\main.ts"
+set "BUN_SERVE_MAIN=%ROOT%\src\serve.ts"
 set "RUNTIME_DIR=%ROOT%\.runtime"
 set "LOG_DIR=%ROOT%\logs"
 set "PID_FILE=%RUNTIME_DIR%\sider2claude.pid"
@@ -377,10 +379,11 @@ if /i "!RUNTIME!"=="bun" (
   )
   echo 运行环境: Bun
   echo 入口文件: %BUN_MAIN%
+  set "RUNTIME_EXE="
+  for /f "delims=" %%P in ('where bun 2^>nul') do if not defined RUNTIME_EXE set "RUNTIME_EXE=%%P"
   powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference='Stop';" ^
-    "$env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User');" ^
-    "$p = Start-Process -FilePath 'bun' -ArgumentList @('run','--watch','%BUN_MAIN%') -WorkingDirectory '%ROOT%' -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -WindowStyle Hidden -PassThru;" ^
+    "$p = Start-Process -FilePath '!RUNTIME_EXE!' -ArgumentList @('run','%BUN_SERVE_MAIN%') -WorkingDirectory '%ROOT%' -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -WindowStyle Hidden -PassThru;" ^
     "Set-Content -LiteralPath '%PID_FILE%' -Value $p.Id -Encoding ASCII;" ^
     "Write-Output ('PID: ' + $p.Id)"
   if errorlevel 1 (
@@ -395,18 +398,17 @@ if /i "!RUNTIME!"=="bun" (
   )
   echo 运行环境: Deno
   echo 入口文件: %DENO_MAIN%
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "$env:PATH = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User');" ^
-    "$p = Start-Process -FilePath 'deno' -ArgumentList @('run','--allow-net','--allow-env','--allow-read','%DENO_MAIN%') -WorkingDirectory '%ROOT%' -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -WindowStyle Hidden -PassThru;" ^
-    "Set-Content -LiteralPath '%PID_FILE%' -Value $p.Id -Encoding ASCII;" ^
-    "Write-Output ('PID: ' + $p.Id)"
+  set "RUNTIME_EXE="
+  for /f "delims=" %%P in ('where deno 2^>nul') do if not defined RUNTIME_EXE set "RUNTIME_EXE=%%P"
+  start "Sider2Claude Deno" /min "!RUNTIME_EXE!" serve --allow-net --allow-env --allow-read --port "%PORT%" "%DENO_SERVE_MAIN%"
   if errorlevel 1 (
     echo [FAIL] 启动失败。
     exit /b 1
   )
 )
 
+call :waitForService
+if errorlevel 1 exit /b 1
 echo [OK] 服务已启动。
 echo       API  : http://127.0.0.1:%PORT%
 echo       日志 : %OUT_LOG%
@@ -433,7 +435,7 @@ if /i "!RUNTIME!"=="bun" (
   echo 按 Ctrl+C 停止。
   echo.
   pushd "%ROOT%"
-  bun run --watch "%BUN_MAIN%"
+  bun run --watch "%BUN_SERVE_MAIN%"
   set "DEV_EXIT=%ERRORLEVEL%"
   popd
 ) else (
@@ -468,13 +470,12 @@ if errorlevel 1 (
   exit /b 0
 )
 echo 正在停止服务，PID: !SERVICE_PID!
-taskkill /PID !SERVICE_PID! /T /F >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Stop-Process -Id !SERVICE_PID! -Force -ErrorAction Stop"
 if errorlevel 1 (
   echo [FAIL] 停止服务失败。
   exit /b 1
 )
 if exist "%PID_FILE%" del "%PID_FILE%"
-if exist "%RUNTIME_MODE_FILE%" del "%RUNTIME_MODE_FILE%"
 echo [OK] 服务已停止。
 exit /b 0
 
@@ -521,36 +522,16 @@ REM ================================================================
 echo.
 echo [Current Config] 当前配置:
 if not exist "%ENV_FILE%" (
-  echo [FAIL] .env 不存在: %ENV_FILE%
-  echo        请运行: sider.bat init-config
+  echo [FAIL] .env does not exist: %ENV_FILE%
+  echo        Run: sider.bat init-config
   exit /b 1
 )
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$keys=@('PORT','AUTH_TOKEN','SIDER_API_URL','SIDER_AUTH_TOKEN','DEEPSEEK_BASE_URL','DEEPSEEK_API_KEY','DEEPSEEK_MODEL','ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','DEFAULT_BACKEND','AUTO_FALLBACK','PREFER_SIDER_FOR_CHAT','DEBUG_ROUTING','REQUEST_TIMEOUT','LOG_LEVEL','NODE_ENV');" ^
-  "$values=@{};" ^
-  "Get-Content -LiteralPath '%ENV_FILE%' -Encoding UTF8 | ForEach-Object {" ^
-  "  $line=$_.Trim();" ^
-  "  if(!$line -or $line.StartsWith('#')){ return };" ^
-  "  $idx=$line.IndexOf('=');" ^
-  "  if($idx -le 0){ return };" ^
-  "  $key=$line.Substring(0,$idx).Trim();" ^
-  "  $value=$line.Substring($idx+1).Trim();" ^
-  "  if($key){ $values[$key]=$value }" ^
-  "};" ^
-  "foreach($key in $keys){" ^
-  "  $value=$values[$key];" ^
-  "  if($null -eq $value){ $value='<unset>' }" ^
-  "  elseif($key -match 'TOKEN|KEY'){" ^
-  "    if($value.Length -le 8){ $value='********' }" ^
-  "    else { $value=$value.Substring(0,4) + '...' + $value.Substring($value.Length-4) }" ^
-  "  };" ^
-  "  Write-Output ('  ' + $key + ' = ' + $value)" ^
-  "}"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$keys=@('PORT','AUTH_TOKEN','SIDER_API_URL','SIDER_AUTH_TOKEN','DEEPSEEK_BASE_URL','DEEPSEEK_API_KEY','DEEPSEEK_MODEL','ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','DEFAULT_BACKEND','AUTO_FALLBACK','PREFER_SIDER_FOR_CHAT','DEBUG_ROUTING','REQUEST_TIMEOUT','LOG_LEVEL','NODE_ENV'); $values=@{}; foreach($raw in [System.IO.File]::ReadLines('%ENV_FILE%')){ $line=$raw.Trim(); if((-not $line) -or $line.StartsWith('#')){ continue }; $idx=$line.IndexOf('='); if($idx -le 0){ continue }; $key=$line.Substring(0,$idx).Trim(); $value=$line.Substring($idx+1).Trim(); if($key){ $values[$key]=$value } }; foreach($key in $keys){ $value=$values[$key]; if($null -eq $value){ $value='<unset>' } elseif($key -match 'TOKEN|KEY'){ if($value.Length -le 8){ $value='********' } else { $value=$value.Substring(0,4) + '...' + $value.Substring($value.Length-4) } }; Write-Output ('  ' + $key + ' = ' + $value) }"
 exit /b %ERRORLEVEL%
 
 
 REM ================================================================
-REM  14. 设置配置参数
+REM  14. 璁剧疆閰嶇疆鍙傛暟
 REM ================================================================
 :setConfigPrompt
 echo.
@@ -649,163 +630,161 @@ REM  18. 运行回归测试
 REM ================================================================
 :testAction
 echo.
-echo [Regression Tests] 回归测试:
+echo [Regression Tests] Run regression checks:
+set "DT_EXIT=0"
+set "DC_EXIT=0"
+set "TC_EXIT=0"
 echo.
 echo --- Deno tests ---
 where deno >nul 2>nul
 if errorlevel 1 (
-  echo [SKIP] Deno 未安装，跳过。
+  echo [SKIP] Deno is not installed.
 ) else (
   pushd "%ROOT%"
   deno test --allow-env deno/test
-  set "DT_EXIT=%ERRORLEVEL%"
+  set "DT_EXIT=!ERRORLEVEL!"
   popd
-  if !DT_EXIT! equ 0 (echo [OK] Deno 测试通过。) else (echo [FAIL] Deno 测试失败。)
+  if !DT_EXIT! equ 0 (echo [OK] Deno tests passed.) else (echo [FAIL] Deno tests failed.)
 )
-
 echo.
 echo --- Deno type check ---
 where deno >nul 2>nul
 if errorlevel 1 (
-  echo [SKIP] Deno 未安装，跳过。
+  echo [SKIP] Deno is not installed.
 ) else (
   pushd "%ROOT%"
   deno check deno/main.ts
-  set "DC_EXIT=%ERRORLEVEL%"
+  set "DC_EXIT=!ERRORLEVEL!"
   popd
-  if !DC_EXIT! equ 0 (echo [OK] Deno 类型检查通过。) else (echo [FAIL] Deno 类型检查失败。)
+  if !DC_EXIT! equ 0 (echo [OK] Deno type check passed.) else (echo [FAIL] Deno type check failed.)
 )
-
 echo.
 echo --- TypeScript type check ---
 where npm >nul 2>nul
 if errorlevel 1 (
-  echo [SKIP] npm 未安装，跳过。
+  echo [SKIP] npm is not installed.
 ) else (
   pushd "%ROOT%"
   npm run typecheck
-  set "TC_EXIT=%ERRORLEVEL%"
+  set "TC_EXIT=!ERRORLEVEL!"
   popd
-  if !TC_EXIT! equ 0 (echo [OK] TypeScript 类型检查通过。) else (echo [FAIL] TypeScript 类型检查失败。)
+  if !TC_EXIT! equ 0 (echo [OK] TypeScript type check passed.) else (echo [FAIL] TypeScript type check failed.)
 )
-exit /b 0
+set "TEST_EXIT=0"
+if not "!DT_EXIT!"=="0" set "TEST_EXIT=1"
+if not "!DC_EXIT!"=="0" set "TEST_EXIT=1"
+if not "!TC_EXIT!"=="0" set "TEST_EXIT=1"
+exit /b !TEST_EXIT!
 
 
 REM ================================================================
-REM  19. 类型检查
+REM  19. Type check
 REM ================================================================
 :typecheckAction
 echo.
-echo [Type Checks] 类型检查:
+echo [Type Checks] Run type checks:
+set "DC_EXIT=0"
+set "TC_EXIT=0"
+pushd "%ROOT%"
 echo.
 echo --- Deno ---
-pushd "%ROOT%"
 where deno >nul 2>nul
 if errorlevel 1 (
-  echo [SKIP] Deno 未安装，跳过。
+  echo [SKIP] Deno is not installed.
 ) else (
   deno check deno/main.ts
+  set "DC_EXIT=!ERRORLEVEL!"
 )
 echo.
 echo --- TypeScript (tsc) ---
 where npm >nul 2>nul
 if errorlevel 1 (
-  echo [SKIP] npm 未安装，跳过。
+  echo [SKIP] npm is not installed.
 ) else (
   npm run typecheck
+  set "TC_EXIT=!ERRORLEVEL!"
 )
 popd
-exit /b 0
+set "TYPECHECK_EXIT=0"
+if not "!DC_EXIT!"=="0" set "TYPECHECK_EXIT=1"
+if not "!TC_EXIT!"=="0" set "TYPECHECK_EXIT=1"
+exit /b !TYPECHECK_EXIT!
 
 
 REM ================================================================
-REM  20. 清理缓存和构建产物
+REM  20. Clean runtime and build artifacts
 REM ================================================================
 :cleanAction
 echo.
-echo [Clean] 清理:
+echo [Clean] Clean generated runtime artifacts:
 echo.
-echo 将清理以下内容:
-echo   - dist/        (TypeScript 构建输出)
-echo   - .runtime/    (PID 文件)
-echo   - logs/        (运行日志)
-echo   - deno.lock    (Deno 锁文件)
+echo This will remove:
+echo   - dist/        build output
+echo   - .runtime/    PID and runtime files
+echo   - logs/        runtime logs
 echo.
-set /p "CLEAN_CONFIRM=确认清理? [y/N] "
+set /p "CLEAN_CONFIRM=Confirm cleanup? [y/N] "
 if /i not "%CLEAN_CONFIRM%"=="y" (
-  echo 已取消。
+  echo Canceled.
   exit /b 0
 )
-
 pushd "%ROOT%"
 if exist "dist" (
   rmdir /s /q "dist" 2>nul
-  echo [OK] 已删除 dist/
+  echo [OK] Removed dist/
 )
 if exist ".runtime" (
   rmdir /s /q ".runtime" 2>nul
-  echo [OK] 已删除 .runtime/
+  echo [OK] Removed .runtime/
 )
 if exist "logs" (
   rmdir /s /q "logs" 2>nul
-  echo [OK] 已删除 logs/
-)
-if exist "deno.lock" (
-  del "deno.lock" 2>nul
-  echo [OK] 已删除 deno.lock
+  echo [OK] Removed logs/
 )
 popd
-echo [OK] 清理完成。
+echo [OK] Cleanup completed.
 exit /b 0
 
 
 REM ================================================================
-REM  21. 导出 cc-switch 配置 (Export cc-switch config)
+REM  21. Export cc-switch config
 REM ================================================================
 :ccSwitchExportAction
 echo.
-echo [cc-switch Export] 导出 cc-switch 配置:
+echo [cc-switch Export] Export cc-switch config:
 echo.
-echo 从 .env 读取 Sider2Claude 配置，生成 cc-switch 兼容的提供者 JSON。
-
-REM Sanity-check: Python (Anaconda) must exist
-set "PYTHON_EXE=C:\Users\PC\anaconda3\envs\python312\python.exe"
-if not exist "%PYTHON_EXE%" (
-  echo [FAIL] 未找到 Python: %PYTHON_EXE%
-  echo        请检查 Anaconda 环境路径。
+if not exist "%ROOT%\tools\export-cc-switch.py" (
+  echo [FAIL] Missing exporter: %ROOT%\tools\export-cc-switch.py
   exit /b 1
 )
-
-%PYTHON_EXE% "%ROOT%\tools\export-cc-switch.py" --env-file "%ENV_FILE%" --output "%ROOT%\cc-switch-provider.json" --deeplink
-
-if %ERRORLEVEL% equ 0 (
-  echo.
-  echo [OK] cc-switch 配置已导出。
-  echo.
-  REM Deep link sidecar file
-  set "CC_DL_FILE=%ROOT%\cc-switch-provider.deeplink.url"
-  if exist "!CC_DL_FILE!" (
-    echo 正在唤起 cc-switch 导入...
-    REM Use PowerShell to read and open the URL (avoids cmd parsing & in URL)
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-      "$url = Get-Content -LiteralPath '!CC_DL_FILE!' -Raw; Start-Process $url.Trim()"
-    echo [OK] 已向 cc-switch 发送导入请求。
-    echo      如果 cc-switch 未弹出，请手动导入 JSON 文件:
-    echo      !CC_DL_FILE!
-  ) else (
-    echo [INFO] 无法生成 deep link，请手动导入:
-    echo       cc-switch ^> Settings ^> Import/Export ^> Import providers
-  )
+if defined PYTHON_EXE if exist "%PYTHON_EXE%" goto runCcSwitchExport
+set "PYTHON_EXE="
+for /f "delims=" %%P in ('where python 2^>nul') do if not defined PYTHON_EXE set "PYTHON_EXE=%%P"
+if not defined PYTHON_EXE (
+  echo [FAIL] Python is not installed or not in PATH.
+  echo        Set PYTHON_EXE to a python.exe path if needed.
+  exit /b 1
+)
+:runCcSwitchExport
+"%PYTHON_EXE%" "%ROOT%\tools\export-cc-switch.py" --env-file "%ENV_FILE%" --output "%ROOT%\cc-switch-provider.json" --deeplink
+set "CC_EXPORT_EXIT=%ERRORLEVEL%"
+if not "%CC_EXPORT_EXIT%"=="0" (
+  echo [FAIL] Export failed. Check .env and Python environment.
+  exit /b %CC_EXPORT_EXIT%
+)
+echo [OK] cc-switch config exported.
+set "CC_DL_FILE=%ROOT%\cc-switch-provider.deeplink.url"
+if exist "!CC_DL_FILE!" (
+  echo Opening cc-switch import link...
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "$url = Get-Content -LiteralPath '!CC_DL_FILE!' -Raw; Start-Process $url.Trim()"
 ) else (
-  echo [FAIL] 导出失败，请检查 .env 配置和 Python 环境。
+  echo [INFO] Deep link file was not generated. Import cc-switch-provider.json manually.
 )
-exit /b %ERRORLEVEL%
-)
-exit /b %ERRORLEVEL%
+exit /b 0
 
 
 REM ================================================================
-REM  UTILITY FUNCTIONS (工具函数)
+REM  UTILITY FUNCTIONS
 REM ================================================================
 
 REM --- ensureGit ---
@@ -911,7 +890,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$path='%ENV_FILE%';" ^
   "$key='%CFG_KEY%';" ^
   "$value='%CFG_VALUE%';" ^
-  "if(!(Test-Path -LiteralPath $path)){ New-Item -ItemType File -Path $path | Out-Null };" ^
+  "if(-not (Test-Path -LiteralPath $path)){ New-Item -ItemType File -Path $path | Out-Null };" ^
   "$lines=@(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue);" ^
   "$pattern='^\s*' + [regex]::Escape($key) + '\s*=';" ^
   "$entry=$key + '=' + $value;" ^
@@ -919,23 +898,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$next=@();" ^
   "foreach($line in $lines){" ^
   "  if($line -match $pattern){" ^
-  "    if(!$found){ $next += $entry; $found=$true }" ^
+  "    if(-not $found){ $next += $entry; $found=$true }" ^
   "  } else { $next += $line }" ^
   "};" ^
-  "if(!$found){ $next += $entry };" ^
+  "if(-not $found){ $next += $entry };" ^
   "Set-Content -LiteralPath $path -Value $next -Encoding UTF8"
 if errorlevel 1 (
   echo [FAIL] 更新 .env 失败。
   exit /b 1
 )
-echo [OK] 已设置 %CFG_KEY% = %CFG_VALUE%
+call :maskValue "%CFG_KEY%" "%CFG_VALUE%"
+echo [OK] Set %CFG_KEY% = !MASKED_VALUE!
 exit /b 0
 
 REM --- detectRuntime ---
 :detectRuntime
 set "RUNTIME=deno"
 set "RUNTIME_LABEL=Deno (default)"
-if not exist "%RUNTIME_MODE_FILE%" exit /b 0
+if not exist "%RUNTIME_MODE_FILE%" (
+  where bun >nul 2>nul
+  if not errorlevel 1 (
+    set "RUNTIME=bun"
+    set "RUNTIME_LABEL=Bun (auto)"
+  )
+  exit /b 0
+)
 set /p "RT_MODE_RAW="<"%RUNTIME_MODE_FILE%" 2>nul
 for /f "tokens=1" %%X in ("!RT_MODE_RAW!") do set "RUNTIME_MODE=%%X"
 if /i "!RUNTIME_MODE!"=="bun" (
@@ -947,6 +934,57 @@ if /i "!RUNTIME_MODE!"=="bun" (
 )
 exit /b 0
 
+REM --- waitForService ---
+:waitForService
+echo Waiting for service health check...
+for /l %%I in (1,1,10) do (
+  if exist "%PID_FILE%" (
+    call :pidRunning
+    if errorlevel 1 (
+      if exist "%PID_FILE%" del "%PID_FILE%"
+      call :writePidFromPort >nul 2>nul
+    )
+  ) else (
+    call :writePidFromPort >nul 2>nul
+  )
+  where curl.exe >nul 2>nul
+  if errorlevel 1 (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%PORT%/health' -TimeoutSec 2 | Out-Null; exit 0 } catch { exit 1 }"
+  ) else (
+    curl.exe -fsS --connect-timeout 2 "http://127.0.0.1:%PORT%/health" >nul 2>nul
+  )
+  if not errorlevel 1 (
+    if not exist "%PID_FILE%" call :writePidFromPort >nul 2>nul
+    if exist "%PID_FILE%" exit /b 0
+    echo [FAIL] Service is healthy but PID could not be detected.
+    exit /b 1
+  )
+  timeout /t 1 /nobreak >nul
+)
+echo [FAIL] Service did not become healthy on http://127.0.0.1:%PORT%/health.
+call :pidRunning
+if not errorlevel 1 powershell -NoProfile -ExecutionPolicy Bypass -Command "Stop-Process -Id !SERVICE_PID! -Force -ErrorAction SilentlyContinue"
+if exist "%PID_FILE%" del "%PID_FILE%"
+exit /b 1
+
+REM --- writePidFromPort ---
+:writePidFromPort
+set "SERVICE_PID="
+for /f "delims=" %%P in ('powershell -NoProfile -ExecutionPolicy Bypass -Command "$p=(Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess); if($p){ Write-Output $p }"') do set "SERVICE_PID=%%P"
+if "%SERVICE_PID%"=="" exit /b 1
+if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
+> "%PID_FILE%" echo %SERVICE_PID%
+exit /b 0
+
+REM --- maskValue ---
+:maskValue
+set "MASK_KEY=%~1"
+set "MASKED_VALUE=%~2"
+echo !MASK_KEY! | findstr /I "TOKEN KEY SECRET PASSWORD" >nul
+if errorlevel 1 exit /b 0
+set "MASKED_VALUE=********"
+exit /b 0
+
 REM --- pidRunning ---
 REM Returns errorlevel 0 if running, 1 if not
 :pidRunning
@@ -954,6 +992,5 @@ set "SERVICE_PID="
 if not exist "%PID_FILE%" exit /b 1
 set /p "SERVICE_PID="<"%PID_FILE%"
 if "!SERVICE_PID!"=="" exit /b 1
-tasklist /FI "PID eq !SERVICE_PID!" /NH 2>nul | findstr /I /C:"deno.exe" /C:"bun.exe" >nul
-if errorlevel 1 exit /b 1
-exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $p = Get-Process -Id !SERVICE_PID! -ErrorAction Stop; if ($p.ProcessName -match '^(deno|bun)$') { exit 0 }; exit 1 } catch { exit 1 }"
+exit /b %ERRORLEVEL%
