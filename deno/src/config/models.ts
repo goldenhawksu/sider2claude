@@ -133,7 +133,25 @@ const SIDER_FULL_MAPPING: Record<string, string> = {
  * 对 sider2api 的对齐保留为非 Claude 模型的 Sider 映射，供内部 fallback 和
  * 未来多 API 端点（OpenAI Chat Completions 等）使用。
  */
-export const SUPPORTED_MODELS: ModelInfo[] = CLAUDE_MODELS;
+function buildAllUpstreamModels(): ModelInfo[] {
+  const models = [...CLAUDE_MODELS];
+  const seen = new Set(models.map((modelInfo) => modelInfo.id.toLowerCase()));
+
+  for (const [id, siderModel] of Object.entries(SIDER_FULL_MAPPING)) {
+    const normalized = id.toLowerCase();
+    if (seen.has(normalized)) {
+      continue;
+    }
+
+    models.push(model(id, siderModel));
+    seen.add(normalized);
+  }
+
+  return models;
+}
+
+// 对外暴露 Claude 兼容别名和 Sider 支持的全部上游模型。
+export const SUPPORTED_MODELS: ModelInfo[] = buildAllUpstreamModels();
 
 /**
  * 模型映射表：Anthropic -> Sider（仅 Claude 家族）。
@@ -156,7 +174,7 @@ export function getModelById(id: string): ModelInfo | undefined {
  * 供内部路由、fallback 和未来多 API 格式端点使用。
  */
 export function getFullModelMapping(): Record<string, string> {
-  return { ...MODEL_MAP, ...SIDER_FULL_MAPPING };
+  return { ...SIDER_FULL_MAPPING, ...MODEL_MAP };
 }
 
 /**

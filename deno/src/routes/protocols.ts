@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AnthropicRequest, AnthropicResponse } from '../types/anthropic.ts';
+import { getAllModels, getModelById, type ModelInfo } from '../config/models.ts';
 import { hybridMessagesRouter } from './messages-hybrid.ts';
 import {
   anthropicToGemini,
@@ -14,10 +15,26 @@ import {
   openAIFinishReason,
   type OpenAIResponsesRequest,
   openAIResponsesToAnthropic,
-  responseText,
 } from '../utils/protocol-adapters.ts';
 
 const protocolRouter = new Hono();
+
+protocolRouter.get('/v1beta/models', (c) => {
+  return c.json({
+    models: getAllModels().map(toGeminiModel),
+  });
+});
+
+protocolRouter.get('/v1beta/models/:model', (c) => {
+  const modelId = c.req.param('model');
+  const model = getModelById(modelId);
+
+  if (!model) {
+    return geminiError(`Model '${modelId}' was not found`, 404);
+  }
+
+  return c.json(toGeminiModel(model));
+});
 
 protocolRouter.post('/v1/chat/completions', async (c) => {
   try {
@@ -178,6 +195,18 @@ function geminiError(message: string, status: number): Response {
         : 'INVALID_ARGUMENT',
     },
   }, { status });
+}
+
+function toGeminiModel(model: ModelInfo): Record<string, unknown> {
+  return {
+    name: `models/${model.id}`,
+    version: model.id,
+    displayName: model.id,
+    description: `Sider upstream model ${model.id}`,
+    inputTokenLimit: 1_000_000,
+    outputTokenLimit: 64_000,
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+  };
 }
 
 function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Response {
