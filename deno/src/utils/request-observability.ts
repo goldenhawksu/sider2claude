@@ -3,8 +3,10 @@ import type { AnthropicRequest } from '../types/anthropic.ts';
 export const NON_STREAM_SLOW_MS = 10_000;
 export const STREAM_FIRST_EVENT_SLOW_MS = 2_000;
 export const STREAM_TOTAL_SLOW_MS = 30_000;
+export const LARGE_REQUEST_BYTES = 150_000;
+export const LARGE_REQUEST_MESSAGES = 20;
 
-const DUPLICATE_WINDOW_MS = 30_000;
+const DUPLICATE_WINDOW_MS = 5 * 60_000;
 const MAX_RECENT_FINGERPRINTS = 256;
 
 export interface RequestSummary {
@@ -218,9 +220,11 @@ function stableStringify(value: unknown): string {
   }
 
   const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) =>
-    `${JSON.stringify(key)}:${stableStringify(record[key])}`
-  ).join(',')}}`;
+  return `{${
+    Object.keys(record).sort().map((key) =>
+      `${JSON.stringify(key)}:${stableStringify(record[key])}`
+    ).join(',')
+  }}`;
 }
 
 function fnv1a53(input: string): string {

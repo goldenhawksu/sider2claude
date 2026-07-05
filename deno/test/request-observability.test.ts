@@ -73,3 +73,15 @@ Deno.test('请求观测：外部 request id 会被清洗和截断', () => {
   assertEquals(context.requestId.includes('\n'), false);
   assertEquals(context.requestId.length, 80);
 });
+
+Deno.test('request observability keeps duplicate candidates after a 30s stream', () => {
+  resetRequestObservabilityForTests();
+
+  const hash = 'slow-stream-request';
+  const first = observeDuplicateCandidate(hash, true, 1_000);
+  const second = observeDuplicateCandidate(hash, false, 32_000);
+
+  assertEquals(first.duplicate, false);
+  assertEquals(second.duplicate, true);
+  assertEquals(second.ageMs, 31_000);
+});

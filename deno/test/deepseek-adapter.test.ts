@@ -96,7 +96,7 @@ Deno.test('DeepSeek 适配器：用 Anthropic 兼容协议补齐工具能力，�
 Deno.test('DeepSeek 适配器：兼容真实上游返回的 thinking 内容块', async () => {
   const originalFetch = globalThis.fetch;
 
-  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(init?.body as string) as AnthropicRequest;
 
     return Promise.resolve(
@@ -242,14 +242,16 @@ Deno.test('DeepSeek 适配器：转发工具历史时转录工具上下文以避
       throw new Error('断言失败：期望 assistant content 被转录为文本');
     }
     assertEquals(assistantContent.includes('thinking'), false);
-    assertEquals(assistantContent.includes('[tool_use:Bash]'), true);
+    assertEquals(assistantContent.includes('Previous assistant tool request: name=Bash'), true);
+    assertEquals(assistantContent.includes('[tool_use:Bash]'), false);
 
     const userContent = calls[0].body.messages[1].content;
     if (typeof userContent !== 'string') {
       throw new Error('断言失败：期望 user content 被转录为文本');
     }
-    assertEquals(userContent.includes('[tool_result]'), true);
+    assertEquals(userContent.includes('Previous tool result:'), true);
     assertEquals(userContent.includes('/repo'), true);
+    assertEquals(userContent.includes('Tool protocol:'), true);
     assertEquals(userContent.includes('Tool choice requirement: call the tool named "Bash"'), true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -363,5 +365,131 @@ Deno.test('DeepSeek 适配器：响应耗时包含 body 读取与解析时间', 
   } finally {
     globalThis.fetch = originalFetch;
     console.info = originalInfo;
+  }
+});
+
+Deno.test('DeepSeek adapter converts textual tool transcript into structured tool_use', async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init?.body as string) as AnthropicRequest;
+
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: 'msg_textual_tool',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content: [{
+            type: 'text',
+            text:
+              'I need to inspect the file.\n[tool_use:Read] id=call_read_1 input={"file_path":"deno_pro.ts","limit":200}',
+          }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 10, output_tokens: 8 },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'deepseek-token',
+      model: 'deepseek-v4-flash',
+    });
+
+    const response = await adapter.sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'review deno_pro.ts' }],
+      max_tokens: 128,
+      tools: [{
+        name: 'Read',
+        description: 'Read file',
+        input_schema: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            limit: { type: 'number' },
+          },
+          required: ['file_path'],
+        },
+      }],
+    });
+
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content.length, 2);
+    assertEquals(response.content[0].type, 'text');
+    assertEquals(response.content[1].type, 'tool_use');
+    if (response.content[1].type === 'tool_use') {
+      assertEquals(response.content[1].name, 'Read');
+      assertEquals(response.content[1].id, 'call_read_1');
+      assertEquals(response.content[1].input.file_path, 'deno_pro.ts');
+      assertEquals(response.content[1].input.limit, 200);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('DeepSeek adapter sends timeout signal to upstream fetch', async () => {
+  const originalFetch = globalThis.fetch;
+  const previousTimeout = Deno.env.get('DEEPSEEK_REQUEST_TIMEOUT_MS');
+  let signalSeen = false;
+
+  Deno.env.set('DEEPSEEK_REQUEST_TIMEOUT_MS', '12345');
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    signalSeen = init?.signal instanceof AbortSignal;
+    const body = JSON.parse(init?.body as string) as AnthropicRequest;
+
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: 'msg_timeout_signal',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'deepseek-token',
+      model: 'deepseek-v4-flash',
+    });
+
+    await adapter.sendRequest({
+      model: 'claude-sonnet-4.6',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 128,
+    });
+
+    assertEquals(signalSeen, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousTimeout === undefined) {
+      Deno.env.delete('DEEPSEEK_REQUEST_TIMEOUT_MS');
+    } else {
+      Deno.env.set('DEEPSEEK_REQUEST_TIMEOUT_MS', previousTimeout);
+    }
   }
 });

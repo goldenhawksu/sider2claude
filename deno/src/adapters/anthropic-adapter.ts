@@ -21,6 +21,9 @@ import {
   NON_STREAM_SLOW_MS,
   type RequestLogContext,
 } from '../utils/request-observability.ts';
+import { getEnv } from '../utils/env.ts';
+
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 90_000;
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -38,12 +41,14 @@ export class AnthropicApiAdapter {
   private apiKey: string;
   private upstreamModel: string;
   private provider: AnthropicBackendConfig['provider'];
+  private requestTimeoutMs: number;
 
   constructor(config: AnthropicBackendConfig) {
     this.baseUrl = config.baseUrl.replace(/\/+$/, '');
     this.apiKey = config.apiKey;
     this.upstreamModel = config.model;
     this.provider = config.provider;
+    this.requestTimeoutMs = parseTimeoutMs();
   }
 
   async sendRequest(
@@ -64,11 +69,17 @@ export class AnthropicApiAdapter {
       requestedStream: !!request.stream,
     }, 'Forwarding Anthropic-compatible request:');
 
-    const response = await fetch(`${this.baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(upstreamRequest),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(upstreamRequest),
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
+      });
+    } catch (error) {
+      this.handleFetchError(error, logContext, startTime);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -100,7 +111,7 @@ export class AnthropicApiAdapter {
     }
 
     const data = await response.json() as unknown;
-    const normalized = this.normalizeResponse(data, outwardModel);
+    const normalized = this.normalizeResponse(data, outwardModel, logContext);
     const elapsed = Date.now() - startTime;
 
     logInfo('upstream_response', {
@@ -141,7 +152,10 @@ export class AnthropicApiAdapter {
 
   private buildUpstreamRequest(request: AnthropicRequest, stream: boolean): AnthropicRequest {
     const messages = this.applyToolChoiceInstruction(
-      this.sanitizeMessagesForUpstream(request.messages),
+      this.applyToolProtocolInstruction(
+        this.sanitizeMessagesForUpstream(request.messages),
+        request.tools,
+      ),
       request.tool_choice,
     );
 
@@ -170,6 +184,27 @@ export class AnthropicApiAdapter {
       return messages;
     }
 
+    return this.appendInstructionToLastUser(messages, instruction);
+  }
+
+  private applyToolProtocolInstruction(
+    messages: AnthropicRequest['messages'],
+    tools: AnthropicRequest['tools'],
+  ): AnthropicRequest['messages'] {
+    if (!tools?.length) {
+      return messages;
+    }
+
+    return this.appendInstructionToLastUser(
+      messages,
+      'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. Do not write textual tool-call transcripts such as [tool_use:Name] in normal text.',
+    );
+  }
+
+  private appendInstructionToLastUser(
+    messages: AnthropicRequest['messages'],
+    instruction: string,
+  ): AnthropicRequest['messages'] {
     const nextMessages = [...messages];
     let lastUserIndex = -1;
     for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
@@ -241,14 +276,18 @@ export class AnthropicApiAdapter {
 
     if (block.type === 'tool_use') {
       return [
-        `[tool_use:${block.name}] id=${block.id} input=${JSON.stringify(block.input ?? {})}`,
+        `Previous assistant tool request: name=${block.name} id=${block.id} input_json=${
+          JSON.stringify(block.input ?? {})
+        }`,
       ];
     }
 
     if (block.type === 'tool_result') {
       const content = this.toolResultContentToText(block.content);
       return [
-        `[tool_result] tool_use_id=${block.tool_use_id}${block.is_error ? ' is_error=true' : ''}` +
+        `Previous tool result: tool_use_id=${block.tool_use_id}${
+          block.is_error ? ' is_error=true' : ''
+        }` +
         (content ? `\n${content}` : ''),
       ];
     }
@@ -271,7 +310,11 @@ export class AnthropicApiAdapter {
       .trim();
   }
 
-  private normalizeResponse(data: unknown, outwardModel: string): AnthropicResponse {
+  private normalizeResponse(
+    data: unknown,
+    outwardModel: string,
+    logContext?: RequestLogContext,
+  ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
     }
@@ -285,9 +328,10 @@ export class AnthropicApiAdapter {
       throw new Error(`${this.provider} API error: ${message}`);
     }
 
-    const content = this.normalizeContent(raw.content);
+    const content = this.normalizeContent(raw.content, logContext);
     const usage = this.normalizeUsage(raw.usage);
     const stopReason = this.normalizeStopReason(raw.stop_reason);
+    const hasToolUse = content.some((block) => block.type === 'tool_use');
 
     return {
       id: typeof raw.id === 'string' ? raw.id : `msg_${Date.now()}`,
@@ -295,18 +339,23 @@ export class AnthropicApiAdapter {
       role: 'assistant',
       content,
       model: outwardModel,
-      stop_reason: stopReason,
+      stop_reason: hasToolUse && (stopReason === 'end_turn' || stopReason === null)
+        ? 'tool_use'
+        : stopReason,
       ...(typeof raw.stop_sequence === 'string' ? { stop_sequence: raw.stop_sequence } : {}),
       usage,
     };
   }
 
-  private normalizeContent(content: unknown): AnthropicResponseContent[] {
+  private normalizeContent(
+    content: unknown,
+    logContext?: RequestLogContext,
+  ): AnthropicResponseContent[] {
     if (!Array.isArray(content) || content.length === 0) {
       throw new Error(`${this.provider} API response missing content array`);
     }
 
-    return content.map((block): AnthropicResponseContent => {
+    const normalized = content.map((block): AnthropicResponseContent => {
       if (!block || typeof block !== 'object') {
         throw new Error(`${this.provider} API returned invalid content block`);
       }
@@ -347,6 +396,97 @@ export class AnthropicApiAdapter {
         `${this.provider} API returned unsupported content block type: ${String(item.type)}`,
       );
     });
+
+    const hasStructuredToolUse = normalized.some((block) => block.type === 'tool_use');
+    if (hasStructuredToolUse) {
+      return normalized;
+    }
+
+    const converted = this.normalizeTextualToolUseBlocks(normalized);
+    if (converted.toolUseCount > 0) {
+      logWarn('textual_tool_use_normalized', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        toolUseCount: converted.toolUseCount,
+      });
+    }
+
+    return converted.content;
+  }
+
+  private normalizeTextualToolUseBlocks(
+    blocks: AnthropicResponseContent[],
+  ): { content: AnthropicResponseContent[]; toolUseCount: number } {
+    const next: AnthropicResponseContent[] = [];
+    let toolUseCount = 0;
+
+    for (const block of blocks) {
+      if (block.type !== 'text') {
+        next.push(block);
+        continue;
+      }
+
+      const convertedParts: AnthropicResponseContent[] = [];
+      const pendingText: string[] = [];
+      let converted = false;
+
+      const flushText = () => {
+        const text = pendingText.join('\n').trim();
+        if (text) {
+          convertedParts.push({ type: 'text', text });
+        }
+        pendingText.length = 0;
+      };
+
+      for (const line of block.text.split(/\r?\n/)) {
+        const toolUse = this.parseTextualToolUseLine(line);
+        if (!toolUse) {
+          pendingText.push(line);
+          continue;
+        }
+
+        flushText();
+        convertedParts.push(toolUse);
+        toolUseCount += 1;
+        converted = true;
+      }
+
+      if (!converted) {
+        next.push(block);
+        continue;
+      }
+
+      flushText();
+      next.push(...convertedParts);
+    }
+
+    return { content: next, toolUseCount };
+  }
+
+  private parseTextualToolUseLine(line: string): AnthropicResponseContent | undefined {
+    const match = line.trim().match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=(.+)$/);
+    if (!match) {
+      return undefined;
+    }
+
+    const name = match[1]?.trim();
+    const id = match[2]?.trim();
+    const inputText = match[3]?.trim();
+    if (!name || !id || !inputText?.startsWith('{')) {
+      return undefined;
+    }
+
+    try {
+      const input = JSON.parse(inputText) as unknown;
+      return {
+        type: 'tool_use',
+        id,
+        name,
+        input: this.asRecord(input),
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   private normalizeUsage(usage: unknown): { input_tokens: number; output_tokens: number } {
@@ -398,6 +538,7 @@ export class AnthropicApiAdapter {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(upstreamRequest),
+        signal: AbortSignal.timeout(this.requestTimeoutMs),
       });
 
       if (!response.ok) {
@@ -483,6 +624,7 @@ export class AnthropicApiAdapter {
       const response = await fetch(`${this.baseUrl}/v1/models`, {
         method: 'GET',
         headers: this.buildHeaders(),
+        signal: AbortSignal.timeout(Math.min(this.requestTimeoutMs, 10_000)),
       });
       return response.ok;
     } catch (error) {
@@ -501,4 +643,40 @@ export class AnthropicApiAdapter {
       requestHash: logContext.requestHash,
     };
   }
+
+  private handleFetchError(
+    error: unknown,
+    logContext: RequestLogContext | undefined,
+    startTime: number,
+  ): never {
+    const elapsed = Date.now() - startTime;
+    if (isAbortError(error)) {
+      logError('upstream_timeout', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        timeoutMs: this.requestTimeoutMs,
+        elapsedMs: elapsed,
+      });
+      throw new AnthropicBackendError(
+        `${this.provider} API timeout after ${this.requestTimeoutMs}ms`,
+        503,
+        this.provider,
+      );
+    }
+
+    throw error;
+  }
+}
+
+function parseTimeoutMs(): number {
+  const raw = getEnv('DEEPSEEK_REQUEST_TIMEOUT_MS', String(DEFAULT_UPSTREAM_TIMEOUT_MS));
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_UPSTREAM_TIMEOUT_MS;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'TimeoutError' ||
+    error instanceof DOMException && error.name === 'AbortError' ||
+    error instanceof Error && error.name === 'AbortError' ||
+    error instanceof Error && error.name === 'TimeoutError';
 }

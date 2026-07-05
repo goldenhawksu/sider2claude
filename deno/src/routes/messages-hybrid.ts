@@ -32,6 +32,8 @@ import { RouterEngine } from '../routing/router-engine.ts';
 import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter.ts';
 import {
   createRequestLogContext,
+  LARGE_REQUEST_BYTES,
+  LARGE_REQUEST_MESSAGES,
   logError,
   logInfo,
   logWarn,
@@ -48,6 +50,12 @@ const messagesRouter = new Hono();
 const config = loadBackendConfig();
 const routerEngine = new RouterEngine(config);
 const capabilityAdapter = config.deepseek.enabled ? new AnthropicApiAdapter(config.deepseek) : null;
+const DUPLICATE_RESPONSE_CACHE_TTL_MS = 5 * 60_000;
+const MAX_DUPLICATE_RESPONSE_CACHE_ENTRIES = 64;
+const duplicateResponseCache = new Map<
+  string,
+  { response: AnthropicResponse; backend: Backend; storedAt: number }
+>();
 
 messagesRouter.use('*', requireAuth);
 
@@ -96,6 +104,28 @@ messagesRouter.post('/', async (c: Context) => {
         messages: anthropicRequest.messages.length,
         tools: anthropicRequest.tools?.length || 0,
       });
+    }
+
+    warnLargeRequest(logContext, anthropicRequest);
+
+    if (!anthropicRequest.stream) {
+      const cached = getCachedDuplicateResponse(logContext.requestHash);
+      if (cached) {
+        logInfo('duplicate_request_replayed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: cached.backend,
+          ageMs: Date.now() - cached.storedAt,
+          stopReason: cached.response.stop_reason,
+          contentBlocks: cached.response.content.length,
+        });
+
+        const cachedResponse = c.json(cached.response);
+        cachedResponse.headers.set('X-Request-ID', logContext.requestId);
+        cachedResponse.headers.set('X-Request-Hash', logContext.requestHash);
+        cachedResponse.headers.set('X-Duplicate-Replay', 'true');
+        return cachedResponse;
+      }
     }
 
     let conversationId = c.req.query('cid') || c.req.header('X-Conversation-ID');
@@ -150,7 +180,6 @@ messagesRouter.post('/', async (c: Context) => {
           );
         }
       }
-
     } catch (error) {
       logError('backend_request_failed', {
         requestId: logContext.requestId,
@@ -211,6 +240,7 @@ messagesRouter.post('/', async (c: Context) => {
         thresholdMs: NON_STREAM_SLOW_MS,
       });
     }
+    cacheDuplicateResponse(logContext.requestHash, selectedBackend, response);
 
     const jsonResponse = c.json(response);
     jsonResponse.headers.set('X-Request-ID', logContext.requestId);
@@ -507,6 +537,77 @@ function generateStreamMessageId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 }
 
+function warnLargeRequest(
+  logContext: RequestLogContext,
+  request: AnthropicRequest,
+): void {
+  const requestBytes = logContext.summary.requestBytes;
+  const messages = request.messages.length;
+  if (requestBytes <= LARGE_REQUEST_BYTES && messages <= LARGE_REQUEST_MESSAGES) {
+    return;
+  }
+
+  logWarn('large_request', {
+    requestId: logContext.requestId,
+    requestHash: logContext.requestHash,
+    model: request.model,
+    messages,
+    tools: request.tools?.length || 0,
+    requestBytes,
+    requestBytesThreshold: LARGE_REQUEST_BYTES,
+    messagesThreshold: LARGE_REQUEST_MESSAGES,
+  });
+}
+
+function getCachedDuplicateResponse(
+  requestHash: string,
+): { response: AnthropicResponse; backend: Backend; storedAt: number } | undefined {
+  cleanupDuplicateResponseCache();
+  const cached = duplicateResponseCache.get(requestHash);
+  if (!cached) {
+    return undefined;
+  }
+
+  return {
+    response: cloneAnthropicResponse(cached.response),
+    backend: cached.backend,
+    storedAt: cached.storedAt,
+  };
+}
+
+function cacheDuplicateResponse(
+  requestHash: string,
+  backend: Backend,
+  response: AnthropicResponse,
+): void {
+  cleanupDuplicateResponseCache();
+  duplicateResponseCache.set(requestHash, {
+    response: cloneAnthropicResponse(response),
+    backend,
+    storedAt: Date.now(),
+  });
+
+  while (duplicateResponseCache.size > MAX_DUPLICATE_RESPONSE_CACHE_ENTRIES) {
+    const oldest = duplicateResponseCache.keys().next().value;
+    if (!oldest) {
+      return;
+    }
+    duplicateResponseCache.delete(oldest);
+  }
+}
+
+function cleanupDuplicateResponseCache(now = Date.now()): void {
+  for (const [hash, cached] of duplicateResponseCache.entries()) {
+    if (now - cached.storedAt > DUPLICATE_RESPONSE_CACHE_TTL_MS) {
+      duplicateResponseCache.delete(hash);
+    }
+  }
+}
+
+function cloneAnthropicResponse(response: AnthropicResponse): AnthropicResponse {
+  return JSON.parse(JSON.stringify(response)) as AnthropicResponse;
+}
+
 /**
  * 流式请求分流：按路由决策选定后端，进入对应的真流式实现。
  */
@@ -524,6 +625,13 @@ async function handleStreamingRequest(
     }
     if (conversationId) {
       routerEngine.recordSessionBackend(conversationId, 'deepseek');
+    }
+    if (anthropicRequest.tools?.length) {
+      return createDeepSeekSynthesizedStreamingResponse(
+        capabilityAdapter,
+        anthropicRequest,
+        logContext,
+      );
     }
     return createDeepSeekStreamingResponse(capabilityAdapter, anthropicRequest, logContext);
   }
@@ -756,7 +864,221 @@ function createTrueSiderStreamingResponse(
 }
 
 /**
- * DeepSeek 真流式：DeepSeek 的 /v1/messages 原生输出 Anthropic SSE，直接透传上游事件。
+ * DeepSeek 工具流式：用非流式上游响应合成规范 Anthropic SSE，保证工具回合完整闭合。
+ */
+function createDeepSeekSynthesizedStreamingResponse(
+  adapter: AnthropicApiAdapter,
+  request: AnthropicRequest,
+  logContext: RequestLogContext,
+): Response {
+  const encoder = new TextEncoder();
+  const streamStartedAt = Date.now();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      let eventCount = 0;
+      let firstEventLogged = false;
+      let firstEventMs = 0;
+      const send = (event: unknown) => {
+        if (closed) {
+          return;
+        }
+        eventCount += 1;
+        if (!firstEventLogged) {
+          firstEventLogged = true;
+          firstEventMs = Date.now() - streamStartedAt;
+          logInfo('stream_first_event', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            backend: 'deepseek',
+            model: request.model,
+            mode: 'synthesized',
+            elapsedMs: firstEventMs,
+          });
+        }
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      };
+      const safeClose = () => {
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      };
+      const keepAlive = setInterval(() => send({ type: 'ping' }), 10_000);
+
+      try {
+        logInfo('stream_started', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'deepseek',
+          model: request.model,
+          tools: request.tools?.length || 0,
+          mode: 'synthesized',
+        });
+
+        send({
+          type: 'message_start',
+          message: {
+            id: generateStreamMessageId(),
+            type: 'message',
+            role: 'assistant',
+            content: [],
+            model: request.model,
+            stop_reason: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+
+        const response = await adapter.sendRequest({ ...request, stream: false }, logContext);
+        cacheDuplicateResponse(logContext.requestHash, 'deepseek', response);
+        sendAnthropicResponseContentAsStream(response, send);
+        send({
+          type: 'message_delta',
+          delta: { stop_reason: response.stop_reason },
+          usage: { output_tokens: response.usage.output_tokens },
+        });
+        send({ type: 'message_stop' });
+
+        const elapsedMs = Date.now() - streamStartedAt;
+        logInfo('stream_completed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'deepseek',
+          model: request.model,
+          mode: 'synthesized',
+          stopReason: response.stop_reason,
+          eventCount,
+          firstEventMs,
+          elapsedMs,
+        });
+        if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
+          logWarn('slow_stream_request', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            backend: 'deepseek',
+            model: request.model,
+            mode: 'synthesized',
+            eventCount,
+            elapsedMs,
+            thresholdMs: STREAM_TOTAL_SLOW_MS,
+          });
+        }
+        safeClose();
+      } catch (error) {
+        send({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: error instanceof Error ? error.message : 'DeepSeek streaming error',
+          },
+        });
+        logWarn('stream_failed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'deepseek',
+          model: request.model,
+          mode: 'synthesized',
+          eventCount,
+          elapsedMs: Date.now() - streamStartedAt,
+          error: serializeError(error),
+        }, 'Streaming failed:');
+        safeClose();
+      } finally {
+        clearInterval(keepAlive);
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      ...SSE_HEADERS,
+      'X-Request-ID': logContext.requestId,
+      'X-Request-Hash': logContext.requestHash,
+    },
+  });
+}
+
+function sendAnthropicResponseContentAsStream(
+  response: AnthropicResponse,
+  send: (event: unknown) => void,
+): void {
+  response.content.forEach((block, index) => {
+    if (block.type === 'text') {
+      send({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'text', text: '' },
+      });
+      if (block.text) {
+        send({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'text_delta', text: block.text },
+        });
+      }
+      send({ type: 'content_block_stop', index });
+      return;
+    }
+
+    if (block.type === 'thinking') {
+      send({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'thinking', thinking: '' },
+      });
+      if (block.thinking) {
+        send({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'thinking_delta', thinking: block.thinking },
+        });
+      }
+      if (block.signature) {
+        send({
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'signature_delta', signature: block.signature },
+        });
+      }
+      send({ type: 'content_block_stop', index });
+      return;
+    }
+
+    if (block.type === 'redacted_thinking') {
+      send({
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'redacted_thinking', data: block.data },
+      });
+      send({ type: 'content_block_stop', index });
+      return;
+    }
+
+    send({
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'tool_use',
+        id: block.id,
+        name: block.name,
+        input: {},
+      },
+    });
+    send({
+      type: 'content_block_delta',
+      index,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: JSON.stringify(block.input ?? {}),
+      },
+    });
+    send({ type: 'content_block_stop', index });
+  });
+}
+
+/**
+ * DeepSeek 普通流式：DeepSeek 的 /v1/messages 原生输出 Anthropic SSE，直接透传上游事件。
  */
 function createDeepSeekStreamingResponse(
   adapter: AnthropicApiAdapter,
