@@ -119,11 +119,7 @@ export function createAuthMiddleware(options: {
         } satisfies AuthInfo,
       );
 
-      // 日志记录 (不记录完整 token)
-      console.log('⚙️ Auth successful:', {
-        tokenPrefix: token.substring(0, 8) + '...',
-        type,
-      });
+      console.log('Auth successful:', { type });
 
       await next();
     } catch (error) {

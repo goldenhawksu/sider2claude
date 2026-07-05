@@ -14,6 +14,13 @@ import type {
   AnthropicResponseContent,
 } from '../types/anthropic.ts';
 import type { AnthropicBackendConfig } from '../config/backends.ts';
+import {
+  logError,
+  logInfo,
+  logWarn,
+  NON_STREAM_SLOW_MS,
+  type RequestLogContext,
+} from '../utils/request-observability.ts';
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -39,19 +46,23 @@ export class AnthropicApiAdapter {
     this.provider = config.provider;
   }
 
-  async sendRequest(request: AnthropicRequest): Promise<AnthropicResponse> {
+  async sendRequest(
+    request: AnthropicRequest,
+    logContext?: RequestLogContext,
+  ): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
     const upstreamRequest = this.buildUpstreamRequest(request, false);
 
-    console.info('Forwarding Anthropic-compatible request:', {
+    logInfo('upstream_request', {
+      ...this.contextFields(logContext),
       provider: this.provider,
       upstreamModel: upstreamRequest.model,
       outwardModel,
       messages: upstreamRequest.messages.length,
       tools: upstreamRequest.tools?.length || 0,
       requestedStream: !!request.stream,
-    });
+    }, 'Forwarding Anthropic-compatible request:');
 
     const response = await fetch(`${this.baseUrl}/v1/messages`, {
       method: 'POST',
@@ -59,16 +70,18 @@ export class AnthropicApiAdapter {
       body: JSON.stringify(upstreamRequest),
     });
 
-    const elapsed = Date.now() - startTime;
     if (!response.ok) {
       const errorText = await response.text();
-      console.error('Anthropic-compatible backend error:', {
+      const elapsed = Date.now() - startTime;
+      logError('upstream_error', {
+        ...this.contextFields(logContext),
         provider: this.provider,
         status: response.status,
         statusText: response.statusText,
         preview: errorText.substring(0, 300),
         elapsed: `${elapsed}ms`,
-      });
+        elapsedMs: elapsed,
+      }, 'Anthropic-compatible backend error:');
       throw new AnthropicBackendError(
         `${this.provider} API error: ${response.status} ${response.statusText}`,
         response.status,
@@ -88,14 +101,29 @@ export class AnthropicApiAdapter {
 
     const data = await response.json() as unknown;
     const normalized = this.normalizeResponse(data, outwardModel);
+    const elapsed = Date.now() - startTime;
 
-    console.info('Anthropic-compatible backend response:', {
+    logInfo('upstream_response', {
+      ...this.contextFields(logContext),
       provider: this.provider,
       id: normalized.id,
       stopReason: normalized.stop_reason,
       contentBlocks: normalized.content.length,
       elapsed: `${elapsed}ms`,
-    });
+      elapsedMs: elapsed,
+    }, 'Anthropic-compatible backend response:');
+    if (elapsed > NON_STREAM_SLOW_MS) {
+      logWarn('upstream_slow_response', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        upstreamModel: upstreamRequest.model,
+        outwardModel,
+        messages: upstreamRequest.messages.length,
+        tools: upstreamRequest.tools?.length || 0,
+        elapsedMs: elapsed,
+        thresholdMs: NON_STREAM_SLOW_MS,
+      });
+    }
 
     return normalized;
   }
@@ -360,6 +388,7 @@ export class AnthropicApiAdapter {
     onChunk: (chunk: unknown) => void,
     onComplete: () => void,
     onError: (error: Error) => void,
+    logContext?: RequestLogContext,
   ): Promise<void> {
     const outwardModel = request.model;
     const upstreamRequest = this.buildUpstreamRequest(request, true);
@@ -373,12 +402,13 @@ export class AnthropicApiAdapter {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('Anthropic-compatible backend stream error:', {
+        logError('upstream_stream_error', {
+          ...this.contextFields(logContext),
           provider: this.provider,
           status: response.status,
           statusText: response.statusText,
           preview: errorText.substring(0, 300),
-        });
+        }, 'Anthropic-compatible backend stream error:');
         throw new Error(`${this.provider} API error: ${response.status} ${response.statusText}`);
       }
 
@@ -459,5 +489,16 @@ export class AnthropicApiAdapter {
       console.error('Anthropic-compatible backend health check failed:', error);
       return false;
     }
+  }
+
+  private contextFields(logContext?: RequestLogContext): Record<string, unknown> {
+    if (!logContext) {
+      return {};
+    }
+
+    return {
+      requestId: logContext.requestId,
+      requestHash: logContext.requestHash,
+    };
   }
 }

@@ -3,7 +3,7 @@
  * 将 Anthropic API 请求转换为 Sider API 格式
  */
 
-import type { AnthropicRequest, SiderRequest } from '../types/index.ts';
+import type { AnthropicMessage, AnthropicRequest, SiderRequest } from '../types/index.ts';
 import type { SiderTools } from '../types/sider.ts';
 // import { getOrCreateConversation, getParentMessageId } from './conversation-manager.ts'; // Fallback functions, not used in current version
 import { siderConversationClient } from './sider-conversation.ts';
@@ -267,6 +267,92 @@ function getRealSiderConversationId(conversationId?: string): string {
 }
 
 // 模型映射函数已移至 ../config/models.ts，通过 import 引入
+
+type IncomingMessage = Omit<Partial<AnthropicMessage>, 'role' | 'content'> & {
+  role?: string;
+  content?: unknown;
+  tool_call_id?: string;
+  name?: string;
+};
+
+/**
+ * 兼容部分客户端把 OpenAI 风格 role 发送到 Anthropic /v1/messages 的情况。
+ */
+export function normalizeAnthropicRequest(request: AnthropicRequest): AnthropicRequest {
+  if (!Array.isArray(request.messages)) {
+    return request;
+  }
+
+  const systemParts: string[] = [];
+  const currentSystem = normalizeText(request.system);
+  if (currentSystem) {
+    systemParts.push(currentSystem);
+  }
+
+  const messages: AnthropicMessage[] = [];
+  for (const message of request.messages as unknown as IncomingMessage[]) {
+    if (message.role === 'system' || message.role === 'developer') {
+      const text = normalizeText(message.content);
+      if (text) {
+        systemParts.push(text);
+      }
+      continue;
+    }
+
+    if (message.role === 'tool' || message.role === 'function') {
+      messages.push({
+        role: 'user',
+        content: formatToolRoleMessage(message),
+      });
+      continue;
+    }
+
+    messages.push(message as AnthropicMessage);
+  }
+
+  return {
+    ...request,
+    messages,
+    ...(systemParts.length > 0 ? { system: systemParts.join('\n\n') } : {}),
+  };
+}
+
+function formatToolRoleMessage(message: IncomingMessage): string {
+  const toolUseId = message.tool_call_id || message.name || 'unknown';
+  const text = normalizeText(message.content);
+  return `[tool_result] tool_use_id=${toolUseId}${text ? `\n${text}` : ''}`;
+}
+
+function normalizeText(value: unknown): string {
+  if (value === undefined || value === null) {
+    return '';
+  }
+
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normalizeText).filter(Boolean).join('\n').trim();
+  }
+
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (typeof record.text === 'string') {
+      return record.text.trim();
+    }
+    if (record.content !== undefined) {
+      return normalizeText(record.content);
+    }
+    try {
+      return JSON.stringify(record);
+    } catch {
+      return String(record);
+    }
+  }
+
+  return String(value).trim();
+}
 
 /**
  * 验证 Anthropic 请求格式

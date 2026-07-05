@@ -14,6 +14,7 @@ import type { SiderRequest } from '../types/sider.ts';
 import {
   convertAnthropicToSider,
   convertAnthropicToSiderAsync,
+  normalizeAnthropicRequest,
   validateAnthropicRequest,
 } from '../utils/request-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
@@ -29,6 +30,18 @@ import {
 import { type Backend, getBackendDisplayName, loadBackendConfig } from '../config/backends.ts';
 import { RouterEngine } from '../routing/router-engine.ts';
 import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter.ts';
+import {
+  createRequestLogContext,
+  logError,
+  logInfo,
+  logWarn,
+  NON_STREAM_SLOW_MS,
+  observeDuplicateCandidate,
+  type RequestLogContext,
+  serializeError,
+  STREAM_FIRST_EVENT_SLOW_MS,
+  STREAM_TOTAL_SLOW_MS,
+} from '../utils/request-observability.ts';
 
 const messagesRouter = new Hono();
 
@@ -39,6 +52,9 @@ const capabilityAdapter = config.deepseek.enabled ? new AnthropicApiAdapter(conf
 messagesRouter.use('*', requireAuth);
 
 messagesRouter.post('/', async (c: Context) => {
+  const requestStartedAt = Date.now();
+  const inboundRequestId = c.req.header('X-Request-ID') || undefined;
+  let logContext: RequestLogContext | undefined;
   try {
     const auth = getAuthInfo(c);
     if (!auth) {
@@ -54,15 +70,33 @@ messagesRouter.post('/', async (c: Context) => {
       );
     }
 
-    const anthropicRequest = await c.req.json() as AnthropicRequest;
-    console.log('Received Anthropic request:', {
-      model: anthropicRequest.model,
-      messages: anthropicRequest.messages?.length || 0,
-      tools: anthropicRequest.tools?.length || 0,
-      stream: !!anthropicRequest.stream,
+    const anthropicRequest = normalizeAnthropicRequest(await c.req.json() as AnthropicRequest);
+    logContext = createRequestLogContext(anthropicRequest, inboundRequestId);
+    logInfo('request_received', {
+      requestId: logContext.requestId,
+      requestHash: logContext.requestHash,
+      ...logContext.summary,
     });
 
     validateAnthropicRequest(anthropicRequest);
+
+    const duplicate = observeDuplicateCandidate(
+      logContext.requestHash,
+      !!anthropicRequest.stream,
+    );
+    if (duplicate.duplicate) {
+      logWarn('duplicate_request_candidate', {
+        requestId: logContext.requestId,
+        requestHash: logContext.requestHash,
+        count: duplicate.count,
+        ageMs: duplicate.ageMs,
+        previousStreams: duplicate.previousStreams,
+        stream: !!anthropicRequest.stream,
+        model: anthropicRequest.model,
+        messages: anthropicRequest.messages.length,
+        tools: anthropicRequest.tools?.length || 0,
+      });
+    }
 
     let conversationId = c.req.query('cid') || c.req.header('X-Conversation-ID');
     const parentMessageId = c.req.header('X-Parent-Message-ID');
@@ -83,6 +117,7 @@ messagesRouter.post('/', async (c: Context) => {
         anthropicRequest,
         auth.token,
         decision.backend,
+        logContext,
         conversationId,
         parentMessageId,
       );
@@ -100,7 +135,7 @@ messagesRouter.post('/', async (c: Context) => {
         response = await capabilityAdapter.sendRequest({
           ...anthropicRequest,
           stream: false,
-        });
+        }, logContext);
 
         if (conversationId) {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
@@ -116,19 +151,32 @@ messagesRouter.post('/', async (c: Context) => {
         }
       }
 
-      console.log(`Request completed via ${getBackendDisplayName(selectedBackend)}`);
     } catch (error) {
-      console.error(`${getBackendDisplayName(decision.backend)} failed:`, error);
+      logError('backend_request_failed', {
+        requestId: logContext.requestId,
+        requestHash: logContext.requestHash,
+        backend: decision.backend,
+        backendDisplayName: getBackendDisplayName(decision.backend),
+        error: serializeError(error),
+      }, `${getBackendDisplayName(decision.backend)} failed:`);
 
       if (!decision.allowFallback || !config.routing.autoFallback) {
         throw error;
       }
 
       const fallbackBackend: Backend = decision.backend === 'sider' ? 'deepseek' : 'sider';
-      console.warn(`Attempting fallback to ${getBackendDisplayName(fallbackBackend)}`);
+      logWarn('backend_fallback_attempt', {
+        requestId: logContext.requestId,
+        requestHash: logContext.requestHash,
+        fromBackend: decision.backend,
+        toBackend: fallbackBackend,
+      }, `Attempting fallback to ${getBackendDisplayName(fallbackBackend)}`);
 
       if (fallbackBackend === 'deepseek' && capabilityAdapter) {
-        response = await capabilityAdapter.sendRequest({ ...anthropicRequest, stream: false });
+        response = await capabilityAdapter.sendRequest(
+          { ...anthropicRequest, stream: false },
+          logContext,
+        );
         selectedBackend = 'deepseek';
         if (conversationId) {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
@@ -141,7 +189,32 @@ messagesRouter.post('/', async (c: Context) => {
       }
     }
 
+    const elapsedMs = Date.now() - requestStartedAt;
+    logInfo('request_completed', {
+      requestId: logContext.requestId,
+      requestHash: logContext.requestHash,
+      backend: selectedBackend,
+      backendDisplayName: getBackendDisplayName(selectedBackend),
+      stopReason: response.stop_reason,
+      contentBlocks: response.content.length,
+      elapsedMs,
+    }, `Request completed via ${getBackendDisplayName(selectedBackend)}`);
+    if (elapsedMs > NON_STREAM_SLOW_MS) {
+      logWarn('slow_request', {
+        requestId: logContext.requestId,
+        requestHash: logContext.requestHash,
+        backend: selectedBackend,
+        model: anthropicRequest.model,
+        messages: anthropicRequest.messages.length,
+        tools: anthropicRequest.tools?.length || 0,
+        elapsedMs,
+        thresholdMs: NON_STREAM_SLOW_MS,
+      });
+    }
+
     const jsonResponse = c.json(response);
+    jsonResponse.headers.set('X-Request-ID', logContext.requestId);
+    jsonResponse.headers.set('X-Request-Hash', logContext.requestHash);
     if (selectedBackend === 'sider' && response.sider_session?.message_ids) {
       const sessionHeaders = getSessionHeaders({
         conversationId: response.sider_session.conversation_id,
@@ -163,7 +236,12 @@ messagesRouter.post('/', async (c: Context) => {
 
     return jsonResponse;
   } catch (error) {
-    console.error('Messages API error:', error);
+    logError('messages_api_error', {
+      requestId: logContext?.requestId || inboundRequestId || 'unknown',
+      requestHash: logContext?.requestHash || 'unknown',
+      elapsedMs: Date.now() - requestStartedAt,
+      error: serializeError(error),
+    }, 'Messages API error:');
 
     if (
       error instanceof Error && (
@@ -246,10 +324,10 @@ function mapErrorStatusToType(statusCode: number): AnthropicError['error']['type
 
 messagesRouter.post('/count_tokens', async (c: Context) => {
   try {
-    const body = await c.req.json();
+    const body = normalizeAnthropicRequest(await c.req.json() as AnthropicRequest);
 
     try {
-      validateAnthropicRequest(body as AnthropicRequest);
+      validateAnthropicRequest(body);
     } catch (validationError) {
       return c.json(
         {
@@ -436,6 +514,7 @@ async function handleStreamingRequest(
   anthropicRequest: AnthropicRequest,
   authToken: string,
   backend: Backend,
+  logContext: RequestLogContext,
   conversationId?: string,
   parentMessageId?: string,
 ): Promise<Response> {
@@ -446,7 +525,7 @@ async function handleStreamingRequest(
     if (conversationId) {
       routerEngine.recordSessionBackend(conversationId, 'deepseek');
     }
-    return createDeepSeekStreamingResponse(capabilityAdapter, anthropicRequest);
+    return createDeepSeekStreamingResponse(capabilityAdapter, anthropicRequest, logContext);
   }
 
   if (conversationId) {
@@ -465,6 +544,7 @@ async function handleStreamingRequest(
     siderAuthToken,
     anthropicRequest.model,
     isThinkingEnabled(anthropicRequest),
+    logContext,
   );
 }
 
@@ -477,13 +557,40 @@ function createTrueSiderStreamingResponse(
   siderAuthToken: string,
   outwardModel: string,
   includeThinking: boolean,
+  logContext: RequestLogContext,
 ): Response {
   const encoder = new TextEncoder();
+  const streamStartedAt = Date.now();
 
   const stream = new ReadableStream({
     async start(controller) {
       let closed = false;
+      let eventCount = 0;
+      let firstEventLogged = false;
+      let firstEventMs = 0;
       const send = (event: unknown) => {
+        eventCount += 1;
+        if (!firstEventLogged) {
+          firstEventLogged = true;
+          firstEventMs = Date.now() - streamStartedAt;
+          logInfo('stream_first_event', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            backend: 'sider',
+            model: outwardModel,
+            elapsedMs: firstEventMs,
+          });
+          if (firstEventMs > STREAM_FIRST_EVENT_SLOW_MS) {
+            logWarn('slow_stream_first_event', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              backend: 'sider',
+              model: outwardModel,
+              elapsedMs: firstEventMs,
+              thresholdMs: STREAM_FIRST_EVENT_SLOW_MS,
+            });
+          }
+        }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
       };
       const safeClose = () => {
@@ -537,6 +644,14 @@ function createTrueSiderStreamingResponse(
       };
 
       try {
+        logInfo('stream_started', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'sider',
+          model: outwardModel,
+          includeThinking,
+        });
+
         await siderClient.chatStream(siderRequest, siderAuthToken, {
           onMessageStart() {
             ensureStart();
@@ -579,9 +694,36 @@ function createTrueSiderStreamingResponse(
           usage: { output_tokens: Math.ceil(outputChars / 4) },
         });
         send({ type: 'message_stop' });
+        const elapsedMs = Date.now() - streamStartedAt;
+        logInfo('stream_completed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'sider',
+          model: outwardModel,
+          eventCount,
+          firstEventMs,
+          elapsedMs,
+        });
+        if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
+          logWarn('slow_stream_request', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            backend: 'sider',
+            model: outwardModel,
+            eventCount,
+            elapsedMs,
+            thresholdMs: STREAM_TOTAL_SLOW_MS,
+          });
+        }
         safeClose();
       } catch (error) {
-        console.error('Sider streaming failed:', error);
+        logError('stream_error', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'sider',
+          model: outwardModel,
+          error: serializeError(error),
+        }, 'Sider streaming failed:');
         ensureStart();
         closeBlock();
         send({
@@ -591,12 +733,26 @@ function createTrueSiderStreamingResponse(
             message: error instanceof Error ? error.message : 'Sider streaming error',
           },
         });
+        logWarn('stream_failed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'sider',
+          model: outwardModel,
+          eventCount,
+          elapsedMs: Date.now() - streamStartedAt,
+        }, 'Streaming failed:');
         safeClose();
       }
     },
   });
 
-  return new Response(stream, { headers: SSE_HEADERS });
+  return new Response(stream, {
+    headers: {
+      ...SSE_HEADERS,
+      'X-Request-ID': logContext.requestId,
+      'X-Request-Hash': logContext.requestHash,
+    },
+  });
 }
 
 /**
@@ -605,13 +761,40 @@ function createTrueSiderStreamingResponse(
 function createDeepSeekStreamingResponse(
   adapter: AnthropicApiAdapter,
   request: AnthropicRequest,
+  logContext: RequestLogContext,
 ): Response {
   const encoder = new TextEncoder();
+  const streamStartedAt = Date.now();
 
   const stream = new ReadableStream({
     async start(controller) {
       let closed = false;
+      let eventCount = 0;
+      let firstEventLogged = false;
+      let firstEventMs = 0;
       const send = (event: unknown) => {
+        eventCount += 1;
+        if (!firstEventLogged) {
+          firstEventLogged = true;
+          firstEventMs = Date.now() - streamStartedAt;
+          logInfo('stream_first_event', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            backend: 'deepseek',
+            model: request.model,
+            elapsedMs: firstEventMs,
+          });
+          if (firstEventMs > STREAM_FIRST_EVENT_SLOW_MS) {
+            logWarn('slow_stream_first_event', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              backend: 'deepseek',
+              model: request.model,
+              elapsedMs: firstEventMs,
+              thresholdMs: STREAM_FIRST_EVENT_SLOW_MS,
+            });
+          }
+        }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
       };
       const safeClose = () => {
@@ -622,10 +805,41 @@ function createDeepSeekStreamingResponse(
       };
 
       try {
+        logInfo('stream_started', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'deepseek',
+          model: request.model,
+          tools: request.tools?.length || 0,
+        });
+
         await adapter.sendStreamRequest(
           request,
           (chunk) => send(chunk),
-          () => safeClose(),
+          () => {
+            const elapsedMs = Date.now() - streamStartedAt;
+            logInfo('stream_completed', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              backend: 'deepseek',
+              model: request.model,
+              eventCount,
+              firstEventMs,
+              elapsedMs,
+            });
+            if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
+              logWarn('slow_stream_request', {
+                requestId: logContext.requestId,
+                requestHash: logContext.requestHash,
+                backend: 'deepseek',
+                model: request.model,
+                eventCount,
+                elapsedMs,
+                thresholdMs: STREAM_TOTAL_SLOW_MS,
+              });
+            }
+            safeClose();
+          },
           (error) => {
             send({
               type: 'error',
@@ -634,8 +848,17 @@ function createDeepSeekStreamingResponse(
                 message: error.message,
               },
             });
+            logWarn('stream_failed', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              backend: 'deepseek',
+              model: request.model,
+              eventCount,
+              elapsedMs: Date.now() - streamStartedAt,
+            }, 'Streaming failed:');
             safeClose();
           },
+          logContext,
         );
       } catch (error) {
         send({
@@ -645,12 +868,27 @@ function createDeepSeekStreamingResponse(
             message: error instanceof Error ? error.message : 'DeepSeek streaming error',
           },
         });
+        logWarn('stream_failed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          backend: 'deepseek',
+          model: request.model,
+          eventCount,
+          elapsedMs: Date.now() - streamStartedAt,
+          error: serializeError(error),
+        }, 'Streaming failed:');
         safeClose();
       }
     },
   });
 
-  return new Response(stream, { headers: SSE_HEADERS });
+  return new Response(stream, {
+    headers: {
+      ...SSE_HEADERS,
+      'X-Request-ID': logContext.requestId,
+      'X-Request-Hash': logContext.requestHash,
+    },
+  });
 }
 
 export { messagesRouter as hybridMessagesRouter };

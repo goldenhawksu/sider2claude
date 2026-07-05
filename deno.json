@@ -22,8 +22,7 @@
   },
   "compilerOptions": {
     "lib": ["deno.window", "dom"],
-    "strict": true,
-    "allowJs": false
+    "strict": true
   },
   "nodeModulesDir": "auto",
   "fmt": {

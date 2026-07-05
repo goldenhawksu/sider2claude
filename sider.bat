@@ -10,6 +10,8 @@ set "DENO_MAIN=%ROOT%\deno\main.ts"
 set "DENO_SERVE_MAIN=%ROOT%\deno\serve.ts"
 set "BUN_MAIN=%ROOT%\src\main.ts"
 set "BUN_SERVE_MAIN=%ROOT%\src\serve.ts"
+set "BUN_SERVICE_SCRIPT=%ROOT%\tools\start-bun-service.ps1"
+set "DENO_SERVICE_SCRIPT=%ROOT%\tools\start-deno-service.ps1"
 set "RUNTIME_DIR=%ROOT%\.runtime"
 set "LOG_DIR=%ROOT%\logs"
 set "PID_FILE=%RUNTIME_DIR%\sider2claude.pid"
@@ -371,41 +373,32 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
 call :readPort
 
-if /i "!RUNTIME!"=="bun" (
+if /i "!RUNTIME!"=="bun" goto startBunRuntime
+goto startDenoRuntime
+
+:startBunRuntime
   where bun >nul 2>nul
   if errorlevel 1 (
     echo [FAIL] Bun 未安装。
     exit /b 1
   )
   echo 运行环境: Bun
-  echo 入口文件: %BUN_MAIN%
-  set "RUNTIME_EXE="
-  for /f "delims=" %%P in ('where bun 2^>nul') do if not defined RUNTIME_EXE set "RUNTIME_EXE=%%P"
-  powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "$p = Start-Process -FilePath '!RUNTIME_EXE!' -ArgumentList @('run','%BUN_SERVE_MAIN%') -WorkingDirectory '%ROOT%' -RedirectStandardOutput '%OUT_LOG%' -RedirectStandardError '%ERR_LOG%' -WindowStyle Hidden -PassThru;" ^
-    "Set-Content -LiteralPath '%PID_FILE%' -Value $p.Id -Encoding ASCII;" ^
-    "Write-Output ('PID: ' + $p.Id)"
-  if errorlevel 1 (
-    echo [FAIL] 启动失败。
-    exit /b 1
-  )
-) else (
+  echo 入口文件: %BUN_SERVE_MAIN%
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%BUN_SERVICE_SCRIPT%" -Root "%ROOT%" -Entrypoint "%BUN_SERVE_MAIN%" -OutLog "%OUT_LOG%" -ErrLog "%ERR_LOG%" -PidFile "%PID_FILE%"
+goto runtimeStarted
+
+:startDenoRuntime
   where deno >nul 2>nul
   if errorlevel 1 (
     echo [FAIL] Deno 未安装。
     exit /b 1
   )
   echo 运行环境: Deno
-  echo 入口文件: %DENO_MAIN%
-  set "RUNTIME_EXE="
-  for /f "delims=" %%P in ('where deno 2^>nul') do if not defined RUNTIME_EXE set "RUNTIME_EXE=%%P"
-  start "Sider2Claude Deno" /min "!RUNTIME_EXE!" serve --allow-net --allow-env --allow-read --port "%PORT%" "%DENO_SERVE_MAIN%"
-  if errorlevel 1 (
-    echo [FAIL] 启动失败。
-    exit /b 1
-  )
-)
+  echo 入口文件: %DENO_SERVE_MAIN%
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%DENO_SERVICE_SCRIPT%" -Root "%ROOT%" -Port "%PORT%" -Entrypoint "%DENO_SERVE_MAIN%" -OutLog "%OUT_LOG%" -ErrLog "%ERR_LOG%" -PidFile "%PID_FILE%"
+goto runtimeStarted
+
+:runtimeStarted
 
 call :waitForService
 if errorlevel 1 exit /b 1

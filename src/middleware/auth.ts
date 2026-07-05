@@ -120,11 +120,7 @@ export function createAuthMiddleware(options: {
         } satisfies AuthInfo,
       );
 
-      // 日志记录 (不记录完整 token)
-      consola.debug('Auth successful:', {
-        tokenPrefix: token.substring(0, 8) + '...',
-        type,
-      });
+      consola.debug('Auth successful:', { type });
 
       await next();
     } catch (error) {

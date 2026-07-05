@@ -72,3 +72,32 @@ Deno.test('认证：只有显式开启 ALLOW_DUMMY_TOKEN 才接受 dummy', async
     assertEquals(response.status, 200);
   });
 });
+
+Deno.test('认证：成功日志不输出 token 或 token 前缀', async () => {
+  await withEnv({
+    AUTH_TOKEN: 'real-token-secret',
+    ALLOW_DUMMY_TOKEN: undefined,
+  }, async () => {
+    const app = protectedApp();
+    const originalLog = console.log;
+    const logs: string[] = [];
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => JSON.stringify(arg)).join(' '));
+    };
+
+    try {
+      const response = await app.request('/protected', {
+        headers: { Authorization: 'Bearer real-token-secret' },
+      });
+      assertEquals(response.status, 200);
+    } finally {
+      console.log = originalLog;
+    }
+
+    const text = logs.join('\n');
+    assertEquals(text.includes('real-token-secret'), false);
+    assertEquals(text.includes('real-tok'), false);
+    assertEquals(text.includes('tokenPrefix'), false);
+  });
+});

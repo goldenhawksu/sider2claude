@@ -13,6 +13,12 @@ function assertExists(value: unknown) {
   }
 }
 
+function assertGreaterOrEqual(actual: number, expected: number) {
+  if (actual < expected) {
+    throw new Error(`断言失败：期望 ${actual} >= ${expected}`);
+  }
+}
+
 Deno.test('DeepSeek 适配器：用 Anthropic 兼容协议补齐工具能力，并保持对外 Claude 模型名', async () => {
   const originalFetch = globalThis.fetch;
   const calls: Array<{ url: string; init?: RequestInit; body: AnthropicRequest }> = [];
@@ -287,5 +293,75 @@ Deno.test('DeepSeek 适配器：上游错误保留状态码用于路由层透传
     }
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('DeepSeek 适配器：响应耗时包含 body 读取与解析时间', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalInfo = console.info;
+  const infos: Array<{ message: string; data?: Record<string, unknown> }> = [];
+
+  console.info = (message?: unknown, data?: unknown) => {
+    infos.push({
+      message: String(message),
+      data: data && typeof data === 'object' ? data as Record<string, unknown> : undefined,
+    });
+  };
+
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init?.body as string) as AnthropicRequest;
+    const payload = JSON.stringify({
+      id: 'msg_delayed_body',
+      type: 'message',
+      role: 'assistant',
+      model: body.model,
+      content: [{ type: 'text', text: 'ok' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      },
+    });
+
+    return Promise.resolve(
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+  }) as typeof fetch;
+
+  try {
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      apiKey: 'deepseek-token',
+      model: 'deepseek-v4-flash',
+    });
+
+    await adapter.sendRequest({
+      model: 'claude-sonnet-4.6',
+      messages: [{ role: 'user', content: 'hello' }],
+      max_tokens: 128,
+    });
+
+    const responseLog = infos.find((item) =>
+      item.message === 'Anthropic-compatible backend response:'
+    );
+    if (!responseLog?.data || typeof responseLog.data.elapsed !== 'string') {
+      throw new Error('断言失败：缺少响应耗时日志');
+    }
+
+    const elapsed = Number(responseLog.data.elapsed.replace('ms', ''));
+    assertGreaterOrEqual(elapsed, 20);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.info = originalInfo;
   }
 });
