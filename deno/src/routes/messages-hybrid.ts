@@ -678,6 +678,9 @@ function createTrueSiderStreamingResponse(
       let firstEventLogged = false;
       let firstEventMs = 0;
       const send = (event: unknown) => {
+        if (closed) {
+          return;
+        }
         eventCount += 1;
         if (!firstEventLogged) {
           firstEventLogged = true;
@@ -752,6 +755,7 @@ function createTrueSiderStreamingResponse(
         });
       };
 
+      let keepAlive: ReturnType<typeof setInterval> | undefined;
       try {
         logInfo('stream_started', {
           requestId: logContext.requestId,
@@ -760,6 +764,9 @@ function createTrueSiderStreamingResponse(
           model: outwardModel,
           includeThinking,
         });
+
+        ensureStart();
+        keepAlive = setInterval(() => send({ type: 'ping' }), 10_000);
 
         await siderClient.chatStream(siderRequest, siderAuthToken, {
           onMessageStart() {
@@ -851,6 +858,10 @@ function createTrueSiderStreamingResponse(
           elapsedMs: Date.now() - streamStartedAt,
         }, 'Streaming failed:');
         safeClose();
+      } finally {
+        if (keepAlive) {
+          clearInterval(keepAlive);
+        }
       }
     },
   });

@@ -48,6 +48,117 @@ function parseSseEvents(text: string): Array<Record<string, unknown>> {
     .map((line) => JSON.parse(line.slice(5).trim()) as Record<string, unknown>);
 }
 
+function parseFirstSseEvent(value: Uint8Array): Record<string, unknown> {
+  const text = new TextDecoder().decode(value);
+  const line = text.split(/\r?\n/).find((line) => line.startsWith('data:'));
+  if (!line) {
+    throw new Error(`assert failed: expected SSE data line in ${text}`);
+  }
+  return JSON.parse(line.slice(5).trim()) as Record<string, unknown>;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function readWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  ms: number,
+): Promise<ReadableStreamReadResult<Uint8Array> | 'timeout'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+Deno.test('sider stream sends message_start before upstream response', async () => {
+  const originalFetch = globalThis.fetch;
+  const upstream = deferred<Response>();
+
+  try {
+    await withEnv({
+      AUTH_TOKEN: 'test-token-12345',
+      SIDER_AUTH_TOKEN: 'sider-token',
+      DEFAULT_BACKEND: 'sider',
+      PREFER_SIDER_FOR_CHAT: 'true',
+      DEEPSEEK_API_KEY: undefined,
+    }, async () => {
+      globalThis.fetch = (() => upstream.promise) as typeof fetch;
+
+      const routeModule = await import(
+        `../src/routes/messages-hybrid.ts?test=${crypto.randomUUID()}`
+      );
+      const app = new Hono();
+      app.route('/v1/messages', routeModule.hybridMessagesRouter);
+
+      const response = await app.request('/v1/messages?beta=true', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer test-token-12345',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4.5',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 16,
+          stream: true,
+        }),
+      });
+
+      assertEquals(response.status, 200);
+      assertExists(response.body);
+
+      const reader = response.body!.getReader();
+      const first = await readWithTimeout(reader, 100);
+      if (first === 'timeout') {
+        upstream.reject(new Error('test cleanup'));
+        throw new Error('assert failed: expected first SSE event before upstream response');
+      }
+
+      const firstEvent = parseFirstSseEvent(first.value!);
+      assertEquals(firstEvent.type, 'message_start');
+
+      upstream.resolve(
+        new Response(
+          `data: ${
+            JSON.stringify({
+              code: 0,
+              msg: 'ok',
+              data: { type: 'text', model: 'claude-haiku-4.5', text: 'OK' },
+            })
+          }\n\ndata: [DONE]\n\n`,
+          {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+          },
+        ),
+      );
+
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+      }
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test('hybrid route synthesizes tool stream and replays duplicate non-stream request', async () => {
   const originalFetch = globalThis.fetch;
   let upstreamCalls = 0;
