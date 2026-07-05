@@ -153,3 +153,37 @@ Deno.test('hybrid route synthesizes tool stream and replays duplicate non-stream
     globalThis.fetch = originalFetch;
   }
 });
+
+Deno.test('hybrid route maps missing user message validation to 400', async () => {
+  await withEnv({
+    AUTH_TOKEN: 'test-token-12345',
+    DEEPSEEK_API_KEY: 'deepseek-token',
+    DEEPSEEK_BASE_URL: 'https://api.deepseek.com/anthropic',
+    DEFAULT_BACKEND: 'deepseek',
+    SIDER_AUTH_TOKEN: undefined,
+  }, async () => {
+    const routeModule = await import(
+      `../src/routes/messages-hybrid.ts?test=${crypto.randomUUID()}`
+    );
+    const app = new Hono();
+    app.route('/v1/messages', routeModule.hybridMessagesRouter);
+
+    const response = await app.request('/v1/messages?beta=true', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer test-token-12345',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4.6',
+        messages: [{ role: 'assistant', content: 'assistant only' }],
+        max_tokens: 16,
+      }),
+    });
+
+    assertEquals(response.status, 400);
+    const body = await response.json() as { error?: { type?: string; message?: string } };
+    assertEquals(body.error?.type, 'invalid_request_error');
+    assertEquals(body.error?.message, 'At least one user message is required');
+  });
+});

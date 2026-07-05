@@ -276,6 +276,7 @@ messagesRouter.post('/', async (c: Context) => {
     if (
       error instanceof Error && (
         error.message.includes('Missing required field') ||
+        error.message.includes('At least one user message is required') ||
         error.message.includes('Invalid') ||
         error.message.includes('cannot be empty')
       )
