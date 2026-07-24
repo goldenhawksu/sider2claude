@@ -109,6 +109,8 @@ const SIDER_FULL_MAPPING: Record<string, string> = {
   'gemini-3.0-flash-think': 'gemini-3.0-flash-think',
   'gemini-3.5-flash': 'gemini-3.5-flash',
   'gemini-3.5-flash-think': 'gemini-3.5-flash-think',
+  'gemini-3.6-flash': 'gemini-3.6-flash',
+  'gemini-3.6-flash-think': 'gemini-3.6-flash-think',
 
   // DeepSeek 系列
   'deepseek-v4-flash': 'deepseek-v4-flash',
@@ -121,7 +123,7 @@ const SIDER_FULL_MAPPING: Record<string, string> = {
   'glm-5': 'glm-5',
   'glm-5-think': 'glm-5-think',
   'qwen3-max': 'qwen3-max',
-  'kimi-k2': 'kimi-k2',
+  'kimi-k3': 'kimi-k3',
   'llama-3.1-405b': 'llama-3.1-405b',
 
   // 智能路由
