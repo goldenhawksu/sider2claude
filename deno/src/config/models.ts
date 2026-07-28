@@ -48,6 +48,8 @@ const CLAUDE_MODELS: ModelInfo[] = [
   model('claude-opus-4.6-think'),
   model('claude-opus-4.8', 'claude-opus-4.8'),
   model('claude-opus-4.8-think', 'claude-opus-4.8-think'),
+  model('claude-opus-5', 'claude-opus-5'),
+  model('claude-opus-5-think', 'claude-opus-5-think'),
   model('claude-fable-5', 'claude-fable-5'),
   model('claude-fable-5-think', 'claude-fable-5-think'),
 
@@ -83,6 +85,12 @@ const SIDER_FULL_MAPPING: Record<string, string> = {
   'gpt-5.4-think': 'gpt-5.4-think',
   'gpt-5.5': 'gpt-5.5',
   'gpt-5.5-think': 'gpt-5.5-think',
+  'gpt-5.6-sol': 'gpt-5.6-sol',
+  'gpt-5.6-sol-think': 'gpt-5.6-sol-think',
+  'gpt-5.6-terra': 'gpt-5.6-terra',
+  'gpt-5.6-terra-think': 'gpt-5.6-terra-think',
+  'gpt-5.6-luna': 'gpt-5.6-luna',
+  'gpt-5.6-luna-think': 'gpt-5.6-luna-think', 
 
   // Claude 系列（对齐 sider2api 的命名风格）
   'claude-opus-4.5': 'claude-opus-4.5',
@@ -91,12 +99,16 @@ const SIDER_FULL_MAPPING: Record<string, string> = {
   'claude-opus-4.6-think': 'claude-opus-4.6-think',
   'claude-opus-4.8': 'claude-opus-4.8',
   'claude-opus-4.8-think': 'claude-opus-4.8-think',
+  'claude-opus-5': 'claude-opus-5',
+  'claude-opus-5-think': 'claude-opus-5-think',
   'claude-fable-5': 'claude-fable-5',
   'claude-fable-5-think': 'claude-fable-5-think',
   'claude-4.5-sonnet': 'claude-4.5-sonnet',
   'claude-4.5-sonnet-think': 'claude-4.5-sonnet-think',
   'claude-sonnet-4.6': 'claude-sonnet-4.6',
   'claude-sonnet-4.6-think': 'claude-sonnet-4.6-think',
+  'claude-sonnet-5': 'claude-sonnet-5',
+  'claude-sonnet-5-think': 'claude-sonnet-5-think',
   'claude-haiku-4.5': 'claude-haiku-4.5',
   'claude-haiku-4.5-think': 'claude-haiku-4.5-think',
 
