@@ -27,6 +27,7 @@ sider-capability-probe-*.json
 test/reports/integration-*.md
 test/reports/本地测试报告_20*.md
 test/reports/生产验证报告_20*.md
+deno/test/integration/reports/
 
 # Runtime data
 .runtime/
