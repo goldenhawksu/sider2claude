@@ -20,10 +20,17 @@ export interface RoutingDecision {
   ruleId: string;
 }
 
+/**
+ * 会话后端记忆的存活时间与容量上限。
+ * 工具回合的连续性只在一次对话期间有意义，长期驻留既无用也会让实例无限累积条目。
+ */
+const SESSION_BACKEND_TTL_MS = 60 * 60_000;
+const MAX_SESSION_BACKEND_ENTRIES = 500;
+
 export class RouterEngine {
   private config: BackendConfig;
   private analyzer: RequestAnalyzer;
-  private sessionBackends = new Map<string, Backend>();
+  private sessionBackends = new Map<string, { backend: Backend; updatedAt: number }>();
 
   constructor(config: BackendConfig) {
     this.config = config;
@@ -45,8 +52,15 @@ export class RouterEngine {
     conversationId?: string,
   ): RoutingDecision {
     if (analysis.type === 'tool_result_feedback' && conversationId) {
-      const previousBackend = this.sessionBackends.get(conversationId);
-      if (previousBackend) {
+      const previousBackend = this.getSessionBackend(conversationId);
+
+      // Sider 未被证明支持 Anthropic `tool_use`。本轮若带了需要 DeepSeek 承接的工具，
+      // 就不能仅因为"延续上一回合"而回到 Sider：没有显式 X-Conversation-ID 的请求
+      // 共享 `continuous-conversation` 这一个槽位，上一回合很可能是另一段纯对话。
+      const needsToolCapableBackend = analysis.hasClaudeCodeTools || analysis.hasMcpTools;
+      const siderCannotServe = previousBackend === 'sider' && needsToolCapableBackend;
+
+      if (previousBackend && !siderCannotServe) {
         return {
           backend: previousBackend,
           reason: `Maintain backend for tool result feedback (previous: ${getBackendDisplayName(previousBackend)})`,
@@ -54,6 +68,14 @@ export class RouterEngine {
           allowFallback: false,
           ruleId: 'rule_1_tool_result_continuity',
         };
+      }
+
+      if (siderCannotServe) {
+        consola.warn('Skipping tool result continuity: Sider cannot serve tool_use requests.', {
+          conversationId: conversationId.substring(0, 12),
+          claudeCodeTools: analysis.claudeCodeToolNames.slice(0, 3),
+          mcpTools: analysis.mcpToolNames.slice(0, 3),
+        });
       }
     }
 
@@ -190,20 +212,54 @@ export class RouterEngine {
   }
 
   recordSessionBackend(conversationId: string, backend: Backend): void {
-    this.sessionBackends.set(conversationId, backend);
+    // 先删后插：让 Map 的插入顺序反映最近使用，超量时可直接淘汰最老的条目。
+    this.sessionBackends.delete(conversationId);
+    this.sessionBackends.set(conversationId, { backend, updatedAt: Date.now() });
+    this.evictOverflowSessions();
+
     consola.debug(
       `Session backend recorded: ${conversationId.substring(0, 12)}... -> ${getBackendDisplayName(backend)}`,
     );
   }
 
+  /** 读取会话后端；超过 TTL 的记录视为不存在并顺手清除。 */
   getSessionBackend(conversationId: string): Backend | undefined {
-    return this.sessionBackends.get(conversationId);
+    const entry = this.sessionBackends.get(conversationId);
+    if (!entry) {
+      return undefined;
+    }
+
+    if (Date.now() - entry.updatedAt > SESSION_BACKEND_TTL_MS) {
+      this.sessionBackends.delete(conversationId);
+      return undefined;
+    }
+
+    return entry.backend;
   }
 
-  cleanupExpiredSessions(_maxAge: number = 3600000): number {
-    const count = this.sessionBackends.size;
-    this.sessionBackends.clear();
-    return count;
+  /** 清理过期的会话后端记录，返回清理条数。 */
+  cleanupExpiredSessions(maxAge: number = SESSION_BACKEND_TTL_MS): number {
+    const now = Date.now();
+    let cleaned = 0;
+
+    for (const [conversationId, entry] of this.sessionBackends.entries()) {
+      if (now - entry.updatedAt > maxAge) {
+        this.sessionBackends.delete(conversationId);
+        cleaned += 1;
+      }
+    }
+
+    return cleaned;
+  }
+
+  private evictOverflowSessions(): void {
+    while (this.sessionBackends.size > MAX_SESSION_BACKEND_ENTRIES) {
+      const oldest = this.sessionBackends.keys().next().value;
+      if (!oldest) {
+        return;
+      }
+      this.sessionBackends.delete(oldest);
+    }
   }
 
   private logDecision(decision: RoutingDecision, analysis: RequestAnalysis): void {
@@ -244,8 +300,8 @@ Context:
     let siderCount = 0;
     let deepseekCount = 0;
 
-    for (const backend of this.sessionBackends.values()) {
-      if (backend === 'sider') {
+    for (const entry of this.sessionBackends.values()) {
+      if (entry.backend === 'sider') {
         siderCount++;
       } else {
         deepseekCount++;

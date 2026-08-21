@@ -89,7 +89,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   const models = getAllModels();
   const ids = models.map((model) => model.id);
 
-  assertEquals(models.length, 54);
+  assertEquals(models.length, 67);
   for (
     const id of [
       'claude-sonnet-4.6',
@@ -98,8 +98,8 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
       'deepseek-v4-pro-think',
       'grok-4',
       'glm-5',
-      'qwen3-max',
-      'kimi-k2',
+      'qwen3.8-max',
+      'kimi-k3',
       'llama-3.1-405b',
       'sider',
     ]
@@ -119,7 +119,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   assertEquals(listResponse.status, 200);
   const list = await listResponse.json() as { data?: Array<{ id?: string }> };
   const listIds = idsFromOpenAIModelList(list);
-  assertEquals(listIds.length, 54);
+  assertEquals(listIds.length, 67);
   assertEquals(listIds.includes('gpt-5.5-think'), true);
   assertEquals(listIds.includes('gemini-3.5-flash'), true);
 
@@ -144,7 +144,7 @@ Deno.test('Gemini model discovery exposes every upstream model', async () => {
     assertEquals(listResponse.status, 200);
     const list = await listResponse.json() as { models?: Array<{ name?: string }> };
     const ids = idsFromGeminiModelList(list);
-    assertEquals(ids.length, 54);
+    assertEquals(ids.length, 67);
     assertEquals(ids.includes('gpt-5.5-think'), true);
     assertEquals(ids.includes('gemini-3.5-flash'), true);
 
