@@ -20,6 +20,33 @@ import type {
 } from '../types/index.ts';
 import { getOrCreateContinuousSession, saveSiderSession } from './sider-session-manager.ts';
 
+/**
+ * Sider 在 SSE 内用 `code !== 0` 表达业务失败（如 1135 用量超限），HTTP 状态仍是 200。
+ * 这类失败必须显式表达，否则调用方只会收到一个空回复，既无法 fallback 也无法诊断。
+ */
+export class SiderUpstreamError extends Error {
+  constructor(
+    message: string,
+    public siderCode: number,
+    public statusCode: number,
+  ) {
+    super(message);
+    this.name = 'SiderUpstreamError';
+  }
+}
+
+/**
+ * 由 Sider 业务错误码构造错误。消息格式与状态码映射只在这里定义一次：
+ * 1135 为用量超限（429），其余按上游故障（502）处理。
+ */
+export function siderUpstreamError(code: number, msg: string): SiderUpstreamError {
+  return new SiderUpstreamError(
+    `Sider upstream error ${code}: ${msg}`,
+    code,
+    code === 1135 ? 429 : 502,
+  );
+}
+
 export interface SiderStreamCallbacks {
   onMessageStart?: (data: SiderMessageStart) => void;
   onReasoningContent?: (data: SiderReasoningContent) => void;
@@ -187,6 +214,7 @@ export function persistSessionFromMessageStart(data: SiderMessageStart): void {
 export function createAccumulatorCallbacks(): {
   callbacks: SiderStreamCallbacks;
   result: SiderParsedResponse;
+  upstream: { error?: SiderUpstreamError };
 } {
   const result: SiderParsedResponse = {
     reasoningParts: [],
@@ -194,6 +222,7 @@ export function createAccumulatorCallbacks(): {
     toolResults: [],
     model: '',
   };
+  const upstream: { error?: SiderUpstreamError } = {};
 
   const ensureTool = (toolId: string, toolName: string) => {
     if (!result.toolResults) {
@@ -264,7 +293,11 @@ export function createAccumulatorCallbacks(): {
       }
       result.model = data.model;
     },
+    onWarning(code, msg) {
+      // 保留首个错误：后续事件可能继续到达，但首个错误最接近失败原因。
+      upstream.error ??= siderUpstreamError(code, msg);
+    },
   };
 
-  return { callbacks, result };
+  return { callbacks, result, upstream };
 }

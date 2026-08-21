@@ -21,7 +21,7 @@ import {
   normalizeAnthropicRequest,
   validateAnthropicRequest,
 } from '../utils/request-converter';
-import { siderClient } from '../utils/sider-client';
+import { siderClient, SiderUpstreamError } from '../utils/sider-client';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
 import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
 import { cleanupExpiredSiderSessions, getSiderSessionStats } from '../utils/sider-session-manager';
@@ -251,7 +251,9 @@ messagesRouter.post('/', async (c: Context) => {
       );
     }
 
-    if (error instanceof AnthropicBackendError) {
+    // AnthropicBackendError 来自 DeepSeek，SiderUpstreamError 来自 Sider 的 SSE 内业务错误码
+    // （HTTP 200 + code != 0）。两者都已带好 statusCode，走到这里说明 fallback 用尽或不被允许。
+    if (error instanceof AnthropicBackendError || error instanceof SiderUpstreamError) {
       const status = normalizeErrorStatus(error.statusCode);
       return c.json(
         {
@@ -291,14 +293,25 @@ messagesRouter.post('/', async (c: Context) => {
   }
 });
 
-function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 503 {
+function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
   if (statusCode === 400) return 400;
   if (statusCode === 401) return 401;
   if (statusCode === 403) return 403;
   if (statusCode === 404) return 404;
   if (statusCode === 429) return 429;
+  if (statusCode === 502) return 502;
   if (statusCode === 503) return 503;
   return 500;
+}
+
+/**
+ * 按 Anthropic SSE 约定编码事件：每条事件同时带 `event:` 与 `data:` 行。
+ * 只发 `data:` 时，依赖事件名分发的客户端会收不到任何内容。
+ */
+function encodeSSEEvent(encoder: TextEncoder, event: unknown): Uint8Array {
+  const name = (event as { type?: string }).type;
+  const data = `data: ${JSON.stringify(event)}\n\n`;
+  return encoder.encode(name ? `event: ${name}\n${data}` : data);
 }
 
 function mapErrorStatusToType(statusCode: number): AnthropicError['error']['type'] {
@@ -391,10 +404,13 @@ messagesRouter.get('/conversations', (c: Context) => {
 messagesRouter.post('/conversations/cleanup', (c: Context) => {
   try {
     const cleaned = cleanupExpiredConversations(1);
+    // 路由的会话后端记忆同属对话状态，一并回收，避免长期运行的实例只增不减。
+    const cleanedRoutingSessions = routerEngine.cleanupExpiredSessions();
     return c.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
       cleanedConversations: cleaned,
+      cleanedRoutingSessions,
     });
   } catch (error) {
     consola.error('Failed to cleanup conversations:', error);
@@ -493,7 +509,7 @@ function createStreamingResponse(response: AnthropicResponse, logContext: Reques
             });
           }
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(encodeSSEEvent(encoder, event));
       };
 
       try {

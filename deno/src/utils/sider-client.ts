@@ -78,8 +78,14 @@ export class SiderClient {
 
     try {
       const response = await this.doFetch(request, authToken);
-      const { callbacks, result } = createAccumulatorCallbacks();
+      const { callbacks, result, upstream } = createAccumulatorCallbacks();
       await streamSiderSSE(response, callbacks);
+
+      // Sider 用 SSE 内的 code 表达业务失败。只在同时没拿到任何文本时才判定为失败，
+      // 避免把「已正常作答 + 附带一条非致命提示」误判成错误。
+      if (upstream.error && result.textParts.length === 0) {
+        throw upstream.error;
+      }
 
       this.logParsedSummary(result);
       return result;

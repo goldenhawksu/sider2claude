@@ -18,6 +18,7 @@ import {
   validateAnthropicRequest,
 } from '../utils/request-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
+import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter.ts';
 import {
   cleanupExpiredConversations,
@@ -293,7 +294,9 @@ messagesRouter.post('/', async (c: Context) => {
       );
     }
 
-    if (error instanceof AnthropicBackendError) {
+    // AnthropicBackendError 来自 DeepSeek，SiderUpstreamError 来自 Sider 的 SSE 内业务错误码
+    // （HTTP 200 + code != 0）。两者都已带好 statusCode，走到这里说明 fallback 用尽或不被允许。
+    if (error instanceof AnthropicBackendError || error instanceof SiderUpstreamError) {
       const status = normalizeErrorStatus(error.statusCode);
       return c.json(
         {
@@ -333,12 +336,13 @@ messagesRouter.post('/', async (c: Context) => {
   }
 });
 
-function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 503 {
+function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
   if (statusCode === 400) return 400;
   if (statusCode === 401) return 401;
   if (statusCode === 403) return 403;
   if (statusCode === 404) return 404;
   if (statusCode === 429) return 429;
+  if (statusCode === 502) return 502;
   if (statusCode === 503) return 503;
   return 500;
 }
@@ -433,10 +437,13 @@ messagesRouter.get('/conversations', (c: Context) => {
 messagesRouter.post('/conversations/cleanup', (c: Context) => {
   try {
     const cleaned = cleanupExpiredConversations(1);
+    // 路由的会话后端记忆同属对话状态，一并回收，避免长期运行的实例只增不减。
+    const cleanedRoutingSessions = routerEngine.cleanupExpiredSessions();
     return c.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
       cleanedConversations: cleaned,
+      cleanedRoutingSessions,
     });
   } catch (error) {
     console.error('Failed to cleanup conversations:', error);
@@ -536,6 +543,16 @@ const SSE_HEADERS = {
 
 function generateStreamMessageId(): string {
   return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+}
+
+/**
+ * 按 Anthropic SSE 约定编码事件：每条事件同时带 `event:` 与 `data:` 行。
+ * 只发 `data:` 时，依赖事件名分发的客户端会收不到任何内容。
+ */
+function encodeSSEEvent(encoder: TextEncoder, event: unknown): Uint8Array {
+  const name = (event as { type?: string }).type;
+  const data = `data: ${JSON.stringify(event)}\n\n`;
+  return encoder.encode(name ? `event: ${name}\n${data}` : data);
 }
 
 function warnLargeRequest(
@@ -703,7 +720,7 @@ function createTrueSiderStreamingResponse(
             });
           }
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(encodeSSEEvent(encoder, event));
       };
       const safeClose = () => {
         if (!closed) {
@@ -799,6 +816,11 @@ function createTrueSiderStreamingResponse(
               delta: { type: 'text_delta', text: data.text },
             });
           },
+          onWarning(code, msg) {
+            // Sider 在 SSE 内用 code 表达业务失败（HTTP 仍是 200）。抛出让下面的 catch
+            // 统一收尾成 error 事件，否则客户端只会收到一个没有内容块的空流。
+            throw siderUpstreamError(code, msg);
+          },
         });
 
         // 流正常结束：极端情况下没有任何事件，也要先发 message_start。
@@ -845,7 +867,9 @@ function createTrueSiderStreamingResponse(
         send({
           type: 'error',
           error: {
-            type: 'api_error',
+            type: error instanceof SiderUpstreamError
+              ? mapErrorStatusToType(error.statusCode)
+              : 'api_error',
             message: error instanceof Error ? error.message : 'Sider streaming error',
           },
         });
@@ -909,7 +933,7 @@ function createDeepSeekSynthesizedStreamingResponse(
             elapsedMs: firstEventMs,
           });
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(encodeSSEEvent(encoder, event));
       };
       const safeClose = () => {
         if (!closed) {
@@ -1129,7 +1153,7 @@ function createDeepSeekStreamingResponse(
             });
           }
         }
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(encodeSSEEvent(encoder, event));
       };
       const safeClose = () => {
         if (!closed) {

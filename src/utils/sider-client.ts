@@ -14,6 +14,33 @@ import { getEnv } from './env';
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
 
 /**
+ * Sider 在 SSE 内用 `code !== 0` 表达业务失败（如 1135 用量超限），HTTP 状态仍是 200。
+ * 这类失败必须显式表达，否则调用方只会收到一个空回复，既无法 fallback 也无法诊断。
+ */
+export class SiderUpstreamError extends Error {
+  constructor(
+    message: string,
+    public siderCode: number,
+    public statusCode: number,
+  ) {
+    super(message);
+    this.name = 'SiderUpstreamError';
+  }
+}
+
+/**
+ * 由 Sider 业务错误码构造错误。消息格式与状态码映射只在这里定义一次：
+ * 1135 为用量超限（429），其余按上游故障（502）处理。
+ */
+export function siderUpstreamError(code: number, msg: string): SiderUpstreamError {
+  return new SiderUpstreamError(
+    `Sider upstream error ${code}: ${msg}`,
+    code,
+    code === 1135 ? 429 : 502,
+  );
+}
+
+/**
  * Sider API 客户端类
  */
 export class SiderClient {
@@ -93,6 +120,7 @@ export class SiderClient {
       toolResults: [], // 初始化工具调用结果数组
       model: '',
     };
+    const upstream: { error?: SiderUpstreamError } = {};
 
     try {
       let buffer = '';
@@ -109,17 +137,23 @@ export class SiderClient {
         buffer = lines.pop() || ''; // 保留最后一个不完整的行
 
         for (const line of lines) {
-          await this.processSSELine(line.trim(), result);
+          await this.processSSELine(line.trim(), result, upstream);
         }
       }
 
       // 处理剩余的缓冲区
       if (buffer.trim()) {
-        await this.processSSELine(buffer.trim(), result);
+        await this.processSSELine(buffer.trim(), result, upstream);
       }
 
     } finally {
       reader.releaseLock();
+    }
+
+    // Sider 用 SSE 内的 code 表达业务失败。只在同时没拿到任何文本时才判定为失败，
+    // 避免把「已正常作答 + 附带一条非致命提示」误判成错误。
+    if (upstream.error && result.textParts.length === 0) {
+      throw upstream.error;
     }
 
     consola.info('SSE parsing completed:', {
@@ -174,7 +208,11 @@ export class SiderClient {
   /**
    * 处理单行 SSE 数据
    */
-  private async processSSELine(line: string, result: SiderParsedResponse): Promise<void> {
+  private async processSSELine(
+    line: string,
+    result: SiderParsedResponse,
+    upstream: { error?: SiderUpstreamError },
+  ): Promise<void> {
     // 跳过空行和注释
     if (!line || line.startsWith(':')) {
       return;
@@ -196,6 +234,8 @@ export class SiderClient {
         
         if (data.code !== 0) {
           consola.warn('Sider API warning:', { code: data.code, msg: data.msg });
+          // 保留首个错误：后续事件可能继续到达，但首个错误最接近失败原因。
+          upstream.error ??= siderUpstreamError(data.code, data.msg);
           return;
         }
 

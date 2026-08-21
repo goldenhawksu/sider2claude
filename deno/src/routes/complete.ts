@@ -15,6 +15,7 @@ import {
   validateCompleteRequest,
 } from '../utils/complete-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
+import { SiderUpstreamError } from '../utils/sse-line-reader.ts';
 import { convertAnthropicToSiderSync } from '../utils/request-converter.ts';
 import type { AnthropicResponse } from '../types/anthropic.ts';
 import { loadBackendConfig } from '../config/backends.ts';
@@ -115,6 +116,21 @@ app.post('/', async (c: Context) => {
     return c.json(completeResponse);
   } catch (error) {
     console.error('❌ Complete API error:', error);
+
+    // Sider 的 SSE 内业务错误码（如 1135 用量超限）自带 statusCode，
+    // 按它返回才能让客户端区分「限流可重试」和「服务端故障」。
+    if (error instanceof SiderUpstreamError) {
+      const rateLimited = error.statusCode === 429;
+      const errorResp: CompleteError = {
+        type: 'error',
+        error: {
+          type: rateLimited ? 'rate_limit_error' : 'api_error',
+          message: error.message,
+        },
+      };
+
+      return c.json(errorResp, rateLimited ? 429 : 502);
+    }
 
     const errorResp: CompleteError = {
       type: 'error',
