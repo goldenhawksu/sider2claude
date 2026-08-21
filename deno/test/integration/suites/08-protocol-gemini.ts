@@ -11,6 +11,7 @@ import {
   bailIfUpstreamLimited,
   brief,
   type Suite,
+  UpstreamLimited,
 } from '../harness.ts';
 
 const MODEL = 'gemini-3.7-flash';
@@ -78,6 +79,14 @@ export const suite: Suite = {
           contents: [{ role: 'user', parts: [{ text: '数到3' }] }],
         });
         assertEquals(res.status, 200, 'HTTP 状态');
+
+        // 上游限流时必须以 Gemini 错误对象告知，不能是只有 [DONE] 的空流。
+        const errEvent = res.events.find((e) => e.error);
+        if (errEvent) {
+          assertTrue(!!errEvent.error.message, '错误对象带 message');
+          throw new UpstreamLimited(`gemini 流式上游限流：${brief(errEvent.error.message, 90)}`);
+        }
+
         const withCandidates = res.events.filter((e) => Array.isArray(e.candidates));
         assertTrue(withCandidates.length > 0, '流内有 candidates 事件');
         const text = withCandidates

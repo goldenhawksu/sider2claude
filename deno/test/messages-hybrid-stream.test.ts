@@ -257,8 +257,10 @@ Deno.test('hybrid route synthesizes tool stream and replays duplicate non-stream
         body: JSON.stringify({ ...request, stream: false }),
       });
       assertEquals(replayResponse.status, 200);
-      assertEquals(replayResponse.headers.get('X-Duplicate-Replay'), 'true');
-      assertEquals(upstreamCalls, 1);
+      // 指纹忽略 stream（跨流式/非流式识别客户端重试），但响应缓存按流式隔离：
+      // 流式完成的响应不得被等价非流式请求回放，须重新请求上游。
+      assertEquals(replayResponse.headers.get('X-Duplicate-Replay'), null);
+      assertEquals(upstreamCalls, 2);
     });
   } finally {
     globalThis.fetch = originalFetch;

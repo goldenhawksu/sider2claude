@@ -581,7 +581,9 @@ function getCachedDuplicateResponse(
   requestHash: string,
 ): { response: AnthropicResponse; backend: Backend; storedAt: number } | undefined {
   cleanupDuplicateResponseCache();
-  const cached = duplicateResponseCache.get(requestHash);
+  // 缓存键带流式标记：指纹刻意忽略 stream 以跨流式/非流式识别客户端重试（观测用），
+  // 但响应缓存不能共享——非流式回放流式缓存的响应属于语义错配。
+  const cached = duplicateResponseCache.get(`${requestHash}:non-stream`);
   if (!cached) {
     return undefined;
   }
@@ -599,7 +601,7 @@ function cacheDuplicateResponse(
   response: AnthropicResponse,
 ): void {
   cleanupDuplicateResponseCache();
-  duplicateResponseCache.set(requestHash, {
+  duplicateResponseCache.set(`${requestHash}:non-stream`, {
     response: cloneAnthropicResponse(response),
     backend,
     storedAt: Date.now(),
@@ -967,7 +969,8 @@ function createDeepSeekSynthesizedStreamingResponse(
         });
 
         const response = await adapter.sendRequest({ ...request, stream: false }, logContext);
-        cacheDuplicateResponse(logContext.requestHash, 'deepseek', response);
+        // 不写入重复响应缓存：本路径响应以流式事件下发，缓存它只会让后续的
+        // 非流式请求回放一份来源语义不同的快照（幂等重试缓存只覆盖非流式）。
         sendAnthropicResponseContentAsStream(response, send);
         send({
           type: 'message_delta',

@@ -240,6 +240,21 @@ function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Resp
             finish_reason: openAIFinishReason(stopReason),
           }],
         });
+        return;
+      }
+
+      // 上游失败在 Anthropic 流里是 error 事件；丢弃它会让 OpenAI 客户端
+      // 只收到空 chunk 流 + [DONE]，无法得知限流或故障。
+      if (event.type === 'error') {
+        const err = event.error as { message?: string } | undefined;
+        send({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          error: { type: 'upstream_error', message: err?.message ?? 'upstream error' },
+        });
       }
     },
   });
@@ -294,6 +309,23 @@ function mapAnthropicStreamToOpenAIResponses(response: Response, model: string):
             output_text: text,
           },
         }, 'response.completed');
+        return;
+      }
+
+      // 上游失败在 Anthropic 流里是 error 事件；透传为 Responses API 的 failed 状态，
+      // 丢弃它会让客户端只收到 in_progress 后没有下文。
+      if (event.type === 'error') {
+        const err = event.error as { message?: string } | undefined;
+        send({
+          type: 'response.failed',
+          response: {
+            id,
+            object: 'response',
+            created_at: createdAt,
+            status: 'failed',
+            error: { code: 'upstream_error', message: err?.message ?? 'upstream error' },
+          },
+        }, 'response.failed');
       }
     },
   });
@@ -324,6 +356,14 @@ function mapAnthropicStreamToGemini(response: Response): Response {
             index: 0,
           }],
         });
+        return;
+      }
+
+      // 上游失败在 Anthropic 流里是 error 事件；丢弃它会让 Gemini 客户端
+      // 只收到一个空流 + [DONE]，无法得知限流或故障。
+      if (event.type === 'error') {
+        const err = event.error as { message?: string } | undefined;
+        send({ error: { code: 429, message: err?.message ?? 'upstream error', status: 'RESOURCE_EXHAUSTED' } });
       }
     },
   });
