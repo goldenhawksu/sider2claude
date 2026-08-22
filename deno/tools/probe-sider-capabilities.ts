@@ -369,7 +369,9 @@ async function readWithTimeout(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number,
 ): Promise<ReadableStreamReadResult<Uint8Array> | undefined> {
-  let timeoutId: number | undefined;
+  // 不写死 number：Deno 2.9 起 setTimeout 返回 Timeout 对象而非数字，
+  // 用 ReturnType 推导可同时兼容新旧运行时。
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<undefined>((resolve) => {
     timeoutId = setTimeout(() => resolve(undefined), timeoutMs);
   });
