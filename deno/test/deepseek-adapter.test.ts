@@ -702,6 +702,215 @@ Deno.test('DeepSeek adapter 的防模仿提示词禁止实际在用的转录格�
   }
 });
 
+/**
+ * Windows 路径回归：模型模仿转录格式时，会把 JSON.stringify 产出的 `C:\\Users`
+ * 按人类写法还原成单反斜杠 `C:\Users`。这不是合法 JSON，JSON.parse 会抛
+ * "Bad escaped character"，兜底随即失效 → end_turn → Claude Code 停止。
+ * 下面两行是生产 log 里的原始数据。
+ */
+Deno.test('DeepSeek adapter 还原含未转义 Windows 路径的转录（生产 log 原文·Grep）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Grep id=call_00_GfLr3D3R4w0ExT73Udb1p8469 input_json={"-n":true,"output_mode":"content","path":"d:\Github_repo\sider2api\deno_pro.ts","pattern":"stats.json"}`,
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'find stats route' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content[0].type, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].name, 'Grep');
+      // 反斜杠必须原样保留成路径分隔符，不能被吃掉或变成转义字符。
+      assertEquals(response.content[0].input.path, 'd:\\Github_repo\\sider2api\\deno_pro.ts');
+      assertEquals(response.content[0].input['-n'], true);
+      assertEquals(response.content[0].input.output_mode, 'content');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 还原含未转义 Windows 路径的转录（生产 log 原文·Read）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Read id=call_00_ET_v5o8iA3 input_json={"file_path":"C:\Users\Weihong\AppData\Local\Temp\ref\sider.ts","limit":60,"offset":140}`,
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'read types' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(
+        response.content[0].input.file_path,
+        'C:\\Users\\Weihong\\AppData\\Local\\Temp\\ref\\sider.ts',
+      );
+      assertEquals(response.content[0].input.limit, 60);
+      assertEquals(response.content[0].input.offset, 140);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 修复未转义反斜杠时不破坏合法转义序列', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    // \n \t \" \\ 都是合法 JSON 转义，必须原样生效；只有 \G \s 这类非法的才补救。
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_esc input_json={"command":"echo \"hi\"\nls\tx","description":"a\\b","path":"d:\Github_repo"}`,
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'run' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].input.command, 'echo "hi"\nls\tx');
+      assertEquals(response.content[0].input.description, 'a\\b');
+      assertEquals(response.content[0].input.path, 'd:\\Github_repo');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 对真正无法解析的 input_json 保持文本，不伪造工具调用', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    // 花括号不闭合 —— 补救反斜杠也救不回来，必须老实退回文本。
+    text:
+      'Previous assistant tool request: name=Read id=call_broken input_json={"file_path":"a.ts",',
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'end_turn');
+    assertEquals(response.content.length, 1);
+    assertEquals(response.content[0].type, 'text');
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 反斜杠修补的边界情形', async () => {
+  const cases: Array<{ name: string; json: string; expect: Record<string, unknown> }> = [
+    {
+      name: 'Windows 路径里 \\r \\b \\t \\n \\f 开头的目录名都不被吃掉',
+      json: String.raw`{"a":"C:\ref\bin\temp\node_modules\files\x.ts","b":"d:\Github_repo\build"}`,
+      expect: {
+        a: 'C:\\ref\\bin\\temp\\node_modules\\files\\x.ts',
+        b: 'd:\\Github_repo\\build',
+      },
+    },
+    {
+      // 已知局限：UNC 路径没有盘符前缀，识别不出「整体是路径」，因而走
+      // 非路径分支——`\r`/`\b` 这类合法转义仍会生效（`\report` → 回车+eport）。
+      // 关键是整体仍能解析、不退回文本，不会让 agent 循环停止。
+      // Claude Code 场景里 UNC 路径极少出现，暂不为它引入更激进的启发式。
+      name: 'UNC 路径（合法转义仍生效，属已知局限）',
+      json: String.raw`{"p":"\\server\share\report.txt"}`,
+      expect: { p: '\\server\\share\report.txt' },
+    },
+    {
+      name: '非路径字符串里的合法转义仍然生效',
+      json: String.raw`{"cmd":"echo \"hi\"\nls\tx","re":"a\\b"}`,
+      expect: { cmd: 'echo "hi"\nls\tx', re: 'a\\b' },
+    },
+    {
+      name: '正则/glob 里的非法转义被补救',
+      json: String.raw`{"pattern":"\d+\s*\w","glob":"**/*.ts"}`,
+      expect: { pattern: '\\d+\\s*\\w', glob: '**/*.ts' },
+    },
+    {
+      name: '含转义引号的路径',
+      json: String.raw`{"path":"C:\a b\c.ts","q":"say \"hi\""}`,
+      expect: { path: 'C:\\a b\\c.ts', q: 'say "hi"' },
+    },
+    {
+      name: '已正确转义的路径不被二次转义',
+      json: String.raw`{"path":"C:\\Users\\a.ts"}`,
+      expect: { path: 'C:\\Users\\a.ts' },
+    },
+    {
+      // 已知局限：这一串本身就是合法 JSON（`\t` 是制表符转义），严格解析即成功，
+      // 修补逻辑根本不会被触发，因此 `d:\tmp` 得到的是 `d:` + TAB + `mp`。
+      // 只有当整串解析失败时我们才有机会介入——单个歧义 token 无从消歧。
+      // 实践中这类路径极少（`\tmp` 需正好跟在盘符后），且不会中断 agent 循环。
+      name: 'unicode 转义保留（\\t 歧义属已知局限）',
+      json: String.raw`{"s":"\u4e2d\u6587","p":"d:\tmp"}`,
+      expect: { s: '中文', p: 'd:\tmp' },
+    },
+    {
+      name: '非字符串值不受影响',
+      json: String.raw`{"n":42,"b":true,"nul":null,"arr":[1,2],"p":"c:\x"}`,
+      expect: { n: 42, b: true, nul: null, p: 'c:\\x' },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const restore = stubUpstreamContent([{
+      type: 'text',
+      text: `Previous assistant tool request: name=Read id=call_edge input_json=${testCase.json}`,
+    }]);
+
+    try {
+      const response = await newAdapter().sendRequest({
+        model: 'claude-opus-4.6',
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 128,
+        tools: [READ_TOOL],
+      } as unknown as AnthropicRequest);
+
+      if (response.content[0].type !== 'tool_use') {
+        throw new Error(`边界用例「${testCase.name}」未还原成 tool_use`);
+      }
+
+      const input = response.content[0].input;
+      for (const [key, want] of Object.entries(testCase.expect)) {
+        const got = input[key];
+        if (got !== want) {
+          throw new Error(
+            `边界用例「${testCase.name}」字段 ${key}：期望 ${JSON.stringify(want)}，实际 ${
+              JSON.stringify(got)
+            }`,
+          );
+        }
+      }
+      // 数组要单独比，=== 比不了。
+      if ('arr' in testCase.expect === false && Array.isArray(input.arr)) {
+        assertEquals(JSON.stringify(input.arr), '[1,2]');
+      }
+    } finally {
+      restore();
+    }
+  }
+});
+
 Deno.test('DeepSeek adapter 保留正常文本，不误判普通句子为工具调用', async () => {
   const restore = stubUpstreamContent([{
     type: 'text',

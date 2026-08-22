@@ -506,7 +506,10 @@ export class AnthropicApiAdapter {
     }
 
     try {
-      const input = JSON.parse(inputText) as unknown;
+      const input = parseLooseToolInputJson(inputText);
+      if (!input) {
+        return undefined;
+      }
       return {
         type: 'tool_use',
         id,
@@ -591,6 +594,177 @@ export class AnthropicApiAdapter {
       requestHash: logContext.requestHash,
     };
   }
+}
+
+/**
+ * 解析模型模仿产出的 input_json。
+ *
+ * 先按严格 JSON 解析；失败时做一次保守修补后重试。
+ *
+ * 为什么需要修补：转录由 `JSON.stringify` 生成，Windows 路径在里面是
+ * `C:\\Users`（双反斜杠）。模型模仿时几乎必然按人类写法还原成 `C:\Users`，
+ * 产出的不是合法 JSON —— `JSON.parse` 抛 "Bad escaped character"，兜底失效，
+ * 响应退化成 end_turn，Claude Code 随即停止 agent 循环。
+ *
+ * 修补后仍解析不了（如括号不闭合）就返回 undefined，老实退回文本 ——
+ * 宁可少还原一次，也不能伪造出参数错误的工具调用。
+ */
+function parseLooseToolInputJson(inputText: string): unknown {
+  try {
+    return JSON.parse(inputText);
+  } catch {
+    // 继续尝试修补
+  }
+
+  try {
+    return JSON.parse(repairJsonBackslashes(inputText));
+  } catch {
+    return undefined;
+  }
+}
+
+/** JSON 规范允许的转义字符。其余跟在反斜杠后的字符都属于非法转义。 */
+const LEGAL_JSON_ESCAPES = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't']);
+
+/**
+ * 把 JSON 文本里未转义的反斜杠补成 `\\`，逐个字符串字面量处理。
+ *
+ * 难点是 `\b` `\f` `\n` `\r` `\t` 既是合法转义，也是 Windows 路径的常见开头
+ * （`\bin`、`\node_modules`、`\report`、`\temp`）。单看转义序列无法消歧，
+ * 因此先取出整个字面量判断它像不像路径（盘符前缀）：
+ * - 像路径 → 按反斜杠连续段的奇偶判断：奇数段是模型漏转义的分隔符，补成双份；
+ *   偶数段说明这一段本来就转义正确，原样保留。
+ * - 不像路径 → 合法转义照常生效，只补救非法转义。
+ *
+ * 已知局限见 deno/src/adapters/anthropic-adapter.ts 与对应测试用例：
+ * UNC 路径无盘符前缀识别不出；整串本身合法时（如 `"d:\tmp"`）修补不会触发。
+ */
+function repairJsonBackslashes(text: string): string {
+  let out = '';
+  let index = 0;
+
+  while (index < text.length) {
+    const char = text[index];
+    if (char !== '"') {
+      out += char;
+      index += 1;
+      continue;
+    }
+
+    const literal = readStringLiteral(text, index);
+    if (!literal) {
+      // 引号未闭合，交给 JSON.parse 去报错。
+      out += text.slice(index);
+      break;
+    }
+
+    out += `"${rewriteLiteralBody(literal.body)}"`;
+    index = literal.end;
+  }
+
+  return out;
+}
+
+/** 从 start 处的引号开始读一个字符串字面量，返回原始内容与结束位置（引号后一位）。 */
+function readStringLiteral(
+  text: string,
+  start: number,
+): { body: string; end: number } | undefined {
+  let index = start + 1;
+  let body = '';
+
+  while (index < text.length) {
+    const char = text[index];
+    if (char === '\\') {
+      // 无论转义是否合法，都连同下一个字符整体带走，避免把 \" 误判成结束引号。
+      body += char + (text[index + 1] ?? '');
+      index += 2;
+      continue;
+    }
+    if (char === '"') {
+      return { body, end: index + 1 };
+    }
+    body += char;
+    index += 1;
+  }
+
+  return undefined;
+}
+
+function rewriteLiteralBody(body: string): string {
+  return looksLikeWindowsPath(body) ? rewritePathLiteral(body) : rewritePlainLiteral(body);
+}
+
+/** 路径字面量：反斜杠一律是分隔符，按连续段奇偶决定是否补转义。 */
+function rewritePathLiteral(body: string): string {
+  let out = '';
+  let index = 0;
+
+  while (index < body.length) {
+    if (body[index] !== '\\') {
+      out += body[index];
+      index += 1;
+      continue;
+    }
+
+    let run = 0;
+    while (body[index + run] === '\\') {
+      run += 1;
+    }
+
+    // 段尾紧跟引号时，最后一个反斜杠属于 \" 转义，不算分隔符。
+    const followedByQuote = body[index + run] === '"';
+    const separators = followedByQuote ? run - 1 : run;
+
+    // 偶数段 = 已经转义正确，原样保留；奇数段 = 漏转义，补成双份。
+    out += separators % 2 === 0 ? '\\'.repeat(separators) : '\\'.repeat(separators * 2);
+
+    if (followedByQuote) {
+      out += '\\"';
+      index += run + 1;
+    } else {
+      index += run;
+    }
+  }
+
+  return out;
+}
+
+/** 非路径字面量：合法转义原样生效，只补救非法转义。 */
+function rewritePlainLiteral(body: string): string {
+  let out = '';
+  let index = 0;
+
+  while (index < body.length) {
+    if (body[index] !== '\\') {
+      out += body[index];
+      index += 1;
+      continue;
+    }
+
+    const next = body[index + 1];
+    if (next === undefined) {
+      out += '\\\\';
+      index += 1;
+      continue;
+    }
+
+    if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(body.slice(index + 2, index + 6))) {
+      out += body.slice(index, index + 6);
+      index += 6;
+      continue;
+    }
+
+    out += LEGAL_JSON_ESCAPES.has(next) ? `\\${next}` : `\\\\${next}`;
+    index += 2;
+  }
+
+  return out;
+}
+
+/** 盘符前缀 —— 判定该字面量整体是 Windows 路径。 */
+function looksLikeWindowsPath(body: string): boolean {
+  return /^[A-Za-z]:\\/.test(body);
 }
 
 /**

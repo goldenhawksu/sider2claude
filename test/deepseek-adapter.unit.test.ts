@@ -135,6 +135,65 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     expect(response.content[0].type).toBe('text');
   });
 
+  test('还原含未转义 Windows 路径的转录（生产 log 原文）', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: String.raw`Previous assistant tool request: name=Grep id=call_00_GfLr3D3R input_json={"-n":true,"path":"d:\Github_repo\sider2api\deno_pro.ts","pattern":"stats.json"}`,
+    }]);
+
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'find' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      name: 'Grep',
+      input: { '-n': true, path: 'd:\\Github_repo\\sider2api\\deno_pro.ts' },
+    });
+  });
+
+  test('修补反斜杠时不破坏非路径字符串里的合法转义', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: String.raw`Previous assistant tool request: name=Bash id=call_esc input_json={"command":"echo \"hi\"\nls","path":"C:\ref\bin\x.ts"}`,
+    }]);
+
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'run' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      input: { command: 'echo "hi"\nls', path: 'C:\\ref\\bin\\x.ts' },
+    });
+  });
+
+  test('真正无法解析的 input_json 保持文本，不伪造工具调用', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: 'Previous assistant tool request: name=Read id=call_broken input_json={"file_path":"a.ts",',
+    }]);
+
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    expect(response.stop_reason).toBe('end_turn');
+    expect(response.content).toHaveLength(1);
+    expect(response.content[0].type).toBe('text');
+  });
+
   test('普通句子不被误判为工具调用', async () => {
     stubUpstreamContent([{
       type: 'text',
