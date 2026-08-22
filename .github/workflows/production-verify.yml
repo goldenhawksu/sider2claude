@@ -53,7 +53,11 @@ jobs:
           INPUT_URL: ${{ github.event.inputs.target_url }}
           SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          URL="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          RAW="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          # 去掉末尾斜杠：拼接 $URL/health 时若原值以 / 结尾会变成 //health，
+          # 上游按不同路径处理并返回 404，而值来自 secret 时日志显示为 ***，极难排查。
+          URL="${RAW%"${RAW##*[!/]}"}"
+          [[ "$URL" != "$RAW" ]] && echo "⚠️ 已移除目标地址末尾的斜杠"
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "目标地址: $URL"
 
@@ -63,13 +67,9 @@ jobs:
           echo "🔍 检查目标服务: $URL"
           # 本 workflow 由 CI 完成触发，而同一次 push 也会让 Deno Deploy 重新部署，
           # 两者是并行的——健康检查可能撞上部署窗口（旧实例已停、新实例未就绪），
-          # 加上 Deno Deploy 实例有冷启动（实测首次请求约 4.4s），一击不中就判死会误报。
-          # 因此重试等待，总窗口 3 分钟。
-          #
-          # 强制 IPv4：该域名同时有 A(69.67.170.170) 与 AAAA(2602:f70f::1) 记录，
-          # 而 Azure/GitHub runner 是 IPv6 优先的。IPv6 侧若不可达会拖慢甚至拖垮
-          # 每次尝试，而本服务的 IPv4 侧已验证稳定可达；健康检查不需要验证 IPv6，
-          # 固定走 v4 可消除这一变量。
+          # 加上实例有冷启动（实测首次请求约 4.4s），一击不中就判死会误报。
+          # 因此重试等待，总窗口 3 分钟。固定走 IPv4：实测 runner 侧 IPv6 不通，
+          # 跳过它可省去每次无谓的连接尝试。
           MAX=12
           for i in $(seq 1 $MAX); do
             STATUS=$(curl -s -4 -o /dev/null -w "%{http_code}" --max-time 30 "$URL/health" || echo "000")
@@ -80,13 +80,7 @@ jobs:
             echo "   第 $i/$MAX 次：HTTP $STATUS，15 秒后重试…"
             sleep 15
           done
-
-          # 走到这里说明 3 分钟内始终未就绪。把诊断信息抬到 Annotations，
-          # 便于区分"服务真的挂了"与"runner 到 Deploy 的网络问题"。
-          V4=$(curl -s -4 -o /dev/null -w "%{http_code}" --max-time 20 "$URL/health" || echo "fail")
-          V6=$(curl -s -6 -o /dev/null -w "%{http_code}" --max-time 20 "$URL/health" || echo "fail")
-          RESOLVED=$(getent hosts "${URL#https://}" | tr '\n' ' ' || echo "解析失败")
-          echo "::error::健康检查失败：$MAX 次尝试均未返回 200（最后状态 $STATUS）。诊断 IPv4=$V4 IPv6=$V6 解析=$RESOLVED"
+          echo "::error::健康检查失败：$MAX 次尝试均未返回 200，最后状态 $STATUS。若为 404，多半是目标地址带了末尾斜杠或路径（拼接后变成 //health）。"
           exit 1
 
       - name: 模型列表验证
@@ -158,7 +152,11 @@ jobs:
           INPUT_URL: ${{ github.event.inputs.target_url }}
           SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          URL="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          RAW="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          # 去掉末尾斜杠：拼接 $URL/health 时若原值以 / 结尾会变成 //health，
+          # 上游按不同路径处理并返回 404，而值来自 secret 时日志显示为 ***，极难排查。
+          URL="${RAW%"${RAW##*[!/]}"}"
+          [[ "$URL" != "$RAW" ]] && echo "⚠️ 已移除目标地址末尾的斜杠"
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "目标地址: $URL"
 
