@@ -241,6 +241,8 @@ messagesRouter.post('/', async (c: Context) => {
         .map((block) => block.name),
       stream: false,
       ms: elapsedMs,
+      inputTokens: response.usage?.input_tokens ?? 0,
+      outputTokens: response.usage?.output_tokens ?? 0,
     });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {
@@ -864,6 +866,9 @@ function createTrueSiderStreamingResponse(
           toolUses: [], // Sider 不承接工具请求（路由保证），流内不会出现 tool_use
           stream: true,
           ms: elapsedMs,
+          // Sider 真流式不回传 token 用量，计 0；总量以非流式请求为准
+          inputTokens: 0,
+          outputTokens: 0,
         });
         if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
           logWarn('slow_stream_request', {
@@ -1021,6 +1026,8 @@ function createDeepSeekSynthesizedStreamingResponse(
             .map((block) => block.name),
           stream: true,
           ms: elapsedMs,
+          inputTokens: response.usage?.input_tokens ?? 0,
+          outputTokens: response.usage?.output_tokens ?? 0,
         });
         if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
           logWarn('slow_stream_request', {

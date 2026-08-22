@@ -18,6 +18,9 @@ const RECENT_LIMIT = 200;
 const RECENT_DISPLAY = 10;
 /** 滑动窗口聚合的跨度。 */
 const WINDOW_MS = 60 * 60_000;
+/** 趋势图的分桶跨度与桶数（24 个小时桶 = 近 24 小时）。 */
+const BUCKET_MS = 60 * 60_000;
+const BUCKET_COUNT = 24;
 
 export interface UsageRecord {
   model: string;
@@ -28,11 +31,36 @@ export interface UsageRecord {
   toolUses: string[];
   stream: boolean;
   ms: number;
+  /** 上游返回的 token 用量；流式路径拿不到时按 0 计。 */
+  inputTokens: number;
+  outputTokens: number;
 }
 
 interface RecentEntry {
   at: number;
   record: UsageRecord;
+}
+
+/** 按模型聚合的一行，供看板表格与环形图使用。 */
+export interface ModelStat {
+  model: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  sider: number;
+  deepseek: number;
+}
+
+/** 趋势图的一个时间桶。 */
+export interface TrendBucket {
+  /** 桶起始时刻（ISO）。 */
+  at: string;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  sider: number;
+  deepseek: number;
 }
 
 export interface UsageSnapshot {
@@ -46,6 +74,8 @@ export interface UsageSnapshot {
     toolCalls: number;
     /** 命中重复响应缓存、未触达上游的请求数（不计入上面的 requests）。 */
     cachedReplays: number;
+    inputTokens: number;
+    outputTokens: number;
   };
   /** 后端占比（分母为非零请求；无请求时两个都是 0%）。 */
   backendShare: { sider: string; deepseek: string };
@@ -56,6 +86,10 @@ export interface UsageSnapshot {
     deepseek: number;
     fallbacks: number;
   };
+  /** 按模型聚合，按请求数降序。 */
+  models: ModelStat[];
+  /** 近 24 小时按小时分桶，旧→新；无数据的桶也保留，保证时间轴连续。 */
+  trend: TrendBucket[];
   /** 工具调用频次 Top 8，按次数降序。 */
   tools: Array<{ name: string; count: number }>;
   /** 最近请求（新在前）。不含任何消息内容或 token。 */
@@ -67,6 +101,7 @@ export interface UsageSnapshot {
     tools: string[];
     stream: boolean;
     ms: number;
+    tokens: number;
   }>;
   note: string;
 }
@@ -80,9 +115,17 @@ let totals = {
   streaming: 0,
   toolCalls: 0,
   cachedReplays: 0,
+  inputTokens: 0,
+  outputTokens: 0,
 };
 const toolCounts = new Map<string, number>();
 const recent: RecentEntry[] = [];
+
+/**
+ * 按模型的累计。与 recent 分开维护：recent 有条数上限会滚掉旧记录，
+ * 而模型累计要覆盖进程全生命周期。
+ */
+const modelStats = new Map<string, ModelStat>();
 
 export function recordUsage(record: UsageRecord): void {
   totals.requests += 1;
@@ -90,9 +133,30 @@ export function recordUsage(record: UsageRecord): void {
   if (record.fallback) totals.fallbacks += 1;
   if (record.stream) totals.streaming += 1;
   totals.toolCalls += record.toolUses.length;
+  totals.inputTokens += record.inputTokens;
+  totals.outputTokens += record.outputTokens;
   for (const name of record.toolUses) {
     toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
   }
+
+  let stat = modelStats.get(record.model);
+  if (!stat) {
+    stat = {
+      model: record.model,
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      sider: 0,
+      deepseek: 0,
+    };
+    modelStats.set(record.model, stat);
+  }
+  stat.requests += 1;
+  stat.inputTokens += record.inputTokens;
+  stat.outputTokens += record.outputTokens;
+  stat.totalTokens += record.inputTokens + record.outputTokens;
+  stat[record.backend] += 1;
 
   recent.unshift({ at: Date.now(), record });
   if (recent.length > RECENT_LIMIT) {
@@ -107,6 +171,40 @@ export function recordUsage(record: UsageRecord): void {
  */
 export function recordCachedReplay(): void {
   totals.cachedReplays += 1;
+}
+
+/**
+ * 近 24 小时按小时分桶。数据源是 recent（有 200 条上限），
+ * 因此高流量下早期桶会偏低——趋势形状仍然可读，绝对值以 totals 为准。
+ */
+function buildTrend(now: number): TrendBucket[] {
+  const currentBucket = Math.floor(now / BUCKET_MS) * BUCKET_MS;
+  const buckets = new Map<number, TrendBucket>();
+
+  // 先铺满空桶，保证时间轴连续（缺口不会被折线连成斜线）
+  for (let i = BUCKET_COUNT - 1; i >= 0; i -= 1) {
+    const at = currentBucket - i * BUCKET_MS;
+    buckets.set(at, {
+      at: new Date(at).toISOString(),
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      sider: 0,
+      deepseek: 0,
+    });
+  }
+
+  for (const { at, record } of recent) {
+    const key = Math.floor(at / BUCKET_MS) * BUCKET_MS;
+    const bucket = buckets.get(key);
+    if (!bucket) continue; // 落在 24 小时窗口外
+    bucket.requests += 1;
+    bucket.inputTokens += record.inputTokens;
+    bucket.outputTokens += record.outputTokens;
+    bucket[record.backend] += 1;
+  }
+
+  return [...buckets.values()];
 }
 
 export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
@@ -126,11 +224,15 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
     .slice(0, 8)
     .map(([name, count]) => ({ name, count }));
 
+  const models = [...modelStats.values()].sort((a, b) => b.requests - a.requests);
+
   return {
     since: new Date(startedAt).toISOString(),
     totals: { ...totals },
     backendShare: { sider: pct(totals.sider), deepseek: pct(totals.deepseek) },
     lastHour,
+    models,
+    trend: buildTrend(now),
     tools,
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
@@ -140,6 +242,7 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
       tools: record.toolUses,
       stream: record.stream,
       ms: record.ms,
+      tokens: record.inputTokens + record.outputTokens,
     })),
     note: '进程内统计，实例重启后清零；Deno Deploy 各隔离实例独立，仅代表当前实例',
   };
@@ -155,7 +258,10 @@ export function resetUsageStats(): void {
     streaming: 0,
     toolCalls: 0,
     cachedReplays: 0,
+    inputTokens: 0,
+    outputTokens: 0,
   };
   toolCounts.clear();
+  modelStats.clear();
   recent.length = 0;
 }

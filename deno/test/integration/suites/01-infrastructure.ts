@@ -83,6 +83,35 @@ export const suite: Suite = {
       },
     },
     {
+      name: 'GET /stats 返回看板页面',
+      async run({ api }) {
+        const res = await api.get('/stats', {});
+        assertStatus(res, 200);
+        const html = res.text;
+        assertTrue(html.startsWith('<!DOCTYPE html>'), '是 HTML 文档');
+        for (const marker of ['模型分布', 'Token 使用趋势', '后端占比', '工具调用频次', '最近请求']) {
+          assertTrue(html.includes(marker), `页面含「${marker}」区块`);
+        }
+        // 模型名来自请求，页面必须转义；同时验证 CSS 变量两种模式都在
+        assertTrue(html.includes('prefers-color-scheme: dark'), '深色模式样式存在');
+        return 'HTML 看板，五大区块与深色模式齐全';
+      },
+    },
+    {
+      name: 'GET /stats.json 返回含趋势与模型的快照',
+      async run({ api }) {
+        const res = await api.get('/stats.json', {});
+        assertStatus(res, 200);
+        const u = res.json;
+        assertTrue(Array.isArray(u.trend) && u.trend.length === 24, 'trend 是 24 个小时桶');
+        assertTrue(Array.isArray(u.models), 'models 是数组');
+        assertTrue(typeof u.totals?.inputTokens === 'number', 'inputTokens 是数字');
+        return `models=${u.models.length} trend=${u.trend.length} tokens=${
+          u.totals.inputTokens + u.totals.outputTokens
+        }`;
+      },
+    },
+    {
       name: 'GET /v1/messages/backends/status',
       async run({ api }) {
         const res = await api.get('/v1/messages/backends/status');

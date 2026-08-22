@@ -18,6 +18,7 @@ import protocolRouter from './routes/protocols';
 import { router } from './routes';
 import { getEnv } from './utils/env';
 import { getUsageSnapshot } from './utils/usage-stats';
+import { renderStatsPage } from './utils/stats-page';
 
 const app = new Hono();
 const PORT = getEnv('PORT', '4141');
@@ -51,6 +52,7 @@ app.get('/', (c) => {
     tech_stack: 'hono + bun',
     endpoints: {
       health: '/health',
+      stats: '/stats',
       models: '/v1/models',
       messages: '/v1/messages',
       openai_chat_completions: '/v1/chat/completions',
@@ -68,6 +70,15 @@ app.get('/', (c) => {
     },
     usage: getUsageSnapshot(),
   });
+});
+
+// 用量看板：/stats 返回 HTML 页面，/stats.json 返回同一份快照的原始数据
+app.get('/stats', (c) => {
+  return c.html(renderStatsPage(getUsageSnapshot()));
+});
+
+app.get('/stats.json', (c) => {
+  return c.json(getUsageSnapshot());
 });
 
 // 注册 API 路由

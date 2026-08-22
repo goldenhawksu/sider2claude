@@ -15,6 +15,7 @@ import completeRouter from './src/routes/complete.ts';
 import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
 import { getUsageSnapshot } from './src/utils/usage-stats.ts';
+import { renderStatsPage } from './src/utils/stats-page.ts';
 
 const app = new Hono();
 
@@ -55,6 +56,7 @@ app.get('/', (c) => {
     runtime: 'Deno Deploy',
     endpoints: {
       health: '/health',
+      stats: '/stats',
       models: '/v1/models',
       messages: '/v1/messages',
       openai_chat_completions: '/v1/chat/completions',
@@ -74,6 +76,15 @@ app.get('/', (c) => {
     },
     usage: getUsageSnapshot(),
   });
+});
+
+// 用量看板：/stats 返回 HTML 页面，/stats.json 返回同一份快照的原始数据
+app.get('/stats', (c) => {
+  return c.html(renderStatsPage(getUsageSnapshot()));
+});
+
+app.get('/stats.json', (c) => {
+  return c.json(getUsageSnapshot());
 });
 
 // 注册 API 路由

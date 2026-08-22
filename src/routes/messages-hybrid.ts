@@ -197,6 +197,8 @@ messagesRouter.post('/', async (c: Context) => {
       // 用请求自身的 stream 标志，流式请求不会被误记为非流式。
       stream: !!anthropicRequest.stream,
       ms: elapsedMs,
+      inputTokens: response.usage?.input_tokens ?? 0,
+      outputTokens: response.usage?.output_tokens ?? 0,
     });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {

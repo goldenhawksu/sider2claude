@@ -177,7 +177,16 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 - `tools`：工具调用频次 Top 8；`recent`：最近 10 条明细（时间/模型/后端/
   是否 fallback/工具/是否流式/耗时）。
 
-实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致）。
+- `trend`：近 24 小时按小时分桶（空桶保留，时间轴连续）；`models`：按模型聚合的
+  请求数与 token 数。
+- `GET /stats` 渲染自包含的 HTML 看板（内联 SVG+CSS，无外部依赖）：环形图
+  （模型分布）+ 面积图（token 趋势）+ 表格 + 后端堆叠条，浅色/深色随系统。
+  `GET /stats.json` 返回同一份快照的原始 JSON。
+- 配色取 dataviz 参考调色板前三个分类槽位（浅深两套已过 validate_palette），
+  模型超过 8 个折叠为「其他」，绝不循环取色；模型名/工具名经 HTML 转义。
+
+实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致，
+`stats-page.ts` 同）。
 埋点在请求完成处：Deno 侧非流式与两条流式路径各埋一次；Node 侧流式是 buffered
 模式（先走完非流式再转 SSE），因此只在非流式完成点埋一次、用请求自身的 stream
 标志区分，避免双计。
