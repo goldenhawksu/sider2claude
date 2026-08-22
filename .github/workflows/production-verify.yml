@@ -59,19 +59,29 @@ jobs:
 
       - name: 健康检查
         run: |
-          echo "🔍 检查目标服务: ${{ steps.target.outputs.url }}"
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.target.outputs.url }}/health" || echo "000")
-          echo "HTTP 状态码: $STATUS"
-          if [[ "$STATUS" != "200" ]]; then
-            echo "❌ 服务不可达"
-            exit 1
-          fi
-          echo "✅ 服务可达"
+          URL="${{ steps.target.outputs.url }}"
+          echo "🔍 检查目标服务: $URL"
+          # 本 workflow 由 CI 完成触发，而同一次 push 也会让 Deno Deploy 重新部署，
+          # 两者是并行的——健康检查很可能撞上部署窗口（旧实例已停、新实例未就绪），
+          # 加上 Deno Deploy 实例有冷启动（实测首次请求约 4s），一击不中就判死会误报。
+          # 因此重试等待，总窗口 3 分钟。
+          MAX=12
+          for i in $(seq 1 $MAX); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL/health" || echo "000")
+            if [[ "$STATUS" == "200" ]]; then
+              echo "✅ 服务可达（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "   第 $i/$MAX 次：HTTP $STATUS，15 秒后重试…"
+            sleep 15
+          done
+          echo "❌ 等待 $((MAX * 15)) 秒后服务仍不可达（最后状态：$STATUS）"
+          exit 1
 
       - name: 模型列表验证
         run: |
           echo "📋 检查模型列表..."
-          RESPONSE=$(curl -s -w "\n%{http_code}" "${{ steps.target.outputs.url }}/v1/models")
+          RESPONSE=$(curl -s --max-time 30 -w "\n%{http_code}" "${{ steps.target.outputs.url }}/v1/models")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
@@ -91,7 +101,7 @@ jobs:
       - name: 认证测试
         run: |
           echo "🔒 检查认证保护..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          STATUS=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
             -X POST "${{ steps.target.outputs.url }}/v1/messages" \
             -H "Content-Type: application/json" \
             -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":10}')
@@ -104,7 +114,7 @@ jobs:
       - name: CORS 检查
         run: |
           echo "🌐 检查 CORS 配置..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          STATUS=$(curl -s --max-time 30 -o /dev/null -w "%{http_code}" \
             -X OPTIONS "${{ steps.target.outputs.url }}/health" \
             -H "Origin: http://localhost:3000" \
             -H "Access-Control-Request-Method: POST")
