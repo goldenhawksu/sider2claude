@@ -4,6 +4,19 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# deno.lock 刻意不入库（不是疏漏，加回来前请先看这段理由）：
+# 1. deno.json 的 imports 全是精确版本，且 hono/consola/gpt-tokenizer/
+#    tiny-invariant 四个包均无传递依赖——Deno 侧没有版本漂移的空间，
+#    lock 提供不了额外保障。
+# 2. deno.lock 里 15 个 specifiers 有 10 个带范围符且全部来自 package.json
+#    （eslint/tsup/typescript 等构建期依赖），这些已由 package-lock.json
+#    与 bun.lock 锁定；再提交一份等于三处锁同一批依赖，反而容易不同步。
+# 3. Deno Deploy 的 Builds 文档未说明会读取或校验它，当前部署也未依赖它。
+# 注意：真正咬过我们的是 CI 里 deno-version 浮动（v2.x 跟到 2.9.5 后
+# setTimeout 类型定义变化导致 deno check 失败），那是运行时版本问题，
+# deno.lock 锁不住。
+deno.lock
+
 # Build outputs
 dist/
 build/
@@ -16,6 +29,10 @@ project_document/
 .env.development.local
 .env.test.local
 .env.production.local
+
+# 本地 Claude Code 客户端配置示例：含 %USERPROFILE% 等本机路径与个人权限偏好，
+# 属个人环境配置，无文档引用（其中的 token 是占位符，非真实凭据）。
+settings.demo.json
 
 # Logs
 logs
