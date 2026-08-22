@@ -17,9 +17,37 @@
 // 运行时需要 --unstable-kv 标志（deno.json 的任务里已加；
 // Deno Deploy 平台默认开放 unstable API）。
 
-import type { UsageRecord } from './usage-stats.ts';
+import type { DeepSeekReason, UsageRecord } from './usage-stats.ts';
 
 const BUCKET_MS = 60 * 60_000;
+
+/** DeepSeek 归因 -> KV 字段名；与 usage-stats.ts 的计数字段同名。 */
+const REASON_FIELD: Record<DeepSeekReason, string> = {
+  tools: 'deepseekTools',
+  fallback: 'deepseekFallback',
+  routing: 'deepseekRouting',
+};
+
+/** 模型行里允许累加的字段，防止未知 key 混进聚合。 */
+const MODEL_FIELDS = new Set([
+  'requests',
+  'sider',
+  'deepseek',
+  'inputTokens',
+  'outputTokens',
+  'deepseekTools',
+  'deepseekFallback',
+  'deepseekRouting',
+]);
+
+/** 趋势桶里允许累加的字段。 */
+const TREND_FIELDS = new Set([
+  'requests',
+  'sider',
+  'deepseek',
+  'inputTokens',
+  'outputTokens',
+]);
 
 type Mutate = Parameters<Deno.AtomicOperation['mutate']>[0];
 
@@ -36,9 +64,7 @@ function getKv(): Promise<Deno.Kv | null> {
       try {
         const mode = (Deno.env.get('STATS_KV') ?? '').toLowerCase();
         if (!mode) return null; // 未显式启用：完全跳过，行为同纯进程内
-        const kv = mode === 'kv'
-          ? await Deno.openKv()
-          : await Deno.openKv(':memory:');
+        const kv = mode === 'kv' ? await Deno.openKv() : await Deno.openKv(':memory:');
         // 首次写入时记下统计起点（check 不存在才写，重启后才会产生新值）
         await kv.atomic()
           .check({ key: ['stats', 'since'], versionstamp: null })
@@ -92,11 +118,19 @@ export function persistUsage(record: UsageRecord): void {
     sum(['stats', 'toolCalls'], record.toolUses.length);
     for (const name of record.toolUses) sum(['stats', 'tool', name], 1);
 
+    // DeepSeek 承接来源；字段名与 UsageSnapshot.totals / ModelStat 一致，
+    // collect() 因此不需要额外映射。
+    const reasonField = record.deepseekReason && REASON_FIELD[record.deepseekReason];
+
     const m = ['stats', 'model', record.model];
     sum([...m, 'requests'], 1);
     sum([...m, record.backend], 1);
     sum([...m, 'inputTokens'], record.inputTokens);
     sum([...m, 'outputTokens'], record.outputTokens);
+    if (reasonField) {
+      sum(['stats', reasonField], 1);
+      sum([...m, reasonField], 1);
+    }
 
     const t = ['stats', 'trend', bucket];
     sum([...t, 'requests'], 1);
@@ -137,6 +171,9 @@ export interface PersistentStats {
     cachedReplays: number;
     inputTokens: number;
     outputTokens: number;
+    deepseekTools: number;
+    deepseekFallback: number;
+    deepseekRouting: number;
   };
   models: Array<{
     model: string;
@@ -145,6 +182,9 @@ export interface PersistentStats {
     outputTokens: number;
     sider: number;
     deepseek: number;
+    deepseekTools: number;
+    deepseekFallback: number;
+    deepseekRouting: number;
   }>;
   tools: Array<{ name: string; count: number }>;
   trend: Array<{
@@ -185,6 +225,9 @@ async function collect(kv: Deno.Kv): Promise<PersistentStats | null> {
     cachedReplays: 0,
     inputTokens: 0,
     outputTokens: 0,
+    deepseekTools: 0,
+    deepseekFallback: 0,
+    deepseekRouting: 0,
   };
 
   const models: PersistentStats['models'] = [];
@@ -201,11 +244,20 @@ async function collect(kv: Deno.Kv): Promise<PersistentStats | null> {
       const field = key[3] as string;
       let row = models.find((m) => m.model === model);
       if (!row) {
-        row = { model, requests: 0, inputTokens: 0, outputTokens: 0, sider: 0, deepseek: 0 };
+        row = {
+          model,
+          requests: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          sider: 0,
+          deepseek: 0,
+          deepseekTools: 0,
+          deepseekFallback: 0,
+          deepseekRouting: 0,
+        };
         models.push(row);
       }
-      if (field === 'requests' || field === 'sider' || field === 'deepseek' ||
-        field === 'inputTokens' || field === 'outputTokens') {
+      if (MODEL_FIELDS.has(field)) {
         (row as unknown as Record<string, number>)[field] += value;
       }
       continue;
@@ -219,8 +271,7 @@ async function collect(kv: Deno.Kv): Promise<PersistentStats | null> {
         row = { bucket, requests: 0, inputTokens: 0, outputTokens: 0, sider: 0, deepseek: 0 };
         trend.push(row);
       }
-      if (field === 'requests' || field === 'sider' || field === 'deepseek' ||
-        field === 'inputTokens' || field === 'outputTokens') {
+      if (TREND_FIELDS.has(field)) {
         (row as unknown as Record<string, number>)[field] += value;
       }
       continue;

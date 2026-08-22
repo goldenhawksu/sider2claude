@@ -40,6 +40,9 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
       cachedReplays: 0,
       inputTokens: 100,
       outputTokens: 200,
+      deepseekTools: 1,
+      deepseekFallback: 0,
+      deepseekRouting: 0,
     },
     backendShare: { sider: '67%', deepseek: '33%' },
     lastHour: { requests: 1, sider: 1, deepseek: 0, fallbacks: 0 },
@@ -49,6 +52,7 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
       model: 'claude-opus-4.6',
       backend: 'deepseek',
       fallback: false,
+      reason: 'tools',
       tools: ['Read'],
       stream: false,
       ms: 120,
@@ -68,6 +72,11 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
       inputTokens: 100,
       outputTokens: 200,
       totalTokens: 300,
+      sider: 2,
+      deepseek: 1,
+      deepseekTools: 1,
+      deepseekFallback: 0,
+      deepseekRouting: 0,
     }],
     ...overrides,
   } as UsageSnapshot;
@@ -99,6 +108,7 @@ Deno.test('stats 页面：跨零点时正确进位到次日', () => {
       model: 'claude-opus-4.6',
       backend: 'sider',
       fallback: false,
+      reason: null,
       tools: [],
       stream: false,
       ms: 50,
@@ -219,4 +229,114 @@ Deno.test('stats 页面：刷新在页面不可见时暂停，可见时立即补
 Deno.test('stats 页面：并发保护，上一次未回来不重复发起', () => {
   const html = renderStatsPage(snapshot());
   assertIncludes(html, 'inFlight', '并发保护');
+});
+
+/**
+ * DeepSeek 归因展示。
+ *
+ * 看板要回答的问题：DeepSeek 被用了这么多次，多少是"请求带工具、本就该它做"，
+ * 多少是"Sider 受限被迫兜底"。后者才需要用户去查配额，因此必须能一眼分开。
+ */
+Deno.test('stats 页面：模型表按归因拆分 DeepSeek 承接次数', () => {
+  const html = renderStatsPage(snapshot({
+    models: [{
+      model: 'claude-opus-4.6',
+      requests: 10,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      sider: 3,
+      deepseek: 7,
+      deepseekTools: 4,
+      deepseekFallback: 2,
+      deepseekRouting: 1,
+    }],
+  }) as UsageSnapshot);
+
+  assertIncludes(html, '4 工具', '工具归因');
+  assertIncludes(html, '2 受限兜底', '受限兜底归因');
+  assertIncludes(html, '1 策略', '策略归因');
+  // 三个分项必须能加回 deepseek 总数，否则用户会怀疑数据丢了
+  assertIncludes(html, 'DeepSeek 共 7 次', '归因合计提示');
+});
+
+Deno.test('stats 页面：模型全部走 Sider 时归因列显示占位而非 0', () => {
+  const html = renderStatsPage(snapshot({
+    models: [{
+      model: 'claude-haiku-4.5',
+      requests: 5,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      sider: 5,
+      deepseek: 0,
+      deepseekTools: 0,
+      deepseekFallback: 0,
+      deepseekRouting: 0,
+    }],
+  }) as UsageSnapshot);
+
+  assertEquals(html.includes('0 工具'), false, '零值不应渲染成 0');
+  assertIncludes(html, '<span class="muted">—</span>', '占位符');
+});
+
+Deno.test('stats 页面：折叠的「其他模型」行也累加归因，不丢数', () => {
+  const many = Array.from({ length: 10 }, (_, i) => ({
+    model: `m${i}`,
+    requests: 10 - i,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    sider: 0,
+    deepseek: 10 - i,
+    deepseekTools: 0,
+    deepseekFallback: 10 - i, // 全部记在受限兜底，便于断言求和
+    deepseekRouting: 0,
+  }));
+  const html = renderStatsPage(snapshot({ models: many }) as UsageSnapshot);
+
+  // 前 8 个直接展示，剩下 m8(2) + m9(1) = 3 折叠进「其他」
+  assertIncludes(html, '其他 2 个模型', '折叠行');
+  assertIncludes(html, '3 受限兜底', '折叠行的归因求和');
+});
+
+Deno.test('stats 页面：后端卡片给出全局 DeepSeek 承接来源', () => {
+  const html = renderStatsPage(snapshot({
+    totals: {
+      requests: 10,
+      sider: 3,
+      deepseek: 7,
+      fallbacks: 2,
+      streaming: 0,
+      toolCalls: 0,
+      cachedReplays: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      deepseekTools: 4,
+      deepseekFallback: 2,
+      deepseekRouting: 1,
+    },
+  }) as UsageSnapshot);
+
+  assertIncludes(html, 'DeepSeek 承接来源', '全局归因区块');
+});
+
+Deno.test('stats 页面：最近明细标出该条走 DeepSeek 的原因', () => {
+  const tools = renderStatsPage(snapshot());
+  assertIncludes(tools, '>工具</span>', '工具标记');
+
+  const fell = renderStatsPage(snapshot({
+    recent: [{
+      time: '2026-08-22T01:05:00.000Z',
+      model: 'claude-opus-4.6',
+      backend: 'deepseek',
+      fallback: true,
+      reason: 'fallback',
+      tools: [],
+      stream: false,
+      ms: 120,
+      tokens: 0,
+    }],
+  }) as UsageSnapshot);
+  assertIncludes(fell, '受限兜底', '兜底标记');
 });

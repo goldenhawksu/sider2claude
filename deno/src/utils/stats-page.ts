@@ -173,6 +173,35 @@ function backendBar(snapshot: UsageSnapshot): string {
 }
 
 /**
+ * DeepSeek 承接来源的三个分项标签。
+ *
+ * 这是看板要回答的核心问题：DeepSeek 被用了这么多次，多少是"本来就该它做"
+ * （请求带工具），多少是"Sider 顶不住了"（受限兜底）。两者的处理方式完全不同：
+ * 前者正常，后者要去查 Sider 配额。
+ */
+const REASON_LABEL = {
+  tools: '工具',
+  fallback: '受限兜底',
+  routing: '策略',
+} as const;
+
+/** 表格单元格：把一行的 DeepSeek 归因压成一行紧凑文本，零值不显示。 */
+function reasonCell(m: ModelStat): string {
+  if (m.deepseek === 0) {
+    return '<span class="muted">—</span>';
+  }
+  const parts: string[] = [];
+  if (m.deepseekTools > 0) parts.push(`${m.deepseekTools} ${REASON_LABEL.tools}`);
+  if (m.deepseekFallback > 0) {
+    parts.push(`<b class="warn-num">${m.deepseekFallback} ${REASON_LABEL.fallback}</b>`);
+  }
+  if (m.deepseekRouting > 0) parts.push(`${m.deepseekRouting} ${REASON_LABEL.routing}`);
+  const title = `${m.model}：DeepSeek 共 ${m.deepseek} 次（工具 ${m.deepseekTools} · ` +
+    `受限兜底 ${m.deepseekFallback} · 策略 ${m.deepseekRouting}）`;
+  return `<span title="${esc(title)}">${parts.join(' · ')}</span>`;
+}
+
+/**
  * 自动刷新：每 5 秒拉一次 `/stats`，只替换内容变化的区域。
  *
  * 为什么不用 `<meta http-equiv="refresh">`：整页重载会闪白、滚动位置归零、
@@ -243,15 +272,19 @@ export function renderStatsPage(snapshot: UsageSnapshot): string {
       totalTokens: rest.reduce((s, m) => s + m.totalTokens, 0),
       sider: rest.reduce((s, m) => s + m.sider, 0),
       deepseek: rest.reduce((s, m) => s + m.deepseek, 0),
+      deepseekTools: rest.reduce((s, m) => s + m.deepseekTools, 0),
+      deepseekFallback: rest.reduce((s, m) => s + m.deepseekFallback, 0),
+      deepseekRouting: rest.reduce((s, m) => s + m.deepseekRouting, 0),
     });
   }
 
   const modelRows = shown.length === 0
-    ? `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`
+    ? `<tr><td colspan="6" class="empty-row">暂无数据</td></tr>`
     : shown.map((m, i) =>
       `<tr>
         <td><i class="dot" style="background:var(--s${i + 1})"></i>${esc(m.model)}</td>
         <td class="num">${m.requests}</td>
+        <td class="reason small">${reasonCell(m)}</td>
         <td class="num">${compact(m.totalTokens)}</td>
         <td class="num muted">${compact(m.inputTokens)}</td>
         <td class="num muted">${compact(m.outputTokens)}</td>
@@ -260,18 +293,21 @@ export function renderStatsPage(snapshot: UsageSnapshot): string {
 
   const recentRows = snapshot.recent.length === 0
     ? `<tr><td colspan="6" class="empty-row">暂无数据</td></tr>`
-    : snapshot.recent.map((r) =>
-      `<tr>
+    : snapshot.recent.map((r) => {
+      const marks: string[] = [];
+      if (r.reason === 'tools') marks.push('<span class="tag ghost">工具</span>');
+      if (r.reason === 'routing') marks.push('<span class="tag ghost">策略</span>');
+      if (r.fallback) marks.push('<span class="tag warn">受限兜底</span>');
+      if (r.stream) marks.push('<span class="tag ghost">stream</span>');
+      return `<tr>
         <td class="num muted">${hhmm(r.time)}</td>
         <td><span class="tag ${r.backend}">${r.backend}</span></td>
         <td>${esc(r.model)}</td>
-        <td>${r.fallback ? '<span class="tag warn">fallback</span>' : ''}${
-        r.stream ? '<span class="tag ghost">stream</span>' : ''
-      }</td>
+        <td>${marks.join('')}</td>
         <td>${r.tools.length ? esc(r.tools.join(', ')) : '<span class="muted">—</span>'}</td>
         <td class="num muted">${r.ms}ms</td>
-      </tr>`
-    ).join('');
+      </tr>`;
+    }).join('');
 
   const toolRows = snapshot.tools.length === 0
     ? `<p class="muted small">暂无工具调用</p>`
@@ -341,7 +377,9 @@ h1 { font-size: 18px; margin: 0; font-weight: 600; }
 .sub { color: var(--muted); font-size: 12px; }
 .grid-3 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
 .row { display: grid; grid-template-columns: 1fr 1.35fr; gap: 16px; margin-bottom: 16px; }
-@media (max-width: 900px) { .row, .grid-3 { grid-template-columns: 1fr; } }
+/* 模型表多一列归因，给它更多宽度，否则模型名会被挤到换行 */
+.row.models { grid-template-columns: 1.3fr 1fr; }
+@media (max-width: 900px) { .row, .row.models, .grid-3 { grid-template-columns: 1fr; } }
 .card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 10px; padding: 16px;
@@ -361,6 +399,9 @@ th {
 td { padding: 7px 8px; border-bottom: 1px solid var(--grid); }
 tr:last-child td { border-bottom: 0; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
+.reason { color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 受限兜底是唯一需要用户采取行动的分项（去查 Sider 配额），单独着色 */
+.warn-num { color: var(--warn); font-weight: 600; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .empty-row { text-align: center; color: var(--muted); padding: 20px 0; }
@@ -410,18 +451,22 @@ a { color: var(--s1); }
   <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>
 </div>
 
-<div class="row">
+<div class="row models">
   <div class="card" id="donut-card">
     <h2>模型分布</h2>
     <div class="donut-wrap">
       <svg viewBox="0 0 180 180" width="150" height="150" role="img"
         aria-label="按模型的请求数构成">${donut(shown, totals.requests)}</svg>
       <table>
-        <thead><tr><th>模型</th><th class="num">请求</th><th class="num">Token</th>
-          <th class="num">输入</th><th class="num">输出</th></tr></thead>
+        <thead><tr><th>模型</th><th class="num">请求</th><th>走 DeepSeek</th>
+          <th class="num">Token</th><th class="num">输入</th><th class="num">输出</th></tr></thead>
         <tbody>${modelRows}</tbody>
       </table>
     </div>
+    <p class="muted small" style="margin:12px 0 0">
+      走 DeepSeek 的原因：<b>工具</b>=请求含 Claude Code / MCP 工具，本就该由 DeepSeek 承接；
+      <b>受限兜底</b>=Sider 调用失败后被迫改走 DeepSeek；<b>策略</b>=长文本等路由策略主动选择。
+    </p>
   </div>
   <div class="card" id="trend-card">
     <h2>Token 使用趋势（近 24 小时）</h2>
@@ -441,6 +486,11 @@ a { color: var(--s1); }
       最近 1 小时：${snapshot.lastHour.requests} 次请求
       （Sider ${snapshot.lastHour.sider} · DeepSeek ${snapshot.lastHour.deepseek}
       · fallback ${snapshot.lastHour.fallbacks}）
+    </p>
+    <p class="muted small" style="margin:6px 0 0">
+      DeepSeek 承接来源：工具 <b>${totals.deepseekTools}</b>
+      · 受限兜底 <b class="warn-num">${totals.deepseekFallback}</b>
+      · 策略 <b>${totals.deepseekRouting}</b>
     </p>
   </div>
   <div class="card" id="tools-card">

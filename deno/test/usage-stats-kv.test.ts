@@ -50,6 +50,7 @@ Deno.test({
       model: 'claude-sonnet-4.6',
       backend: 'deepseek',
       fallback: true,
+      deepseekReason: 'fallback',
       toolUses: ['Bash', 'Read'],
       stream: true,
       ms: 200,
@@ -112,5 +113,56 @@ Deno.test({
     assertEquals(merged.recent.length, 1, 'recent 条数');
     assertEquals(merged.recent[0].model, 'm', 'recent 模型');
     assertEquals(merged.lastHour.requests, 1, 'lastHour 请求数');
+  });
+});
+
+/**
+ * DeepSeek 归因必须一起进 KV。
+ *
+ * 生产上 /stats 的聚合读的是 KV（Deploy 多实例），归因只留在进程内的话，
+ * 用户在看板上看到的三个分项会永远是 0，这个功能等于没做。
+ */
+Deno.test({
+  name: '用量 KV：DeepSeek 归因按模型与总量持久化',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  await withMemoryKv(async () => {
+    resetUsageStats();
+    const opus = (reason: 'tools' | 'fallback' | 'routing') => ({
+      model: 'claude-opus-4.6',
+      backend: 'deepseek' as const,
+      fallback: reason === 'fallback',
+      deepseekReason: reason,
+      toolUses: [],
+      stream: false,
+      ms: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+    recordUsage(opus('tools'));
+    recordUsage(opus('tools'));
+    recordUsage(opus('fallback'));
+    recordUsage(opus('routing'));
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const merged = await getStatsSnapshot();
+    assertEquals(merged.persisted, true, '应来自 KV 层');
+    assertEquals(merged.totals.deepseekTools, 2, 'KV 总量工具归因');
+    assertEquals(merged.totals.deepseekFallback, 1, 'KV 总量受限兜底归因');
+    assertEquals(merged.totals.deepseekRouting, 1, 'KV 总量策略归因');
+
+    const opusRow = merged.models.find((m) => m.model === 'claude-opus-4.6');
+    assertEquals(opusRow?.deepseekTools, 2, 'KV 模型工具归因');
+    assertEquals(opusRow?.deepseekFallback, 1, 'KV 模型受限兜底归因');
+    assertEquals(opusRow?.deepseekRouting, 1, 'KV 模型策略归因');
+    // 不变式在持久层同样成立
+    assertEquals(
+      (opusRow?.deepseekTools ?? 0) + (opusRow?.deepseekFallback ?? 0) +
+        (opusRow?.deepseekRouting ?? 0),
+      opusRow?.deepseek,
+      'KV 模型分项求和',
+    );
   });
 });

@@ -22,7 +22,7 @@ import {
   validateAnthropicRequest,
 } from '../utils/request-converter';
 import { siderClient, SiderUpstreamError } from '../utils/sider-client';
-import { recordUsage } from '../utils/usage-stats';
+import { classifyDeepSeekReason, recordUsage } from '../utils/usage-stats';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
 import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
 import { cleanupExpiredSiderSessions, getSiderSessionStats } from '../utils/sider-session-manager';
@@ -190,6 +190,7 @@ messagesRouter.post('/', async (c: Context) => {
       backend: selectedBackend,
       // 实际后端与路由初判不同 = 中途发生过 fallback。
       fallback: selectedBackend !== decision.backend,
+      deepseekReason: classifyDeepSeekReason(selectedBackend, decision.backend, decision.ruleId),
       toolUses: response.content
         .filter((block: any) => block.type === 'tool_use')
         .map((block: any) => block.name),

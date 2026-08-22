@@ -6,6 +6,7 @@
  */
 
 import {
+  classifyDeepSeekReason,
   getUsageSnapshot,
   recordCachedReplay,
   recordUsage,
@@ -33,7 +34,11 @@ function rec(overrides: Partial<UsageRecord> = {}): UsageRecord {
   };
 }
 
-Deno.test({ name: '用量统计：无请求时占比为 0% 而非除零', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：无请求时占比为 0% 而非除零',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   const snap = getUsageSnapshot();
 
@@ -44,20 +49,27 @@ Deno.test({ name: '用量统计：无请求时占比为 0% 而非除零', saniti
   assertEquals(snap.tools.length, 0, 'tools 条数');
 });
 
-Deno.test({ name: '用量统计：后端计数与占比', sanitizeResources: false, sanitizeOps: false }, () => {
-  resetUsageStats();
-  for (let i = 0; i < 3; i += 1) recordUsage(rec({ backend: 'sider' }));
-  recordUsage(rec({ backend: 'deepseek' }));
+Deno.test(
+  { name: '用量统计：后端计数与占比', sanitizeResources: false, sanitizeOps: false },
+  () => {
+    resetUsageStats();
+    for (let i = 0; i < 3; i += 1) recordUsage(rec({ backend: 'sider' }));
+    recordUsage(rec({ backend: 'deepseek' }));
 
-  const snap = getUsageSnapshot();
-  assertEquals(snap.totals.requests, 4, 'requests');
-  assertEquals(snap.totals.sider, 3, 'sider 次数');
-  assertEquals(snap.totals.deepseek, 1, 'deepseek 次数');
-  assertEquals(snap.backendShare.sider, '75%', 'sider 占比');
-  assertEquals(snap.backendShare.deepseek, '25%', 'deepseek 占比');
-});
+    const snap = getUsageSnapshot();
+    assertEquals(snap.totals.requests, 4, 'requests');
+    assertEquals(snap.totals.sider, 3, 'sider 次数');
+    assertEquals(snap.totals.deepseek, 1, 'deepseek 次数');
+    assertEquals(snap.backendShare.sider, '75%', 'sider 占比');
+    assertEquals(snap.backendShare.deepseek, '25%', 'deepseek 占比');
+  },
+);
 
-Deno.test({ name: '用量统计：fallback 与流式分别计数', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：fallback 与流式分别计数',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'deepseek', fallback: true }));
   recordUsage(rec({ backend: 'sider', stream: true }));
@@ -70,7 +82,11 @@ Deno.test({ name: '用量统计：fallback 与流式分别计数', sanitizeResou
   assertEquals(snap.totals.requests, 3, 'requests');
 });
 
-Deno.test({ name: '用量统计：工具频次按次数降序，取 Top 8', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：工具频次按次数降序，取 Top 8',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'deepseek', toolUses: ['Bash', 'Read'] }));
   recordUsage(rec({ backend: 'deepseek', toolUses: ['Bash'] }));
@@ -87,7 +103,11 @@ Deno.test({ name: '用量统计：工具频次按次数降序，取 Top 8', sani
   assertEquals(snap.tools.length, 8, 'Top 8 截断');
 });
 
-Deno.test({ name: '用量统计：最近明细新在前，且不含消息内容', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：最近明细新在前，且不含消息内容',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ model: 'first' }));
   recordUsage(rec({ model: 'second', backend: 'deepseek', toolUses: ['Bash'] }));
@@ -99,12 +119,26 @@ Deno.test({ name: '用量统计：最近明细新在前，且不含消息内容'
   assertEquals(snap.recent[0].tools[0], 'Bash', '工具名');
 
   // 明细字段是白名单式的，不应混入请求体内容
-  const allowed = ['time', 'model', 'backend', 'fallback', 'tools', 'stream', 'ms', 'tokens'];
+  const allowed = [
+    'time',
+    'model',
+    'backend',
+    'fallback',
+    'reason',
+    'tools',
+    'stream',
+    'ms',
+    'tokens',
+  ];
   const actual = Object.keys(snap.recent[0]).sort();
   assertEquals(actual.join(','), allowed.sort().join(','), 'recent 字段集合');
 });
 
-Deno.test({ name: '用量统计：最近明细只展示 10 条，但总计不受影响', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：最近明细只展示 10 条，但总计不受影响',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   for (let i = 0; i < 25; i += 1) recordUsage(rec({ model: `m${i}` }));
 
@@ -114,7 +148,11 @@ Deno.test({ name: '用量统计：最近明细只展示 10 条，但总计不受
   assertEquals(snap.totals.requests, 25, '总计不截断');
 });
 
-Deno.test({ name: '用量统计：缓存回放单独计数，不污染后端占比', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：缓存回放单独计数，不污染后端占比',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'sider' }));
   recordCachedReplay();
@@ -128,7 +166,11 @@ Deno.test({ name: '用量统计：缓存回放单独计数，不污染后端占�
   assertEquals(snap.recent.length, 1, 'recent 不含回放');
 });
 
-Deno.test({ name: '用量统计：lastHour 只统计窗口内的请求', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：lastHour 只统计窗口内的请求',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'sider' }));
   recordUsage(rec({ backend: 'deepseek', fallback: true }));
@@ -149,7 +191,11 @@ Deno.test({ name: '用量统计：lastHour 只统计窗口内的请求', sanitiz
   assertEquals(now.lastHour.fallbacks, 1, '当下窗口内 fallback');
 });
 
-Deno.test({ name: '用量统计：token 累计到总量与各模型', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：token 累计到总量与各模型',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ model: 'claude-opus-4.6', inputTokens: 100, outputTokens: 50 }));
   recordUsage(rec({ model: 'claude-opus-4.6', inputTokens: 200, outputTokens: 30 }));
@@ -166,7 +212,11 @@ Deno.test({ name: '用量统计：token 累计到总量与各模型', sanitizeRe
   assertEquals(snap.models[1].model, 'claude-haiku-4.5', '次位模型');
 });
 
-Deno.test({ name: '用量统计：模型聚合不受 recent 条数上限影响', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：模型聚合不受 recent 条数上限影响',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   // recent 上限 200；发 210 条后前 10 条会被滚掉，但模型累计必须完整
   for (let i = 0; i < 210; i += 1) {
@@ -177,7 +227,11 @@ Deno.test({ name: '用量统计：模型聚合不受 recent 条数上限影响',
   assertEquals(snap.totals.inputTokens, 210, '总量不受截断影响');
 });
 
-Deno.test({ name: '用量统计：趋势固定 24 个桶且时间轴连续', sanitizeResources: false, sanitizeOps: false }, () => {
+Deno.test({
+  name: '用量统计：趋势固定 24 个桶且时间轴连续',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
   resetUsageStats();
   recordUsage(rec({ inputTokens: 5, outputTokens: 5 }));
 
@@ -199,4 +253,131 @@ Deno.test({ name: '用量统计：趋势固定 24 个桶且时间轴连续', san
   }
   assertEquals(gaps.size, 1, '间隔恒定');
   assertEquals([...gaps][0], 3600_000, '间隔为 1 小时');
+});
+
+/**
+ * DeepSeek 归因。
+ *
+ * 用户的实际问题："Claude Code 跑完一轮，到底 fallback 了多少次 DeepSeek"。
+ * 光看 backend=deepseek 回答不了 —— 绝大多数 DeepSeek 调用是路由规则一开始
+ * 就判过去的（请求带工具），根本不是 fallback。两者必须分开计数。
+ */
+Deno.test({
+  name: '归因：Sider 完成的请求没有 DeepSeek 归因',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  assertEquals(
+    classifyDeepSeekReason('sider', 'sider', 'rule_5_simple_chat_prefer_sider'),
+    undefined,
+    'sider 归因',
+  );
+  // 路由判给 DeepSeek 但最终由 Sider 完成（DeepSeek 失败反向兜底）同样无归因
+  assertEquals(
+    classifyDeepSeekReason('sider', 'deepseek', 'rule_2_claude_tools'),
+    undefined,
+    '反向兜底',
+  );
+});
+
+Deno.test(
+  { name: '归因：工具能力规则记为 tools', sanitizeResources: false, sanitizeOps: false },
+  () => {
+    for (
+      const ruleId of [
+        'rule_1_tool_result_continuity',
+        'rule_2_claude_tools',
+        'rule_3_mcp_tools',
+      ]
+    ) {
+      assertEquals(classifyDeepSeekReason('deepseek', 'deepseek', ruleId), 'tools', ruleId);
+    }
+  },
+);
+
+Deno.test({
+  name: '归因：实际后端偏离路由初判记为 fallback',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  // 路由判 Sider、实际由 DeepSeek 完成 = Sider 上游受限后兜底。
+  // 即便 ruleId 属于工具类也必须记 fallback：偏离本身就是失败的证据。
+  assertEquals(
+    classifyDeepSeekReason('deepseek', 'sider', 'rule_5_simple_chat_prefer_sider'),
+    'fallback',
+    '简单对话兜底',
+  );
+  assertEquals(
+    classifyDeepSeekReason('deepseek', 'sider', 'rule_2_claude_tools'),
+    'fallback',
+    '偏离优先于规则',
+  );
+});
+
+Deno.test({
+  name: '归因：其余主动选择 DeepSeek 的规则记为 routing',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  for (
+    const ruleId of [
+      'rule_5_long_form_generation',
+      'rule_5_simple_chat_deepseek',
+      'rule_6_default_deepseek',
+    ]
+  ) {
+    assertEquals(classifyDeepSeekReason('deepseek', 'deepseek', ruleId), 'routing', ruleId);
+  }
+});
+
+Deno.test({
+  name: '归因：按模型与总量分别累计，三分项之和等于 deepseek',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  resetUsageStats();
+  const opus = (reason: UsageRecord['deepseekReason']) =>
+    rec({ model: 'claude-opus-4.6', backend: 'deepseek', deepseekReason: reason });
+
+  recordUsage(opus('tools'));
+  recordUsage(opus('tools'));
+  recordUsage(opus('fallback'));
+  recordUsage(opus('routing'));
+  recordUsage(rec({ model: 'claude-opus-4.6', backend: 'sider' }));
+  recordUsage(rec({ model: 'claude-haiku-4.5', backend: 'deepseek', deepseekReason: 'tools' }));
+
+  const snap = getUsageSnapshot();
+  const model = snap.models.find((m) => m.model === 'claude-opus-4.6')!;
+  assertEquals(model.requests, 5, 'opus 请求数');
+  assertEquals(model.sider, 1, 'opus 走 sider');
+  assertEquals(model.deepseek, 4, 'opus 走 deepseek');
+  assertEquals(model.deepseekTools, 2, 'opus 工具归因');
+  assertEquals(model.deepseekFallback, 1, 'opus 受限兜底归因');
+  assertEquals(model.deepseekRouting, 1, 'opus 策略归因');
+  // 不变式：三个分项必须能加回 deepseek，否则表格会漏计
+  assertEquals(
+    model.deepseekTools + model.deepseekFallback + model.deepseekRouting,
+    model.deepseek,
+    'opus 分项求和',
+  );
+
+  assertEquals(snap.totals.deepseekTools, 3, '总量工具归因');
+  assertEquals(snap.totals.deepseekFallback, 1, '总量受限兜底归因');
+  assertEquals(snap.totals.deepseekRouting, 1, '总量策略归因');
+  assertEquals(
+    snap.totals.deepseekTools + snap.totals.deepseekFallback + snap.totals.deepseekRouting,
+    snap.totals.deepseek,
+    '总量分项求和',
+  );
+});
+
+Deno.test({
+  name: '归因：sider 请求在 recent 里显式为 null 而非缺字段',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  resetUsageStats();
+  recordUsage(rec({ backend: 'sider' }));
+  const snap = getUsageSnapshot();
+  assertEquals(snap.recent[0].reason, null, 'sider 归因');
 });

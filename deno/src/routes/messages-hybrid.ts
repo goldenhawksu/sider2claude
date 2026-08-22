@@ -19,7 +19,8 @@ import {
 } from '../utils/request-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
 import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
-import { recordCachedReplay, recordUsage } from '../utils/usage-stats.ts';
+import { classifyDeepSeekReason, recordCachedReplay, recordUsage } from '../utils/usage-stats.ts';
+import type { DeepSeekReason } from '../utils/usage-stats.ts';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter.ts';
 import {
   cleanupExpiredConversations,
@@ -31,6 +32,7 @@ import {
 } from '../utils/sider-session-manager.ts';
 import { type Backend, getBackendDisplayName, loadBackendConfig } from '../config/backends.ts';
 import { RouterEngine } from '../routing/router-engine.ts';
+import type { RoutingDecision } from '../routing/router-engine.ts';
 import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter.ts';
 import {
   createRequestLogContext,
@@ -149,7 +151,7 @@ messagesRouter.post('/', async (c: Context) => {
       return await handleStreamingRequest(
         anthropicRequest,
         auth.token,
-        decision.backend,
+        decision,
         logContext,
         conversationId,
         parentMessageId,
@@ -236,6 +238,7 @@ messagesRouter.post('/', async (c: Context) => {
       backend: selectedBackend,
       // 实际后端与路由初判不同 = 中途发生过 fallback。
       fallback: selectedBackend !== decision.backend,
+      deepseekReason: classifyDeepSeekReason(selectedBackend, decision.backend, decision.ruleId),
       toolUses: response.content
         .filter((block) => block.type === 'tool_use')
         .map((block) => block.name),
@@ -649,11 +652,16 @@ function cloneAnthropicResponse(response: AnthropicResponse): AnthropicResponse 
 async function handleStreamingRequest(
   anthropicRequest: AnthropicRequest,
   authToken: string,
-  backend: Backend,
+  decision: RoutingDecision,
   logContext: RequestLogContext,
   conversationId?: string,
   parentMessageId?: string,
 ): Promise<Response> {
+  const backend = decision.backend;
+  // 流式设计上不做后端 fallback，所以实际后端恒等于路由初判：
+  // 归因只可能是 tools / routing，不会出现 fallback。
+  const deepseekReason = classifyDeepSeekReason(backend, backend, decision.ruleId);
+
   if (backend === 'deepseek') {
     if (!capabilityAdapter) {
       throw new Error('DeepSeek capability backend is not configured');
@@ -666,9 +674,15 @@ async function handleStreamingRequest(
         capabilityAdapter,
         anthropicRequest,
         logContext,
+        deepseekReason,
       );
     }
-    return createDeepSeekStreamingResponse(capabilityAdapter, anthropicRequest, logContext);
+    return createDeepSeekStreamingResponse(
+      capabilityAdapter,
+      anthropicRequest,
+      logContext,
+      deepseekReason,
+    );
   }
 
   if (conversationId) {
@@ -934,6 +948,7 @@ function createDeepSeekSynthesizedStreamingResponse(
   adapter: AnthropicApiAdapter,
   request: AnthropicRequest,
   logContext: RequestLogContext,
+  deepseekReason?: DeepSeekReason,
 ): Response {
   const encoder = new TextEncoder();
   const streamStartedAt = Date.now();
@@ -1021,6 +1036,7 @@ function createDeepSeekSynthesizedStreamingResponse(
           model: request.model,
           backend: 'deepseek',
           fallback: false, // 流式设计上不做后端 fallback
+          deepseekReason,
           toolUses: response.content
             .filter((block) => block.type === 'tool_use')
             .map((block) => block.name),
@@ -1161,6 +1177,7 @@ function createDeepSeekStreamingResponse(
   adapter: AnthropicApiAdapter,
   request: AnthropicRequest,
   logContext: RequestLogContext,
+  deepseekReason?: DeepSeekReason,
 ): Response {
   const encoder = new TextEncoder();
   const streamStartedAt = Date.now();
@@ -1212,9 +1229,29 @@ function createDeepSeekStreamingResponse(
           tools: request.tools?.length || 0,
         });
 
+        // 透传上游 token 用量：真流式没有汇总响应，只能从事件里捡。
+        // input_tokens 在 message_start，output_tokens 在 message_delta。
+        let inputTokens = 0;
+        let outputTokens = 0;
+        const collectUsage = (chunk: unknown) => {
+          const event = chunk as {
+            type?: string;
+            message?: { usage?: { input_tokens?: number } };
+            usage?: { output_tokens?: number };
+          };
+          if (event?.type === 'message_start') {
+            inputTokens = event.message?.usage?.input_tokens ?? inputTokens;
+          } else if (event?.type === 'message_delta') {
+            outputTokens = event.usage?.output_tokens ?? outputTokens;
+          }
+        };
+
         await adapter.sendStreamRequest(
           request,
-          (chunk) => send(chunk),
+          (chunk) => {
+            collectUsage(chunk);
+            send(chunk);
+          },
           () => {
             const elapsedMs = Date.now() - streamStartedAt;
             logInfo('stream_completed', {
@@ -1225,6 +1262,19 @@ function createDeepSeekStreamingResponse(
               eventCount,
               firstEventMs,
               elapsedMs,
+            });
+            // 这条路径过去没有埋点，DeepSeek 的无工具流式请求在统计里凭空消失，
+            // 后端占比与模型归因都会偏向 Sider。
+            recordUsage({
+              model: request.model,
+              backend: 'deepseek',
+              fallback: false, // 流式设计上不做后端 fallback
+              deepseekReason,
+              toolUses: [], // 本路径仅在请求不带 tools 时进入
+              stream: true,
+              ms: elapsedMs,
+              inputTokens,
+              outputTokens,
             });
             if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
               logWarn('slow_stream_request', {

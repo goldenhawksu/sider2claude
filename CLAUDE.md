@@ -190,10 +190,24 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
   是否 fallback/工具/是否流式/耗时）。
 
 - `trend`：近 24 小时按小时分桶（空桶保留，时间轴连续）；`models`：按模型聚合的
-  请求数与 token 数。
+  请求数与 token 数，并按**归因**拆出该模型走 DeepSeek 的三个来源。
+- **DeepSeek 归因**（`deepseekTools` / `deepseekFallback` / `deepseekRouting`）回答
+  「某模型这一轮到底 fallback 了多少次 DeepSeek」：
+  - `tools`：ruleId ∈ {`rule_1_tool_result_continuity`, `rule_2_claude_tools`,
+    `rule_3_mcp_tools`}，请求带 Claude Code / MCP 工具，本就该由 DeepSeek 承接；
+  - `fallback`：实际后端 ≠ 路由初判，即 Sider 调用失败后被迫兜底——**只有这一类
+    说明 Sider 配额/可用性出了问题**；
+  - `routing`：其余主动选择 DeepSeek 的规则（长文本、默认后端）。
+  判定在 `classifyDeepSeekReason()`（放统计模块，因为这是观测语义而非路由语义），
+  埋点处把 `(selectedBackend, decision.backend, decision.ruleId)` 传进去。
+  不变式：三个分项之和恒等于 `deepseek`，按模型与按总量都成立，测试守住。
+  新增路由规则时若它把请求判给 DeepSeek，必须决定归入 `tools` 还是 `routing`
+  （不加就默认落进 `routing`）。
 - `GET /stats` 渲染自包含的 HTML 看板（内联 SVG+CSS，无外部依赖）：环形图
   （模型分布）+ 面积图（token 趋势）+ 表格 + 后端堆叠条，浅色/深色随系统。
   `GET /stats.json` 返回同一份快照的原始 JSON。
+- 模型表有一列「走 DeepSeek」按归因展示（零值不渲染成 0，用 `—` 占位），
+  受限兜底单独着色（`.warn-num`）——它是唯一需要用户采取行动的分项。
 - 配色取 dataviz 参考调色板前三个分类槽位（浅深两套已过 validate_palette），
   模型超过 8 个折叠为「其他」，绝不循环取色；模型名/工具名经 HTML 转义。
 - 页面所有时间戳按固定 **UTC+8**（北京/上海）渲染，页头标注时区。
@@ -214,9 +228,12 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 
 实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致，
 `stats-page.ts` 同）。
-埋点在请求完成处：Deno 侧非流式与两条流式路径各埋一次；Node 侧流式是 buffered
-模式（先走完非流式再转 SSE），因此只在非流式完成点埋一次、用请求自身的 stream
+埋点在请求完成处：Deno 侧非流式与**三条**流式路径各埋一次（Sider 真流式、
+DeepSeek 合成流式、DeepSeek 无工具真流式）；Node 侧流式是 buffered 模式
+（先走完非流式再转 SSE），因此只在非流式完成点埋一次、用请求自身的 stream
 标志区分，避免双计。
+DeepSeek 无工具真流式拿不到汇总响应，token 从 SSE 事件里捡：`input_tokens`
+在 `message_start`、`output_tokens` 在 `message_delta`。
 
 持久化（解决"打开 /stats 看到全 0"）：Deno Deploy 会拉起多个隔离实例并
 回收空闲实例，纯进程内统计在生产上几乎必然让用户命中空实例。聚合数据
@@ -243,6 +260,9 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - 回放请求不计入 `requests` 与占比，否则会稀释"由谁完成"的真实比例。
 - KV 写失败必须静默（进程内统计仍在），KV 读带 2s 超时并回退进程内——
   统计永远不能拖垮或阻塞请求。
+- 归因字段必须同时写进 KV（`usage-stats-kv.ts` 的 `REASON_FIELD` 与
+  `MODEL_FIELDS`）。生产上 `/stats` 的聚合读的是 KV，只留进程内的话
+  用户看到的三个分项永远是 0。
 
 ## 测试策略
 
@@ -253,6 +273,7 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/sider-upstream-error.test.ts`
 - `deno/test/duplicate-cache-isolation.test.ts`
 - `deno/test/messages-hybrid-stream.test.ts`
+- `deno/test/usage-attribution.test.ts`
 
 重点覆盖：
 
@@ -264,6 +285,8 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - Sider 的 SSE 内业务错误码（如 1135 用量超限）必须上抛，不能吞成空回复。
 - 带工具的 `tool_result` 续轮不得被会话延续规则路由回 Sider。
 - 重复响应缓存按流式隔离，流式响应不得被等价非流式请求回放。
+- DeepSeek 归因：带工具的请求记 `tools` 而非 `fallback`；Sider 受限兜底记
+  `fallback`；DeepSeek 无工具真流式必须被计入统计（历史上漏埋）。
 
 Node/Bun 侧适配器单元测试（mock fetch，不需要起服务）：
 

@@ -22,11 +22,65 @@ const WINDOW_MS = 60 * 60_000;
 const BUCKET_MS = 60 * 60_000;
 const BUCKET_COUNT = 24;
 
+/**
+ * 一次请求落到 DeepSeek 的原因。
+ *
+ * 存在的意义：用户配了 Sider 却发现 DeepSeek 被大量使用时，需要知道到底是
+ * "Claude Code 带了工具，本来就该走 DeepSeek"，还是"Sider 上游受限被迫兜底"。
+ * 前者是设计如此，后者才说明 Sider 配额/可用性出了问题。
+ */
+export type DeepSeekReason =
+  /** 请求含 Claude Code 内置工具 / MCP 工具，或延续上一个工具回合。 */
+  | 'tools'
+  /** 路由初判是 Sider，调用失败后兜底到 DeepSeek。 */
+  | 'fallback'
+  /** 其余路由策略主动选择 DeepSeek（长文本生成、默认后端等）。 */
+  | 'routing';
+
+/** DeepSeek 归因 -> 计数字段名。三个计数之和恒等于 deepseek 总数。 */
+const REASON_FIELD = {
+  tools: 'deepseekTools',
+  fallback: 'deepseekFallback',
+  routing: 'deepseekRouting',
+} as const;
+
+/**
+ * 由能力短板（而非偏好）把请求推给 DeepSeek 的规则。
+ *
+ * `rule_1_tool_result_continuity` 计入工具类：它只在 `tool_result` 回合触发，
+ * 本质是上一个工具回合的延续。理论上"长文本路由到 DeepSeek 后又续了一轮"
+ * 会被算进工具类，但那要求同一会话先长文本、后 tool_result，实践中不出现。
+ */
+const TOOL_CAPABILITY_RULES = new Set([
+  'rule_1_tool_result_continuity',
+  'rule_2_claude_tools',
+  'rule_3_mcp_tools',
+]);
+
+/**
+ * 判定本次请求走 DeepSeek 的原因；Sider 完成的请求返回 undefined。
+ *
+ * 放在统计模块而非路由模块：这是观测语义（怎么归类给用户看），
+ * 路由本身不需要知道自己会被怎么统计。
+ */
+export function classifyDeepSeekReason(
+  selectedBackend: Backend,
+  decidedBackend: Backend,
+  ruleId: string,
+): DeepSeekReason | undefined {
+  if (selectedBackend !== 'deepseek') return undefined;
+  // 路由初判是 Sider 却由 DeepSeek 完成 = Sider 失败后兜底
+  if (selectedBackend !== decidedBackend) return 'fallback';
+  return TOOL_CAPABILITY_RULES.has(ruleId) ? 'tools' : 'routing';
+}
+
 export interface UsageRecord {
   model: string;
   backend: Backend;
   /** 实际后端与路由初判不同 = 发生过 fallback。 */
   fallback: boolean;
+  /** 走 DeepSeek 的原因；backend 为 sider 时应为 undefined。 */
+  deepseekReason?: DeepSeekReason | undefined;
   /** 本次响应中真实发生的 tool_use 块的工具名。 */
   toolUses: string[];
   stream: boolean;
@@ -50,6 +104,10 @@ export interface ModelStat {
   totalTokens: number;
   sider: number;
   deepseek: number;
+  /** DeepSeek 承接来源拆分；三者之和恒等于 deepseek。 */
+  deepseekTools: number;
+  deepseekFallback: number;
+  deepseekRouting: number;
 }
 
 /** 趋势图的一个时间桶。 */
@@ -76,6 +134,10 @@ export interface UsageSnapshot {
     cachedReplays: number;
     inputTokens: number;
     outputTokens: number;
+    /** DeepSeek 承接来源拆分；三者之和恒等于 deepseek。 */
+    deepseekTools: number;
+    deepseekFallback: number;
+    deepseekRouting: number;
   };
   /** 后端占比（分母为非零请求；无请求时两个都是 0%）。 */
   backendShare: { sider: string; deepseek: string };
@@ -98,6 +160,8 @@ export interface UsageSnapshot {
     model: string;
     backend: Backend;
     fallback: boolean;
+    /** 走 DeepSeek 的原因；Sider 请求为 null。 */
+    reason: DeepSeekReason | null;
     tools: string[];
     stream: boolean;
     ms: number;
@@ -109,7 +173,7 @@ export interface UsageSnapshot {
 }
 
 const startedAt = Date.now();
-let totals = {
+const emptyTotals = () => ({
   requests: 0,
   sider: 0,
   deepseek: 0,
@@ -119,7 +183,11 @@ let totals = {
   cachedReplays: 0,
   inputTokens: 0,
   outputTokens: 0,
-};
+  deepseekTools: 0,
+  deepseekFallback: 0,
+  deepseekRouting: 0,
+});
+let totals = emptyTotals();
 const toolCounts = new Map<string, number>();
 const recent: RecentEntry[] = [];
 
@@ -137,6 +205,7 @@ export function recordUsage(record: UsageRecord): void {
   totals.toolCalls += record.toolUses.length;
   totals.inputTokens += record.inputTokens;
   totals.outputTokens += record.outputTokens;
+  if (record.deepseekReason) totals[REASON_FIELD[record.deepseekReason]] += 1;
   for (const name of record.toolUses) {
     toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
   }
@@ -151,6 +220,9 @@ export function recordUsage(record: UsageRecord): void {
       totalTokens: 0,
       sider: 0,
       deepseek: 0,
+      deepseekTools: 0,
+      deepseekFallback: 0,
+      deepseekRouting: 0,
     };
     modelStats.set(record.model, stat);
   }
@@ -159,6 +231,7 @@ export function recordUsage(record: UsageRecord): void {
   stat.outputTokens += record.outputTokens;
   stat.totalTokens += record.inputTokens + record.outputTokens;
   stat[record.backend] += 1;
+  if (record.deepseekReason) stat[REASON_FIELD[record.deepseekReason]] += 1;
 
   recent.unshift({ at: Date.now(), record });
   if (recent.length > RECENT_LIMIT) {
@@ -241,6 +314,7 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
       model: record.model,
       backend: record.backend,
       fallback: record.fallback,
+      reason: record.deepseekReason ?? null,
       tools: record.toolUses,
       stream: record.stream,
       ms: record.ms,
@@ -261,17 +335,7 @@ export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot>
 
 /** 仅供测试使用。 */
 export function resetUsageStats(): void {
-  totals = {
-    requests: 0,
-    sider: 0,
-    deepseek: 0,
-    fallbacks: 0,
-    streaming: 0,
-    toolCalls: 0,
-    cachedReplays: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-  };
+  totals = emptyTotals();
   toolCounts.clear();
   modelStats.clear();
   recent.length = 0;
