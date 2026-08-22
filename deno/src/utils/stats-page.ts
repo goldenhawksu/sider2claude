@@ -512,8 +512,8 @@ a { color: var(--s1); }
   ${esc(snapshot.note)}<br>
   ${
     snapshot.persisted
-      ? '聚合数据已持久化（Deno KV）。'
-      : '⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。'
+      ? '统计数据已持久化（Deno KV），含最近明细与最近 1 小时窗口。'
+      : '⚠️ 统计未持久化：仅统计当前实例，且实例回收后清零。'
   }
   缓存回放 ${totals.cachedReplays} 次（命中重复响应缓存、未触达上游，故不计入上方请求数）。
   流式请求 ${totals.streaming} 次；Sider 流式不回传 token 用量，Token 总量以非流式请求为准。

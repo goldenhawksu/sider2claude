@@ -90,12 +90,19 @@ Deno.test({
   });
 });
 
+/**
+ * KV 未启用时（STATS_KV 未设，默认降级）必须回退进程内快照。
+ * 这是"不配 KV 也能用"的保证：功能降级为单实例，但不能变成一片空白。
+ */
 Deno.test({
-  name: '用量 KV：recent 明细与 lastHour 始终来自进程内',
+  name: '用量 KV：未启用时 recent 与 lastHour 回退进程内',
   sanitizeResources: false,
   sanitizeOps: false,
 }, async () => {
-  await withMemoryKv(async () => {
+  const previous = Deno.env.get('STATS_KV');
+  Deno.env.delete('STATS_KV');
+  await closeStatsKv();
+  try {
     resetUsageStats();
     recordUsage({
       model: 'm',
@@ -109,11 +116,15 @@ Deno.test({
     });
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const merged = await getStatsSnapshot();
-    assertEquals(merged.recent.length, 1, 'recent 条数');
-    assertEquals(merged.recent[0].model, 'm', 'recent 模型');
-    assertEquals(merged.lastHour.requests, 1, 'lastHour 请求数');
-  });
+    const snap = await getStatsSnapshot();
+    assertEquals(snap.persisted, false, 'KV 未启用');
+    assertEquals(snap.recent.length, 1, 'recent 来自进程内');
+    assertEquals(snap.recent[0].model, 'm', 'recent 模型');
+    assertEquals(snap.lastHour.requests, 1, 'lastHour 来自进程内');
+  } finally {
+    if (previous) Deno.env.set('STATS_KV', previous);
+    await closeStatsKv();
+  }
 });
 
 /**
@@ -164,5 +175,138 @@ Deno.test({
       opusRow?.deepseek,
       'KV 模型分项求和',
     );
+  });
+});
+
+/**
+ * recent 明细与 lastHour 也持久化到 KV。
+ *
+ * 动机：Deno Deploy 会拉起多个隔离实例，纯进程内的明细意味着用户打开
+ * /stats 很可能命中一个没处理过请求的实例，明细与最近 1 小时全是空的。
+ * 下面用「写完之后清空进程内状态」模拟这一幕。
+ */
+Deno.test({
+  name: '用量 KV：清空进程内状态后，recent 与 lastHour 仍能从 KV 还原',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  await withMemoryKv(async () => {
+    resetUsageStats();
+    const rec = (o: Record<string, unknown> = {}) => ({
+      model: 'm',
+      backend: 'sider' as const,
+      fallback: false,
+      toolUses: [] as string[],
+      stream: false,
+      ms: 10,
+      inputTokens: 1,
+      outputTokens: 1,
+      ...o,
+    });
+    recordUsage(rec({ model: 'a' }));
+    recordUsage(
+      rec({ model: 'b', backend: 'deepseek', deepseekReason: 'tools', toolUses: ['Bash'] }),
+    );
+    recordUsage(
+      rec({ model: 'c', backend: 'deepseek', fallback: true, deepseekReason: 'fallback' }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    resetUsageStats(); // 模拟命中另一个（空的）实例
+    const snap = await getStatsSnapshot();
+
+    assertEquals(snap.persisted, true, '应来自 KV');
+    assertEquals(snap.recent.length, 3, 'recent 条数');
+    assertEquals(snap.recent.map((r) => r.model).join(','), 'c,b,a', 'recent 新在前');
+    assertEquals(snap.recent[0].reason, 'fallback', 'recent 归因随明细一起持久化');
+    assertEquals(snap.recent[1].tools.join(','), 'Bash', 'recent 工具名');
+
+    assertEquals(snap.lastHour.requests, 3, 'lastHour 请求数');
+    assertEquals(snap.lastHour.sider, 1, 'lastHour sider');
+    assertEquals(snap.lastHour.deepseek, 2, 'lastHour deepseek');
+    assertEquals(snap.lastHour.fallbacks, 1, 'lastHour fallback');
+
+    // 白名单不能因为过了一趟 KV 就被撑大
+    const allowed = [
+      'time',
+      'model',
+      'backend',
+      'fallback',
+      'reason',
+      'tools',
+      'stream',
+      'ms',
+      'tokens',
+    ];
+    assertEquals(
+      Object.keys(snap.recent[0]).sort().join(','),
+      allowed.sort().join(','),
+      'recent 字段集合',
+    );
+  });
+});
+
+/**
+ * 并发写不能丢明细。
+ *
+ * `['live']` 用 CAS 更新，而 persistUsage 是 fire-and-forget：若不串行化，
+ * 并发请求会读到同一个 versionstamp 争抢同一次提交，只有一个能赢。
+ * 实测未串行化时并发写 30 条只活下来 4 条。
+ */
+Deno.test({
+  name: '用量 KV：并发写入不丢明细（CAS 竞争回归）',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  await withMemoryKv(async () => {
+    resetUsageStats();
+    for (let i = 0; i < 30; i += 1) {
+      recordUsage({
+        model: `x${i}`,
+        backend: 'sider',
+        fallback: false,
+        toolUses: [],
+        stream: false,
+        ms: 1,
+        inputTokens: 1,
+        outputTokens: 0,
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    resetUsageStats();
+    const snap = await getStatsSnapshot();
+    assertEquals(snap.recent.length, 10, '展示条数（KV 内保留 20 条，展示截 10）');
+    assertEquals(snap.recent[0].model, 'x29', '最新一条没有被竞争吃掉');
+    assertEquals(snap.lastHour.requests, 30, 'lastHour 计满 30 条');
+  });
+});
+
+Deno.test({
+  name: '用量 KV：lastHour 窗口相对读取时刻，旧分钟桶不再计入',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, async () => {
+  await withMemoryKv(async () => {
+    resetUsageStats();
+    recordUsage({
+      model: 'm',
+      backend: 'sider',
+      fallback: false,
+      toolUses: [],
+      stream: false,
+      ms: 1,
+      inputTokens: 0,
+      outputTokens: 0,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const now = await getStatsSnapshot();
+    assertEquals(now.lastHour.requests, 1, '当下窗口内');
+
+    // 把「现在」推到 2 小时后：那条记录应滑出窗口
+    const future = await getStatsSnapshot(Date.now() + 2 * 60 * 60_000);
+    assertEquals(future.lastHour.requests, 0, '窗口外不计入');
+    assertEquals(future.totals.requests, 1, '总量不受窗口影响');
   });
 });

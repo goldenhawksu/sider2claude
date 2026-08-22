@@ -192,6 +192,14 @@ const toolCounts = new Map<string, number>();
 const recent: RecentEntry[] = [];
 
 /**
+ * 按小时桶的累计。**必须与 recent 分开维护**：recent 有 200 条上限，
+ * 用它算趋势会让早期桶被静默截断——而且失真是单向的（越早掉得越狠），
+ * 图会长成"什么都刚刚发生"的假曲棍球棒，形状比绝对值先坏掉。
+ * 这里按桶独立累计，与请求量无关。
+ */
+const trendBuckets = new Map<number, Omit<TrendBucket, 'at'>>();
+
+/**
  * 按模型的累计。与 recent 分开维护：recent 有条数上限会滚掉旧记录，
  * 而模型累计要覆盖进程全生命周期。
  */
@@ -237,6 +245,29 @@ export function recordUsage(record: UsageRecord): void {
   if (recent.length > RECENT_LIMIT) {
     recent.length = RECENT_LIMIT;
   }
+
+  addToTrendBucket(Date.now(), record);
+
+}
+
+/** 把一条记录累加进它所属的小时桶，并顺手淘汰滑出 24 小时窗口的旧桶。 */
+function addToTrendBucket(at: number, record: UsageRecord): void {
+  const key = Math.floor(at / BUCKET_MS) * BUCKET_MS;
+  let bucket = trendBuckets.get(key);
+  if (!bucket) {
+    bucket = { requests: 0, inputTokens: 0, outputTokens: 0, sider: 0, deepseek: 0 };
+    trendBuckets.set(key, bucket);
+  }
+  bucket.requests += 1;
+  bucket.inputTokens += record.inputTokens;
+  bucket.outputTokens += record.outputTokens;
+  bucket[record.backend] += 1;
+
+  // 桶数天然有界（24 个），但服务长跑时旧 key 会残留，写入时顺手清掉
+  const oldest = key - (BUCKET_COUNT - 1) * BUCKET_MS;
+  for (const existing of trendBuckets.keys()) {
+    if (existing < oldest) trendBuckets.delete(existing);
+  }
 }
 
 /**
@@ -249,37 +280,28 @@ export function recordCachedReplay(): void {
 }
 
 /**
- * 近 24 小时按小时分桶。数据源是 recent（有 200 条上限），
- * 因此高流量下早期桶会偏低——趋势形状仍然可读，绝对值以 totals 为准。
+ * 近 24 小时按小时分桶。数据源是 `trendBuckets`（按桶独立累计），
+ * 与请求总量无关，因此高流量下也不会失真。
  */
 function buildTrend(now: number): TrendBucket[] {
   const currentBucket = Math.floor(now / BUCKET_MS) * BUCKET_MS;
-  const buckets = new Map<number, TrendBucket>();
+  const trend: TrendBucket[] = [];
 
-  // 先铺满空桶，保证时间轴连续（缺口不会被折线连成斜线）
+  // 空桶也保留，保证时间轴连续（缺口不会被折线连成斜线）
   for (let i = BUCKET_COUNT - 1; i >= 0; i -= 1) {
     const at = currentBucket - i * BUCKET_MS;
-    buckets.set(at, {
+    const bucket = trendBuckets.get(at);
+    trend.push({
       at: new Date(at).toISOString(),
-      requests: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      sider: 0,
-      deepseek: 0,
+      requests: bucket?.requests ?? 0,
+      inputTokens: bucket?.inputTokens ?? 0,
+      outputTokens: bucket?.outputTokens ?? 0,
+      sider: bucket?.sider ?? 0,
+      deepseek: bucket?.deepseek ?? 0,
     });
   }
 
-  for (const { at, record } of recent) {
-    const key = Math.floor(at / BUCKET_MS) * BUCKET_MS;
-    const bucket = buckets.get(key);
-    if (!bucket) continue; // 落在 24 小时窗口外
-    bucket.requests += 1;
-    bucket.inputTokens += record.inputTokens;
-    bucket.outputTokens += record.outputTokens;
-    bucket[record.backend] += 1;
-  }
-
-  return [...buckets.values()];
+  return trend;
 }
 
 export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
@@ -338,5 +360,6 @@ export function resetUsageStats(): void {
   totals = emptyTotals();
   toolCounts.clear();
   modelStats.clear();
+  trendBuckets.clear();
   recent.length = 0;
 }

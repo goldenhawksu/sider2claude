@@ -381,3 +381,96 @@ Deno.test({
   const snap = getUsageSnapshot();
   assertEquals(snap.recent[0].reason, null, 'sider 归因');
 });
+
+/**
+ * 趋势分桶。
+ *
+ * 曾经 buildTrend 的数据源是 recent（200 条上限），高流量下早期桶被静默截断。
+ * 失真是单向的（越早掉得越狠），图会长成"什么都刚刚发生"的假曲棍球棒——
+ * 形状比绝对值先坏掉，而形状正是趋势图的全部意义。
+ */
+Deno.test({
+  name: '趋势：按桶独立累计，不是逐桶累加的累计曲线',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  resetUsageStats();
+  const realNow = Date.now;
+  const base = realNow();
+  try {
+    // 连续 5 个小时，每小时 3 条 × 100 输入 token
+    for (const hoursAgo of [5, 4, 3, 2, 1]) {
+      Date.now = () => base - hoursAgo * 3600_000;
+      for (let i = 0; i < 3; i += 1) {
+        recordUsage(rec({ inputTokens: 100, outputTokens: 10 }));
+      }
+    }
+  } finally {
+    Date.now = realNow;
+  }
+
+  const snap = getUsageSnapshot(base);
+  const window = snap.trend.slice(-6, -1); // 5 小时前 .. 1 小时前
+  for (const bucket of window) {
+    assertEquals(bucket.requests, 3, '每桶请求数');
+    assertEquals(bucket.inputTokens, 300, '每桶输入 token');
+  }
+  // 若是累计曲线，末桶会是 1500 而非 300
+  assertEquals(window[window.length - 1].inputTokens, 300, '末桶不应是累计值');
+  assertEquals(snap.totals.inputTokens, 1500, '总量仍是全量');
+});
+
+Deno.test({
+  name: '趋势：超过 recent 上限后早期桶不被截断（关键回归）',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  resetUsageStats();
+  const realNow = Date.now;
+  const base = realNow();
+  try {
+    // recent 上限 200；这里共 300 条，分两个小时各 150 条
+    for (const hoursAgo of [3, 2]) {
+      Date.now = () => base - hoursAgo * 3600_000;
+      for (let i = 0; i < 150; i += 1) {
+        recordUsage(rec({ inputTokens: 100, outputTokens: 0 }));
+      }
+    }
+  } finally {
+    Date.now = realNow;
+  }
+
+  const snap = getUsageSnapshot(base);
+  const threeHoursAgo = snap.trend[snap.trend.length - 4];
+  assertEquals(threeHoursAgo.requests, 150, '最早的桶不被 recent 上限截断');
+  assertEquals(threeHoursAgo.inputTokens, 15000, '最早的桶 token');
+
+  // 趋势各桶求和必须等于总量，否则图和数对不上
+  const summed = snap.trend.reduce((acc, b) => acc + b.inputTokens, 0);
+  assertEquals(summed, snap.totals.inputTokens, '趋势求和 == 总量');
+});
+
+Deno.test({
+  name: '趋势：滑出 24 小时窗口的桶被淘汰，不无限累积',
+  sanitizeResources: false,
+  sanitizeOps: false,
+}, () => {
+  resetUsageStats();
+  const realNow = Date.now;
+  const base = realNow();
+  try {
+    Date.now = () => base - 30 * 3600_000; // 30 小时前，早已滑出窗口
+    recordUsage(rec({ inputTokens: 999 }));
+    Date.now = () => base;
+    recordUsage(rec({ inputTokens: 1 }));
+  } finally {
+    Date.now = realNow;
+  }
+
+  const snap = getUsageSnapshot(base);
+  assertEquals(snap.trend.length, 24, '桶数恒定');
+  const summed = snap.trend.reduce((acc, b) => acc + b.inputTokens, 0);
+  assertEquals(summed, 1, '窗口外的旧数据不出现在趋势里');
+  // 但总量是全生命周期的，不受窗口影响
+  assertEquals(snap.totals.inputTokens, 1000, '总量保留全部');
+});

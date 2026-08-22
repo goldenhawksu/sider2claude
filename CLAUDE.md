@@ -189,7 +189,11 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 - `tools`：工具调用频次 Top 8；`recent`：最近 10 条明细（时间/模型/后端/
   是否 fallback/工具/是否流式/耗时）。
 
-- `trend`：近 24 小时按小时分桶（空桶保留，时间轴连续）；`models`：按模型聚合的
+- `trend`：近 24 小时按小时分桶（空桶保留，时间轴连续）。**趋势由独立的
+  按桶累计维护（`trendBuckets`），绝不能改回遍历 `recent`**——`recent` 有
+  200 条上限，用它算趋势会让早期桶被静默截断，且失真是单向的（越早掉得
+  越狠），图会长成"什么都刚刚发生"的假曲棍球棒，形状比绝对值先坏掉。
+  桶按 24 小时窗口淘汰；`models`：按模型聚合的
   请求数与 token 数，并按**归因**拆出该模型走 DeepSeek 的三个来源。
 - **DeepSeek 归因**（`deepseekTools` / `deepseekFallback` / `deepseekRouting`）回答
   「某模型这一轮到底 fallback 了多少次 DeepSeek」：
@@ -236,11 +240,35 @@ DeepSeek 无工具真流式拿不到汇总响应，token 从 SSE 事件里捡：
 在 `message_start`、`output_tokens` 在 `message_delta`。
 
 持久化（解决"打开 /stats 看到全 0"）：Deno Deploy 会拉起多个隔离实例并
-回收空闲实例，纯进程内统计在生产上几乎必然让用户命中空实例。聚合数据
-（总量/模型/趋势/工具频次）由 `deno/src/utils/usage-stats-kv.ts` 写入
-Deno KV——每请求的全部增量编码成一次 atomic commit（多个 sum mutation），
-fire-and-forget 不阻塞响应。`recent` 明细与 `lastHour` 保留进程内（快照的
-`note` 已注明）。`STATS_KV` 环境变量控制模式：未设 = 完全跳过 KV（零开销
+回收空闲实例，纯进程内统计在生产上几乎必然让用户命中空实例。**全部统计**
+（总量/模型/趋势/工具频次 + `recent` 明细 + `lastHour` 窗口）由
+`deno/src/utils/usage-stats-kv.ts` 写入 Deno KV，两种存储形态：
+
+1. 聚合计数走 `['stats', ...]` 下的 sum mutation——无竞争、原子累加，
+   每请求的全部增量编码成一次 atomic commit，fire-and-forget 不阻塞响应。
+2. 明细与滑动窗口走**单个** `['live']` key，存 `{recent, minutes}`，
+   用 check-versionstamp 的 CAS 更新。不用"一条明细一个 key"是因为
+   `/stats` 每 5 秒自动刷新，那样每次刷新都要 list 几百个 key；
+   定长数组塞一个 key，读取恒为 1 次 get。
+   - `recent` 定长 20 条（看板展示 10 条），写入时截断；
+   - `lastHour` 由 60 个分钟桶求和得到，保住**真滑动窗口**语义
+     （若改用小时桶，10:05 时"最近 1 小时"只有 5 分钟数据，是降级）；
+     窗口相对**读取时刻**计算，服务闲置一小时后残留的旧桶不再计入。
+
+**`['live']` 的 CAS 更新必须同实例内串行化**（`enqueueLive` 的 promise
+队列）。`persistUsage` 是 fire-and-forget，并发请求会同时读到同一个
+versionstamp 争抢同一次提交，只有一个能赢——实测未串行化时并发写 30 条
+只活下来 4 条。串行后同实例零竞争，跨实例竞争交给 `updateLive` 的 3 次重试。
+队列有深度上限（64），极端流量下宁可丢观测数据也不让待处理写无限堆积。
+`deno/test/usage-stats-kv.test.ts` 有并发回归测试守这条线。
+
+**不要用 `expireIn` 做过期**：实测 `:memory:` KV 上写多久都不生效
+（Deno 2.5.4），本地测不出来的行为不能作为正确性依赖。回收是确定性的：
+`recent`/`minutes` 在写入时按长度和窗口裁剪；趋势旧桶（>25 小时）在
+`collect()` 扫描时顺手删——趋势 key 永不覆盖写，不回收会无限堆积，
+而 `/stats` 每 5 秒全扫一次，堆积直接变成刷新开销。
+
+`STATS_KV` 环境变量控制模式：未设 = 完全跳过 KV（零开销
 降级，其余测试不受影响）；`memory` = :memory: KV 走全链路（测试用）；
 `kv` = 默认 openKv()（Deploy 上连平台数据库，本地会落文件）。
 
@@ -263,6 +291,8 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - 归因字段必须同时写进 KV（`usage-stats-kv.ts` 的 `REASON_FIELD` 与
   `MODEL_FIELDS`）。生产上 `/stats` 的聚合读的是 KV，只留进程内的话
   用户看到的三个分项永远是 0。
+- 趋势必须由 `trendBuckets` 而非 `recent` 计算（见上文，形状会失真）。
+- `['live']` 的写入必须经 `enqueueLive` 串行，绕过它直接 CAS 会丢明细。
 
 ## 测试策略
 
