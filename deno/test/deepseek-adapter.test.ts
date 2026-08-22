@@ -493,3 +493,262 @@ Deno.test('DeepSeek adapter sends timeout signal to upstream fetch', async () =>
     }
   }
 });
+
+/**
+ * 以下用例覆盖「Claude Code 提前停下」的根因：
+ * 历史工具轮被转录成 `Previous assistant tool request:` 文本后，上游会模仿该格式
+ * 输出新的工具调用。若兜底解析器不认识这个格式，响应就退化成纯文本 +
+ * stop_reason=end_turn，客户端据此判定回合结束、agent 循环中断。
+ */
+
+function stubUpstreamContent(
+  content: unknown[],
+  stopReason: string | null = 'end_turn',
+): () => void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init?.body as string) as AnthropicRequest;
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: 'msg_textual',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content,
+          stop_reason: stopReason,
+          usage: { input_tokens: 10, output_tokens: 8 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
+function newAdapter(): AnthropicApiAdapter {
+  return new AnthropicApiAdapter({
+    enabled: true,
+    provider: 'deepseek',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    apiKey: 'deepseek-token',
+    model: 'deepseek-v4-flash',
+  });
+}
+
+const READ_TOOL = {
+  name: 'Read',
+  description: 'Read file',
+  input_schema: {
+    type: 'object',
+    properties: { file_path: { type: 'string' }, limit: { type: 'number' } },
+    required: ['file_path'],
+  },
+};
+
+Deno.test('DeepSeek adapter 还原 Previous-assistant-tool-request 文本为结构化 tool_use', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text:
+      '我需要看一下类型定义。\nPrevious assistant tool request: name=Read id=call_00_ET_v5o8iA3 input_json={"file_path":"deno/src/types/sider.ts","limit":60}',
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'review sider.ts' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    // 核心断言：必须变回 tool_use，否则 Claude Code 会认为回合结束而停下。
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content.length, 2);
+    assertEquals(response.content[0].type, 'text');
+    assertEquals(response.content[1].type, 'tool_use');
+    if (response.content[1].type === 'tool_use') {
+      assertEquals(response.content[1].name, 'Read');
+      assertEquals(response.content[1].id, 'call_00_ET_v5o8iA3');
+      assertEquals(response.content[1].input.file_path, 'deno/src/types/sider.ts');
+      assertEquals(response.content[1].input.limit, 60);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 还原多行 Previous-assistant-tool-request（log 中的真实形态）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: [
+      'Previous assistant tool request: name=Read id=call_00_ET input_json={"file_path":"a.ts","limit":60}',
+      'Previous assistant tool request: name=Bash id=call_01_6I0z input_json={"command":"grep -n toolUses x.ts","description":"See how toolUses extracted"}',
+    ].join('\n'),
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'inspect' }],
+      max_tokens: 128,
+      tools: [READ_TOOL, {
+        name: 'Bash',
+        description: 'Run shell',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' }, description: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content.length, 2);
+    assertEquals(response.content[0].type, 'tool_use');
+    assertEquals(response.content[1].type, 'tool_use');
+    if (response.content[1].type === 'tool_use') {
+      assertEquals(response.content[1].name, 'Bash');
+      assertEquals(response.content[1].input.command, 'grep -n toolUses x.ts');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 不把复述历史的 tool_use id 当成新调用（防重复执行）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text:
+      '回顾一下之前做的事：\nPrevious assistant tool request: name=Bash id=toolu_history_1 input_json={"command":"rm -rf build"}',
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{
+        role: 'assistant',
+        // 这个 id 已经在历史里出现过 —— 模型是在复述，不是发起新调用。
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_history_1',
+          name: 'Bash',
+          input: { command: 'rm -rf build' },
+        }],
+      }, {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_history_1', content: 'done' }],
+      }],
+      max_tokens: 128,
+      tools: [{
+        name: 'Bash',
+        description: 'Run shell',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+
+    // 必须保持文本，否则写操作会被重复执行一次。
+    assertEquals(response.stop_reason, 'end_turn');
+    assertEquals(response.content.length, 1);
+    assertEquals(response.content[0].type, 'text');
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 的防模仿提示词禁止实际在用的转录格式', async () => {
+  const calls: { body: AnthropicRequest }[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(init?.body as string) as AnthropicRequest;
+    calls.push({ body });
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: 'msg_protocol',
+          type: 'message',
+          role: 'assistant',
+          model: body.model,
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    const userContent = calls[0].body.messages[0].content;
+    if (typeof userContent !== 'string') {
+      throw new Error('断言失败：期望 user content 为文本');
+    }
+    // 提示词必须点名上下文里真实出现的格式，否则等于没禁。
+    assertEquals(userContent.includes('Previous assistant tool request'), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('DeepSeek adapter 保留正常文本，不误判普通句子为工具调用', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: '这里说明一下 Previous assistant tool request 这个转录格式的来历，但它不是调用。',
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'explain' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'end_turn');
+    assertEquals(response.content.length, 1);
+    assertEquals(response.content[0].type, 'text');
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 结构化 tool_use 存在时不触发文本兜底', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: 'Previous assistant tool request: name=Read id=call_x input_json={"file_path":"a.ts"}',
+  }, {
+    type: 'tool_use',
+    id: 'toolu_real',
+    name: 'Read',
+    input: { file_path: 'b.ts' },
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'go' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content.length, 2);
+    // 文本块原样保留，不被拆解。
+    assertEquals(response.content[0].type, 'text');
+    assertEquals(response.content[1].type, 'tool_use');
+  } finally {
+    restore();
+  }
+});

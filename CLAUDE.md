@@ -122,6 +122,18 @@ RouterEngine
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
 - DeepSeek 对历史工具轮的 thinking passback 校验很严格；请求侧不要把 Claude Code 压缩后的历史 `thinking` / `tool_use` / `tool_result` 结构原样转发，应转成文本上下文。
+- 历史工具轮被转录成文本后，上游会把转录格式当成调用协议模仿，输出纯文本的
+  「工具调用」。这会让响应退化成 `stop_reason: end_turn` 且无 `tool_use` 块，
+  Claude Code 据此判定回合结束、**agent 循环提前停止**。因此：
+  1. `parseTextualToolUseLine` 必须认识**当前 sanitize 实际产出的每一种格式**
+     （`Previous assistant tool request:` 与 `[tool_use:Name]`）。改转录格式时
+     必须同步改这个解析器，否则兜底网会对着自己的输出漏掉。
+  2. 还原出 `tool_use` 后，`stop_reason` 必须由 `end_turn` 改判为 `tool_use`。
+  3. 还原带 guard：行内 id 若已出现在本次请求历史的 `tool_use.id` /
+     `tool_result.tool_use_id` 中，说明模型在复述历史而非发起新调用，保持文本
+     不还原——否则 `Bash`/`Write` 这类写操作会被重复执行一次。
+  4. 防模仿提示词（`applyToolProtocolInstruction`）点名的格式必须与上下文里
+     真实出现的转录格式一致，否则等于没禁。
 
 ## 模型清单
 
@@ -232,9 +244,17 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - DeepSeek 原生 `tool_use` 能力补齐。
 - DeepSeek 响应侧 `thinking` / `redacted_thinking` 透传。
 - Claude Code 工具续轮历史转录，避免 DeepSeek `content[].thinking` passback 400。
+- 文本工具调用兜底：两种转录格式都能还原成 `tool_use` 且 `stop_reason` 改判，
+  复述历史 id 不还原，普通文本不误判。
 - Sider 的 SSE 内业务错误码（如 1135 用量超限）必须上抛，不能吞成空回复。
 - 带工具的 `tool_result` 续轮不得被会话延续规则路由回 Sider。
 - 重复响应缓存按流式隔离，流式响应不得被等价非流式请求回放。
+
+Node/Bun 侧适配器单元测试（mock fetch，不需要起服务）：
+
+- `test/deepseek-adapter.unit.test.ts`，由 `npm run test:unit:node` 单跑，
+  已并入 `npm run test:regression`。与 `deno/test/deepseek-adapter.test.ts`
+  对应，保证双运行时的适配器行为同步。
 
 Deno 集成回归测试库（打真实实例，`deno task test:e2e`）：
 

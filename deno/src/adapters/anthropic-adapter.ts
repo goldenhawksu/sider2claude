@@ -111,7 +111,12 @@ export class AnthropicApiAdapter {
     }
 
     const data = await response.json() as unknown;
-    const normalized = this.normalizeResponse(data, outwardModel, logContext);
+    const normalized = this.normalizeResponse(
+      data,
+      outwardModel,
+      logContext,
+      collectHistoryToolUseIds(request.messages),
+    );
     const elapsed = Date.now() - startTime;
 
     logInfo('upstream_response', {
@@ -197,7 +202,11 @@ export class AnthropicApiAdapter {
 
     return this.appendInstructionToLastUser(
       messages,
-      'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. Do not write textual tool-call transcripts such as [tool_use:Name] in normal text.',
+      'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. ' +
+        'Lines like "Previous assistant tool request: name=... id=... input_json=..." and ' +
+        '"Previous tool result: ..." are a read-only transcript of what already happened. ' +
+        'Never reproduce those lines to request a tool, and never write textual tool-call ' +
+        'transcripts such as [tool_use:Name] in normal text.',
     );
   }
 
@@ -314,6 +323,7 @@ export class AnthropicApiAdapter {
     data: unknown,
     outwardModel: string,
     logContext?: RequestLogContext,
+    historyToolUseIds?: Set<string>,
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -328,7 +338,7 @@ export class AnthropicApiAdapter {
       throw new Error(`${this.provider} API error: ${message}`);
     }
 
-    const content = this.normalizeContent(raw.content, logContext);
+    const content = this.normalizeContent(raw.content, logContext, historyToolUseIds);
     const usage = this.normalizeUsage(raw.usage);
     const stopReason = this.normalizeStopReason(raw.stop_reason);
     const hasToolUse = content.some((block) => block.type === 'tool_use');
@@ -350,6 +360,7 @@ export class AnthropicApiAdapter {
   private normalizeContent(
     content: unknown,
     logContext?: RequestLogContext,
+    historyToolUseIds?: Set<string>,
   ): AnthropicResponseContent[] {
     if (!Array.isArray(content) || content.length === 0) {
       throw new Error(`${this.provider} API response missing content array`);
@@ -402,12 +413,21 @@ export class AnthropicApiAdapter {
       return normalized;
     }
 
-    const converted = this.normalizeTextualToolUseBlocks(normalized);
+    const converted = this.normalizeTextualToolUseBlocks(normalized, historyToolUseIds);
     if (converted.toolUseCount > 0) {
       logWarn('textual_tool_use_normalized', {
         ...this.contextFields(logContext),
         provider: this.provider,
         toolUseCount: converted.toolUseCount,
+      });
+    }
+    if (converted.replayedCount > 0) {
+      // 模型在复述历史工具轮而非发起新调用。还原它会重复执行一次工具
+      // （含 Bash/Write 这类写操作），故保持文本。
+      logWarn('textual_tool_use_replay_skipped', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        replayedCount: converted.replayedCount,
       });
     }
 
@@ -416,9 +436,11 @@ export class AnthropicApiAdapter {
 
   private normalizeTextualToolUseBlocks(
     blocks: AnthropicResponseContent[],
-  ): { content: AnthropicResponseContent[]; toolUseCount: number } {
+    historyToolUseIds?: Set<string>,
+  ): { content: AnthropicResponseContent[]; toolUseCount: number; replayedCount: number } {
     const next: AnthropicResponseContent[] = [];
     let toolUseCount = 0;
+    let replayedCount = 0;
 
     for (const block of blocks) {
       if (block.type !== 'text') {
@@ -445,6 +467,13 @@ export class AnthropicApiAdapter {
           continue;
         }
 
+        // id 已在本次请求历史里出现 = 模型在复述，不是新调用。
+        if (toolUse.type === 'tool_use' && historyToolUseIds?.has(toolUse.id)) {
+          replayedCount += 1;
+          pendingText.push(line);
+          continue;
+        }
+
         flushText();
         convertedParts.push(toolUse);
         toolUseCount += 1;
@@ -460,11 +489,24 @@ export class AnthropicApiAdapter {
       next.push(...convertedParts);
     }
 
-    return { content: next, toolUseCount };
+    return { content: next, toolUseCount, replayedCount };
   }
 
+  /**
+   * 还原被模型当成调用协议模仿出来的文本工具调用。
+   *
+   * 支持两种转录格式：
+   * - `Previous assistant tool request: name=X id=Y input_json={...}`（当前 sanitize 产出）
+   * - `[tool_use:X] id=Y input={...}`（历史格式，Node 侧与 message-format 仍在用）
+   *
+   * 不还原就会退化成纯文本 + stop_reason=end_turn，Claude Code 据此结束 agent 循环。
+   */
   private parseTextualToolUseLine(line: string): AnthropicResponseContent | undefined {
-    const match = line.trim().match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=(.+)$/);
+    const trimmed = line.trim();
+    const match = trimmed.match(
+      /^Previous assistant tool request:\s*name=(\S+)\s+id=(\S+)\s+input_json=(.+)$/,
+    ) ||
+      trimmed.match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=(.+)$/);
     if (!match) {
       return undefined;
     }
@@ -666,6 +708,27 @@ export class AnthropicApiAdapter {
 
     throw error;
   }
+}
+
+/**
+ * 采集本次请求历史里已出现的 tool_use id。
+ * 用于识别「模型复述历史」而非发起新调用，避免还原后重复执行工具。
+ */
+function collectHistoryToolUseIds(messages: AnthropicRequest['messages']): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content) {
+      if (block.type === 'tool_use' && block.id) {
+        ids.add(block.id);
+      } else if (block.type === 'tool_result' && block.tool_use_id) {
+        ids.add(block.tool_use_id);
+      }
+    }
+  }
+  return ids;
 }
 
 function parseTimeoutMs(): number {
