@@ -34,9 +34,21 @@ function compact(n: number): string {
   return String(n);
 }
 
+/**
+ * 看板时区：固定 UTC+8（北京/上海）。
+ *
+ * 不能用 `Date#getHours()` —— 那读的是运行时本地时区。服务跑在 Deno Deploy
+ * 上（进程时区为 UTC），页面会比北京时间晚 8 小时；而开发机若本身在 UTC+8，
+ * 本地又完全看不出问题。故统一按固定偏移换算，与运行时时区无关。
+ */
+const DISPLAY_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
+const DISPLAY_TZ_LABEL = 'UTC+8';
+
 function hhmm(iso: string): string {
-  const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const shifted = new Date(new Date(iso).getTime() + DISPLAY_TZ_OFFSET_MS);
+  return `${String(shifted.getUTCHours()).padStart(2, '0')}:${
+    String(shifted.getUTCMinutes()).padStart(2, '0')
+  }`;
 }
 
 /** 分类槽位 1-8，超出的模型折叠成「其他」而不是循环取色。 */
@@ -89,7 +101,9 @@ function trendChart(trend: TrendBucket[]): string {
   const y = (v: number) => PAD_T + plotH - (v / peak) * plotH;
 
   const line = (pick: (b: TrendBucket) => number) =>
-    trend.map((b, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(' ');
+    trend.map((b, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(
+      ' ',
+    );
   const area = (pick: (b: TrendBucket) => number) =>
     `${line(pick)} L${x(trend.length - 1).toFixed(1)},${(PAD_T + plotH).toFixed(1)} L${
       x(0).toFixed(1)
@@ -98,7 +112,9 @@ function trendChart(trend: TrendBucket[]): string {
   // 4 条横向参考线，recessive 处理
   const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
     const gy = PAD_T + plotH - f * plotH;
-    return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${gy.toFixed(1)}" class="grid"/>
+    return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${
+      gy.toFixed(1)
+    }" class="grid"/>
       <text x="${PAD_L - 8}" y="${(gy + 4).toFixed(1)}" class="tick" text-anchor="end">${
       compact(Math.round(peak * f))
     }</text>`;
@@ -175,26 +191,30 @@ export function renderStatsPage(snapshot: UsageSnapshot): string {
 
   const modelRows = shown.length === 0
     ? `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`
-    : shown.map((m, i) => `<tr>
+    : shown.map((m, i) =>
+      `<tr>
         <td><i class="dot" style="background:var(--s${i + 1})"></i>${esc(m.model)}</td>
         <td class="num">${m.requests}</td>
         <td class="num">${compact(m.totalTokens)}</td>
         <td class="num muted">${compact(m.inputTokens)}</td>
         <td class="num muted">${compact(m.outputTokens)}</td>
-      </tr>`).join('');
+      </tr>`
+    ).join('');
 
   const recentRows = snapshot.recent.length === 0
     ? `<tr><td colspan="6" class="empty-row">暂无数据</td></tr>`
-    : snapshot.recent.map((r) => `<tr>
+    : snapshot.recent.map((r) =>
+      `<tr>
         <td class="num muted">${hhmm(r.time)}</td>
         <td><span class="tag ${r.backend}">${r.backend}</span></td>
         <td>${esc(r.model)}</td>
         <td>${r.fallback ? '<span class="tag warn">fallback</span>' : ''}${
-      r.stream ? '<span class="tag ghost">stream</span>' : ''
-    }</td>
+        r.stream ? '<span class="tag ghost">stream</span>' : ''
+      }</td>
         <td>${r.tools.length ? esc(r.tools.join(', ')) : '<span class="muted">—</span>'}</td>
         <td class="num muted">${r.ms}ms</td>
-      </tr>`).join('');
+      </tr>`
+    ).join('');
 
   const toolRows = snapshot.tools.length === 0
     ? `<p class="muted small">暂无工具调用</p>`
@@ -319,7 +339,9 @@ a { color: var(--s1); }
 <body>
 <header>
   <h1>Sider2Claude 用量统计</h1>
-  <span class="sub">自 ${esc(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a></span>
+  <span class="sub">自 ${
+    esc(hhmm(snapshot.since))
+  } 起 · 近 24 小时趋势 · 时间为 ${DISPLAY_TZ_LABEL} · <a href="/">服务信息</a></span>
 </header>
 
 <div class="grid-3">
@@ -381,7 +403,11 @@ a { color: var(--s1); }
 
 <footer>
   ${esc(snapshot.note)}<br>
-  ${snapshot.persisted ? '聚合数据已持久化（Deno KV）。' : '⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。'}
+  ${
+    snapshot.persisted
+      ? '聚合数据已持久化（Deno KV）。'
+      : '⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。'
+  }
   缓存回放 ${totals.cachedReplays} 次（命中重复响应缓存、未触达上游，故不计入上方请求数）。
   流式请求 ${totals.streaming} 次；Sider 流式不回传 token 用量，Token 总量以非流式请求为准。
 </footer>

@@ -196,6 +196,13 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
   `GET /stats.json` 返回同一份快照的原始 JSON。
 - 配色取 dataviz 参考调色板前三个分类槽位（浅深两套已过 validate_palette），
   模型超过 8 个折叠为「其他」，绝不循环取色；模型名/工具名经 HTML 转义。
+- 页面所有时间戳按固定 **UTC+8**（北京/上海）渲染，页头标注时区。
+  绝不能用 `Date#getHours()` / `getMinutes()` —— 那读运行时本地时区，
+  Deno Deploy 进程时区是 UTC，页面会晚 8 小时。用
+  `new Date(ts + DISPLAY_TZ_OFFSET_MS)` 配 `getUTCHours()` 换算。
+  注意：开发机若本身在 UTC+8，`getHours()` 会碰巧正确，本地测不出问题，
+  因此 `deno/test/stats-page.test.ts` 里有一例通过替换全局 `Date`
+  模拟 UTC 运行时来守这条线，改时间渲染时不要删。
 
 实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致，
 `stats-page.ts` 同）。

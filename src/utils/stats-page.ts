@@ -34,9 +34,21 @@ function compact(n: number): string {
   return String(n);
 }
 
+/**
+ * 看板时区：固定 UTC+8（北京/上海）。
+ *
+ * 不能用 `Date#getHours()` —— 那读的是运行时本地时区。服务跑在 Deno Deploy
+ * 上（进程时区为 UTC），页面会比北京时间晚 8 小时；而开发机若本身在 UTC+8，
+ * 本地又完全看不出问题。故统一按固定偏移换算，与运行时时区无关。
+ */
+const DISPLAY_TZ_OFFSET_MS = 8 * 60 * 60 * 1000;
+const DISPLAY_TZ_LABEL = 'UTC+8';
+
 function hhmm(iso: string): string {
-  const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const shifted = new Date(new Date(iso).getTime() + DISPLAY_TZ_OFFSET_MS);
+  return `${String(shifted.getUTCHours()).padStart(2, '0')}:${
+    String(shifted.getUTCMinutes()).padStart(2, '0')
+  }`;
 }
 
 /** 分类槽位 1-8，超出的模型折叠成「其他」而不是循环取色。 */
@@ -319,7 +331,7 @@ a { color: var(--s1); }
 <body>
 <header>
   <h1>Sider2Claude 用量统计</h1>
-  <span class="sub">自 ${esc(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · <a href="/">服务信息</a></span>
+  <span class="sub">自 ${esc(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · 时间为 ${DISPLAY_TZ_LABEL} · <a href="/">服务信息</a></span>
 </header>
 
 <div class="grid-3">
