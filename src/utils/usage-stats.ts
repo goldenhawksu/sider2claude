@@ -104,6 +104,8 @@ export interface UsageSnapshot {
     tokens: number;
   }>;
   note: string;
+  /** 聚合数据是否来自持久层；Node 运行时无 Deno KV，恒为 false。 */
+  persisted: boolean;
 }
 
 const startedAt = Date.now();
@@ -245,7 +247,16 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
       tokens: record.inputTokens + record.outputTokens,
     })),
     note: '进程内统计，实例重启后清零；Deno Deploy 各隔离实例独立，仅代表当前实例',
+    persisted: false,
   };
+}
+
+/**
+ * Node/Bun 运行时没有 Deno KV，合并快照等价于进程内快照；
+ * 保留同名导出使两侧调用方代码一致。
+ */
+export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot> {
+  return getUsageSnapshot(now);
 }
 
 /** 仅供测试使用。 */

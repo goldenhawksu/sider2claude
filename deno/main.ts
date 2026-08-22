@@ -14,7 +14,7 @@ import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
 import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
-import { getUsageSnapshot } from './src/utils/usage-stats.ts';
+import { getStatsSnapshot } from './src/utils/usage-stats.ts';
 import { renderStatsPage } from './src/utils/stats-page.ts';
 
 const app = new Hono();
@@ -47,7 +47,7 @@ app.get('/health', (c) => {
 });
 
 // 根路径信息
-app.get('/', (c) => {
+app.get('/', async (c) => {
   return c.json({
     name: 'Sider2Claude',
     description: 'Convert Sider AI API to Anthropic API format for Claude Code compatibility',
@@ -74,17 +74,17 @@ app.get('/', (c) => {
       backends: ['sider', 'deepseek'],
       capability_fallback: 'deepseek',
     },
-    usage: getUsageSnapshot(),
+    usage: await getStatsSnapshot(),
   });
 });
 
 // 用量看板：/stats 返回 HTML 页面，/stats.json 返回同一份快照的原始数据
-app.get('/stats', (c) => {
-  return c.html(renderStatsPage(getUsageSnapshot()));
+app.get('/stats', async (c) => {
+  return c.html(renderStatsPage(await getStatsSnapshot()));
 });
 
-app.get('/stats.json', (c) => {
-  return c.json(getUsageSnapshot());
+app.get('/stats.json', async (c) => {
+  return c.json(await getStatsSnapshot());
 });
 
 // 注册 API 路由

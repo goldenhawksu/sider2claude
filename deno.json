@@ -4,12 +4,12 @@
     "entrypoint": "deno/main.ts"
   },
   "tasks": {
-    "dev": "deno run --allow-net --allow-env --allow-read --watch deno/main.ts",
-    "start": "deno run --allow-net --allow-env --allow-read deno/main.ts",
+    "dev": "deno run --unstable-kv --allow-net --allow-env --allow-read --watch deno/main.ts",
+    "start": "deno run --unstable-kv --allow-net --allow-env --allow-read deno/main.ts",
     "check": "deno check deno/main.ts",
-    "test": "deno test --allow-env --allow-read=deno deno/test",
+    "test": "deno test --unstable-kv --allow-env --allow-read=deno deno/test",
     "test:e2e": "deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts",
-    "regression": "deno test --allow-env --allow-read=deno deno/test && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts && deno check deno/test/integration/run.ts",
+    "regression": "deno test --unstable-kv --allow-env --allow-read=deno deno/test && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts && deno check deno/test/integration/run.ts",
     "probe:sider": "deno run --allow-net --allow-env --allow-read --allow-write deno/tools/probe-sider-capabilities.ts",
     "lint": "deno lint deno/",
     "fmt": "deno fmt deno/"

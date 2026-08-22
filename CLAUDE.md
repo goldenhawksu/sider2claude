@@ -191,12 +191,31 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 模式（先走完非流式再转 SSE），因此只在非流式完成点埋一次、用请求自身的 stream
 标志区分，避免双计。
 
+持久化（解决"打开 /stats 看到全 0"）：Deno Deploy 会拉起多个隔离实例并
+回收空闲实例，纯进程内统计在生产上几乎必然让用户命中空实例。聚合数据
+（总量/模型/趋势/工具频次）由 `deno/src/utils/usage-stats-kv.ts` 写入
+Deno KV——每请求的全部增量编码成一次 atomic commit（多个 sum mutation），
+fire-and-forget 不阻塞响应。`recent` 明细与 `lastHour` 保留进程内（快照的
+`note` 已注明）。`STATS_KV` 环境变量控制模式：未设 = 完全跳过 KV（零开销
+降级，其余测试不受影响）；`memory` = :memory: KV 走全链路（测试用）；
+`kv` = 默认 openKv()（Deploy 上连平台数据库，本地会落文件）。
+
+KV 仍属 unstable API：类型靠文件顶部的 `/// <reference lib="deno.unstable" />`，
+运行时需要 `--unstable-kv`（deno.json 的 dev/start/test/regression 已加；
+Deploy 平台默认开放）。`usage-stats-kv.ts` 仅 Deno 侧存在，Node/Bun 运行时
+无 Deno KV——`src/utils/usage-stats.ts` 的 `getStatsSnapshot()` 恒返回进程内
+快照，两侧调用方代码保持一致。
+
+启用生产持久化的平台步骤（代码无法替代）：Deno Deploy 后台 Databases 里
+Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量里加
+`STATS_KV=kv`。未配置时自动降级，页脚会显示"未持久化"警示。
+
 约束：
 
 - `recent` 只记白名单字段，不得混入消息内容、token 或请求参数。
-- 统计是进程内的，实例重启清零，Deno Deploy 各隔离实例独立——这是有意的
-  观测便利，不是计费依据，`note` 字段已对外声明。
 - 回放请求不计入 `requests` 与占比，否则会稀释"由谁完成"的真实比例。
+- KV 写失败必须静默（进程内统计仍在），KV 读带 2s 超时并回退进程内——
+  统计永远不能拖垮或阻塞请求。
 
 ## 测试策略
 

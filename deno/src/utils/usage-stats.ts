@@ -1,16 +1,24 @@
 /**
- * 进程内用量统计。
+ * 进程内用量统计，聚合部分可选持久化到 Deno KV。
  *
- * 回答三个问题：最近的调用由谁完成（sider 还是 deepseek）、比例是多少、
- * 工具被调用的频次。数据取自每个请求的完成点，不接触消息内容。
+ * 为什么需要 KV：Deno Deploy 会按需拉起多个隔离实例、也会回收空闲实例，
+ * 纯进程内统计在本地单实例上工作良好，但在生产上用户打开 /stats 很可能
+ * 命中一个空实例（全是 0）。聚合数据（总量/模型/趋势/工具频次）写入 KV
+ * 后跨实例、跨重启持久；`recent` 明细与 `lastHour` 保留进程内（页脚注明）。
  *
- * 边界（诚实声明，不是缺陷）：
- * - 统计是进程内的，实例重启清零；Deno Deploy 的每个隔离实例各自独立，
- *   快照只代表处理过该请求的那个实例。
- * - 无持久化是有意的：这是观测便利，不是计费依据。
+ * 降级是显式的：STATS_KV 未设或为 "memory" 时用 :memory: KV（行为同旧版，
+ * 重启清零且不落文件）；设为 "kv" 时用默认 openKv()——在 Deploy 上连接
+ * 平台分配的数据库（需先在后台 Provision 并关联），本地则会写文件。
+ * KV 任何读写失败都静默回退进程内，绝不影响请求路径。
  */
 
 import type { Backend } from '../config/backends.ts';
+import {
+  persistCachedReplay,
+  persistUsage,
+  readPersistentStats,
+  type PersistentStats,
+} from './usage-stats-kv.ts';
 
 /** 最近明细的保留上限；内存占用很小（每条约 200 字节）。 */
 const RECENT_LIMIT = 200;
@@ -104,6 +112,8 @@ export interface UsageSnapshot {
     tokens: number;
   }>;
   note: string;
+  /** 聚合数据是否来自持久层（跨实例）；false 表示仅当前进程。 */
+  persisted: boolean;
 }
 
 const startedAt = Date.now();
@@ -162,6 +172,8 @@ export function recordUsage(record: UsageRecord): void {
   if (recent.length > RECENT_LIMIT) {
     recent.length = RECENT_LIMIT;
   }
+
+  persistUsage(record); // fire-and-forget，KV 未启用时内部直接返回
 }
 
 /**
@@ -171,6 +183,7 @@ export function recordUsage(record: UsageRecord): void {
  */
 export function recordCachedReplay(): void {
   totals.cachedReplays += 1;
+  persistCachedReplay();
 }
 
 /**
@@ -245,6 +258,63 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
       tokens: record.inputTokens + record.outputTokens,
     })),
     note: '进程内统计，实例重启后清零；Deno Deploy 各隔离实例独立，仅代表当前实例',
+    persisted: false,
+  };
+}
+
+
+/**
+ * 合并快照：聚合取 KV 持久层（跨实例、跨重启），明细与 lastHour 取进程内。
+ * KV 未启用 / 不可用 / 读取超时（内部 2s）时退回纯进程内快照。
+ * `/stats`、`/stats.json`、`GET /` 的 usage 都应使用本函数。
+ */
+export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot> {
+  const local = getUsageSnapshot(now);
+  const persistent = await readPersistentStats();
+  if (!persistent) {
+    return local;
+  }
+
+  const pct = (part: number) =>
+    persistent.totals.requests === 0
+      ? '0%'
+      : `${Math.round((part / persistent.totals.requests) * 100)}%`;
+
+  // 近 24 个小时桶，空桶保留（KV 里可能还没有这些桶的 key）
+  const currentBucket = Math.floor(now / BUCKET_MS) * BUCKET_MS;
+  const byBucket = new Map(persistent.trend.map((t) => [t.bucket, t]));
+  const trend: TrendBucket[] = [];
+  for (let i = BUCKET_COUNT - 1; i >= 0; i -= 1) {
+    const at = currentBucket - i * BUCKET_MS;
+    const row = byBucket.get(at);
+    trend.push({
+      at: new Date(at).toISOString(),
+      requests: row?.requests ?? 0,
+      inputTokens: row?.inputTokens ?? 0,
+      outputTokens: row?.outputTokens ?? 0,
+      sider: row?.sider ?? 0,
+      deepseek: row?.deepseek ?? 0,
+    });
+  }
+
+  return {
+    ...local,
+    since: new Date(persistent.since).toISOString(),
+    totals: { ...persistent.totals },
+    backendShare: {
+      sider: pct(persistent.totals.sider),
+      deepseek: pct(persistent.totals.deepseek),
+    },
+    models: persistent.models
+      .map((m) => ({
+        ...m,
+        totalTokens: m.inputTokens + m.outputTokens,
+      }))
+      .sort((a, b) => b.requests - a.requests),
+    tools: persistent.tools.slice(0, 8),
+    trend,
+    note: '聚合数据持久化于 Deno KV，跨实例、跨重启累计；最近请求明细与最近 1 小时窗口仅当前实例',
+    persisted: true,
   };
 }
 

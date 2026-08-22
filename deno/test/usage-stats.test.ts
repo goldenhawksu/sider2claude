@@ -33,7 +33,7 @@ function rec(overrides: Partial<UsageRecord> = {}): UsageRecord {
   };
 }
 
-Deno.test('用量统计：无请求时占比为 0% 而非除零', () => {
+Deno.test({ name: '用量统计：无请求时占比为 0% 而非除零', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   const snap = getUsageSnapshot();
 
@@ -44,7 +44,7 @@ Deno.test('用量统计：无请求时占比为 0% 而非除零', () => {
   assertEquals(snap.tools.length, 0, 'tools 条数');
 });
 
-Deno.test('用量统计：后端计数与占比', () => {
+Deno.test({ name: '用量统计：后端计数与占比', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   for (let i = 0; i < 3; i += 1) recordUsage(rec({ backend: 'sider' }));
   recordUsage(rec({ backend: 'deepseek' }));
@@ -57,7 +57,7 @@ Deno.test('用量统计：后端计数与占比', () => {
   assertEquals(snap.backendShare.deepseek, '25%', 'deepseek 占比');
 });
 
-Deno.test('用量统计：fallback 与流式分别计数', () => {
+Deno.test({ name: '用量统计：fallback 与流式分别计数', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'deepseek', fallback: true }));
   recordUsage(rec({ backend: 'sider', stream: true }));
@@ -70,7 +70,7 @@ Deno.test('用量统计：fallback 与流式分别计数', () => {
   assertEquals(snap.totals.requests, 3, 'requests');
 });
 
-Deno.test('用量统计：工具频次按次数降序，取 Top 8', () => {
+Deno.test({ name: '用量统计：工具频次按次数降序，取 Top 8', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'deepseek', toolUses: ['Bash', 'Read'] }));
   recordUsage(rec({ backend: 'deepseek', toolUses: ['Bash'] }));
@@ -87,7 +87,7 @@ Deno.test('用量统计：工具频次按次数降序，取 Top 8', () => {
   assertEquals(snap.tools.length, 8, 'Top 8 截断');
 });
 
-Deno.test('用量统计：最近明细新在前，且不含消息内容', () => {
+Deno.test({ name: '用量统计：最近明细新在前，且不含消息内容', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ model: 'first' }));
   recordUsage(rec({ model: 'second', backend: 'deepseek', toolUses: ['Bash'] }));
@@ -104,7 +104,7 @@ Deno.test('用量统计：最近明细新在前，且不含消息内容', () => 
   assertEquals(actual.join(','), allowed.sort().join(','), 'recent 字段集合');
 });
 
-Deno.test('用量统计：最近明细只展示 10 条，但总计不受影响', () => {
+Deno.test({ name: '用量统计：最近明细只展示 10 条，但总计不受影响', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   for (let i = 0; i < 25; i += 1) recordUsage(rec({ model: `m${i}` }));
 
@@ -114,7 +114,7 @@ Deno.test('用量统计：最近明细只展示 10 条，但总计不受影响',
   assertEquals(snap.totals.requests, 25, '总计不截断');
 });
 
-Deno.test('用量统计：缓存回放单独计数，不污染后端占比', () => {
+Deno.test({ name: '用量统计：缓存回放单独计数，不污染后端占比', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'sider' }));
   recordCachedReplay();
@@ -128,7 +128,7 @@ Deno.test('用量统计：缓存回放单独计数，不污染后端占比', () 
   assertEquals(snap.recent.length, 1, 'recent 不含回放');
 });
 
-Deno.test('用量统计：lastHour 只统计窗口内的请求', () => {
+Deno.test({ name: '用量统计：lastHour 只统计窗口内的请求', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ backend: 'sider' }));
   recordUsage(rec({ backend: 'deepseek', fallback: true }));
@@ -149,7 +149,7 @@ Deno.test('用量统计：lastHour 只统计窗口内的请求', () => {
   assertEquals(now.lastHour.fallbacks, 1, '当下窗口内 fallback');
 });
 
-Deno.test('用量统计：token 累计到总量与各模型', () => {
+Deno.test({ name: '用量统计：token 累计到总量与各模型', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ model: 'claude-opus-4.6', inputTokens: 100, outputTokens: 50 }));
   recordUsage(rec({ model: 'claude-opus-4.6', inputTokens: 200, outputTokens: 30 }));
@@ -166,7 +166,7 @@ Deno.test('用量统计：token 累计到总量与各模型', () => {
   assertEquals(snap.models[1].model, 'claude-haiku-4.5', '次位模型');
 });
 
-Deno.test('用量统计：模型聚合不受 recent 条数上限影响', () => {
+Deno.test({ name: '用量统计：模型聚合不受 recent 条数上限影响', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   // recent 上限 200；发 210 条后前 10 条会被滚掉，但模型累计必须完整
   for (let i = 0; i < 210; i += 1) {
@@ -177,7 +177,7 @@ Deno.test('用量统计：模型聚合不受 recent 条数上限影响', () => {
   assertEquals(snap.totals.inputTokens, 210, '总量不受截断影响');
 });
 
-Deno.test('用量统计：趋势固定 24 个桶且时间轴连续', () => {
+Deno.test({ name: '用量统计：趋势固定 24 个桶且时间轴连续', sanitizeResources: false, sanitizeOps: false }, () => {
   resetUsageStats();
   recordUsage(rec({ inputTokens: 5, outputTokens: 5 }));
 
