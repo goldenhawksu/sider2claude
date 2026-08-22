@@ -19,6 +19,7 @@ import {
 } from '../utils/request-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
 import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
+import { recordCachedReplay, recordUsage } from '../utils/usage-stats.ts';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter.ts';
 import {
   cleanupExpiredConversations,
@@ -120,6 +121,7 @@ messagesRouter.post('/', async (c: Context) => {
           stopReason: cached.response.stop_reason,
           contentBlocks: cached.response.content.length,
         });
+        recordCachedReplay();
 
         const cachedResponse = c.json(cached.response);
         cachedResponse.headers.set('X-Request-ID', logContext.requestId);
@@ -229,6 +231,17 @@ messagesRouter.post('/', async (c: Context) => {
       contentBlocks: response.content.length,
       elapsedMs,
     }, `Request completed via ${getBackendDisplayName(selectedBackend)}`);
+    recordUsage({
+      model: anthropicRequest.model,
+      backend: selectedBackend,
+      // 实际后端与路由初判不同 = 中途发生过 fallback。
+      fallback: selectedBackend !== decision.backend,
+      toolUses: response.content
+        .filter((block) => block.type === 'tool_use')
+        .map((block) => block.name),
+      stream: false,
+      ms: elapsedMs,
+    });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {
         requestId: logContext.requestId,
@@ -844,6 +857,14 @@ function createTrueSiderStreamingResponse(
           firstEventMs,
           elapsedMs,
         });
+        recordUsage({
+          model: outwardModel,
+          backend: 'sider',
+          fallback: false, // 流式设计上不做后端 fallback
+          toolUses: [], // Sider 不承接工具请求（路由保证），流内不会出现 tool_use
+          stream: true,
+          ms: elapsedMs,
+        });
         if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
           logWarn('slow_stream_request', {
             requestId: logContext.requestId,
@@ -990,6 +1011,16 @@ function createDeepSeekSynthesizedStreamingResponse(
           eventCount,
           firstEventMs,
           elapsedMs,
+        });
+        recordUsage({
+          model: request.model,
+          backend: 'deepseek',
+          fallback: false, // 流式设计上不做后端 fallback
+          toolUses: response.content
+            .filter((block) => block.type === 'tool_use')
+            .map((block) => block.name),
+          stream: true,
+          ms: elapsedMs,
         });
         if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
           logWarn('slow_stream_request', {

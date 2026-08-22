@@ -166,6 +166,29 @@ SIDER_PROBE_OUTPUT=sider-capability-probe-results.json
 
 probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默认提交。
 
+## 用量统计
+
+`GET /` 的响应里带 `usage` 字段，回答"最近的调用由谁完成、比例多少、工具用了多少"：
+
+- `totals`：真实上游调用数、sider/deepseek 各自次数、fallback 次数、流式次数、
+  工具调用次数，以及 `cachedReplays`（命中重复响应缓存、未触达上游的请求，
+  单列以解释"发了 N 次为何统计只有 M 次"）。
+- `backendShare`：后端占比；`lastHour`：最近 1 小时同口径聚合。
+- `tools`：工具调用频次 Top 8；`recent`：最近 10 条明细（时间/模型/后端/
+  是否 fallback/工具/是否流式/耗时）。
+
+实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致）。
+埋点在请求完成处：Deno 侧非流式与两条流式路径各埋一次；Node 侧流式是 buffered
+模式（先走完非流式再转 SSE），因此只在非流式完成点埋一次、用请求自身的 stream
+标志区分，避免双计。
+
+约束：
+
+- `recent` 只记白名单字段，不得混入消息内容、token 或请求参数。
+- 统计是进程内的，实例重启清零，Deno Deploy 各隔离实例独立——这是有意的
+  观测便利，不是计费依据，`note` 字段已对外声明。
+- 回放请求不计入 `requests` 与占比，否则会稀释"由谁完成"的真实比例。
+
 ## 测试策略
 
 确定性测试（mock 上游，`deno task test`）：

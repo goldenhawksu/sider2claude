@@ -14,6 +14,7 @@ import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
 import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
+import { getUsageSnapshot } from './src/utils/usage-stats.ts';
 
 const app = new Hono();
 
@@ -71,6 +72,7 @@ app.get('/', (c) => {
       backends: ['sider', 'deepseek'],
       capability_fallback: 'deepseek',
     },
+    usage: getUsageSnapshot(),
   });
 });
 

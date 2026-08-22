@@ -3,7 +3,13 @@
  * 这些端点不依赖上游，任何失败都是本服务问题。
  */
 
-import { assertEquals, assertStatus, assertTrue, type Suite } from '../harness.ts';
+import {
+  assertEquals,
+  assertStatus,
+  assertTrue,
+  bailIfUpstreamLimited,
+  type Suite,
+} from '../harness.ts';
 
 export const suite: Suite = {
   id: '01',
@@ -28,6 +34,52 @@ export const suite: Suite = {
         assertTrue(endpoints.length > 0, 'endpoints 非空');
         assertTrue(res.json?.features?.hybrid_routing === true, 'hybrid_routing 已开启');
         return `声明端点=${endpoints.length} backends=${JSON.stringify(res.json.features.backends)}`;
+      },
+    },
+    {
+      name: 'GET / 返回用量统计且结构完整',
+      async run({ api }) {
+        const res = await api.get('/', {});
+        assertStatus(res, 200);
+        const usage = res.json?.usage;
+        assertTrue(!!usage, 'usage 字段存在');
+        assertTrue(typeof usage.totals?.requests === 'number', 'totals.requests 是数字');
+        assertTrue(typeof usage.backendShare?.sider === 'string', 'backendShare.sider 是字符串');
+        assertTrue(Array.isArray(usage.tools), 'tools 是数组');
+        assertTrue(Array.isArray(usage.recent), 'recent 是数组');
+        assertTrue(typeof usage.lastHour?.requests === 'number', 'lastHour.requests 是数字');
+        assertTrue(!!usage.since && !!usage.note, 'since 与 note 非空');
+        return `requests=${usage.totals.requests} sider=${usage.backendShare.sider} ` +
+          `deepseek=${usage.backendShare.deepseek} tools=${usage.tools.length}`;
+      },
+    },
+    {
+      name: '用量统计随真实请求增长并记录后端',
+      async run({ api, config }) {
+        const before = (await api.get('/', {})).json.usage.totals.requests;
+
+        const chat = await api.post('/v1/messages', {
+          model: config.liveModel,
+          max_tokens: 64,
+          messages: [{ role: 'user', content: '只回答一个词：中国的首都是哪里？' }],
+        });
+        bailIfUpstreamLimited(chat, '用量统计用例上游限流');
+        assertStatus(chat, 200);
+
+        const usage = (await api.get('/', {})).json.usage;
+        assertTrue(
+          usage.totals.requests > before,
+          `请求计数增长（before=${before} after=${usage.totals.requests}）`,
+        );
+        assertTrue(usage.recent.length > 0, 'recent 有记录');
+
+        const latest = usage.recent[0];
+        assertTrue(
+          latest.backend === 'sider' || latest.backend === 'deepseek',
+          `最近一条记录了后端（实际 ${latest.backend}）`,
+        );
+        assertTrue(typeof latest.ms === 'number', '记录了耗时');
+        return `最近一次由 ${latest.backend} 完成，model=${latest.model} 耗时=${latest.ms}ms`;
       },
     },
     {

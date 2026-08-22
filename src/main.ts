@@ -17,6 +17,7 @@ import completeRouter from './routes/complete';
 import protocolRouter from './routes/protocols';
 import { router } from './routes';
 import { getEnv } from './utils/env';
+import { getUsageSnapshot } from './utils/usage-stats';
 
 const app = new Hono();
 const PORT = getEnv('PORT', '4141');
@@ -65,7 +66,7 @@ app.get('/', (c) => {
       backends: ['sider', 'deepseek'],
       capability_fallback: 'deepseek',
     },
-
+    usage: getUsageSnapshot(),
   });
 });
 

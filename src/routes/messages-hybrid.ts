@@ -22,6 +22,7 @@ import {
   validateAnthropicRequest,
 } from '../utils/request-converter';
 import { siderClient, SiderUpstreamError } from '../utils/sider-client';
+import { recordUsage } from '../utils/usage-stats';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
 import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
 import { cleanupExpiredSiderSessions, getSiderSessionStats } from '../utils/sider-session-manager';
@@ -184,6 +185,19 @@ messagesRouter.post('/', async (c: Context) => {
       contentBlocks: response.content.length,
       elapsedMs,
     }, `Request completed via ${getBackendDisplayName(selectedBackend)}`);
+    recordUsage({
+      model: anthropicRequest.model,
+      backend: selectedBackend,
+      // 实际后端与路由初判不同 = 中途发生过 fallback。
+      fallback: selectedBackend !== decision.backend,
+      toolUses: response.content
+        .filter((block: any) => block.type === 'tool_use')
+        .map((block: any) => block.name),
+      // Node 侧流式是 buffered 模式：先完成本流程再转 SSE，因此此处
+      // 用请求自身的 stream 标志，流式请求不会被误记为非流式。
+      stream: !!anthropicRequest.stream,
+      ms: elapsedMs,
+    });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {
         requestId: logContext.requestId,
