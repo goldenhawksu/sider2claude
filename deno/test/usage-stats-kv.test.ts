@@ -7,6 +7,7 @@
  */
 
 import { getStatsSnapshot, recordUsage, resetUsageStats } from '../src/utils/usage-stats.ts';
+import type { UsageSnapshot } from '../src/utils/usage-stats.ts';
 import { closeStatsKv } from '../src/utils/usage-stats-kv.ts';
 
 /** 显式启用 :memory: KV 并复位状态；结束后恢复环境并关闭 KV。 */
@@ -27,6 +28,30 @@ function assertEquals<T>(actual: T, expected: T, what = '值') {
   if (actual !== expected) {
     throw new Error(`${what}：期望 ${String(expected)}，实际 ${String(actual)}`);
   }
+}
+
+/**
+ * 轮询到快照满足条件为止。
+ *
+ * 不能用固定 sleep 等 KV 落库：写入是 fire-and-forget，且 `['live']` 的更新
+ * 还要排队串行提交，耗时随机器负载浮动。实测在与 `deno fmt` 并发时，固定
+ * 等待会偶发不够，让回归门禁无故变红——一个会偶发红的门禁等于没有门禁。
+ *
+ * 超时后照常返回最后一次快照，让断言给出真实差异而不是"超时"这种无信息报错。
+ */
+async function waitForStats(
+  ready: (snapshot: UsageSnapshot) => boolean,
+  timeoutMs = 8_000,
+): Promise<UsageSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = await getStatsSnapshot();
+
+  while (!ready(snapshot) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    snapshot = await getStatsSnapshot();
+  }
+
+  return snapshot;
 }
 
 Deno.test({
@@ -58,10 +83,8 @@ Deno.test({
       outputTokens: 8,
     });
 
-    // persistUsage 是 fire-and-forget，给它落库的时间
-    await new Promise((resolve) => setTimeout(resolve, 150));
-
-    const merged = await getStatsSnapshot();
+    // persistUsage 是 fire-and-forget，轮询到落库为止
+    const merged = await waitForStats((snap) => snap.totals.requests === 2);
     assertEquals(merged.persisted, true, ':memory: 模式下聚合应来自 KV 层');
     assertEquals(merged.totals.requests, 2, 'KV 请求总数');
     assertEquals(merged.totals.sider, 1, 'KV sider');
@@ -114,8 +137,6 @@ Deno.test({
       inputTokens: 1,
       outputTokens: 1,
     });
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
     const snap = await getStatsSnapshot();
     assertEquals(snap.persisted, false, 'KV 未启用');
     assertEquals(snap.recent.length, 1, 'recent 来自进程内');
@@ -156,9 +177,7 @@ Deno.test({
     recordUsage(opus('fallback'));
     recordUsage(opus('routing'));
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    const merged = await getStatsSnapshot();
+    const merged = await waitForStats((snap) => snap.totals.requests === 4);
     assertEquals(merged.persisted, true, '应来自 KV 层');
     assertEquals(merged.totals.deepseekTools, 2, 'KV 总量工具归因');
     assertEquals(merged.totals.deepseekFallback, 1, 'KV 总量受限兜底归因');
@@ -210,10 +229,8 @@ Deno.test({
     recordUsage(
       rec({ model: 'c', backend: 'deepseek', fallback: true, deepseekReason: 'fallback' }),
     );
-    await new Promise((resolve) => setTimeout(resolve, 600));
-
     resetUsageStats(); // 模拟命中另一个（空的）实例
-    const snap = await getStatsSnapshot();
+    const snap = await waitForStats((s) => s.recent.length === 3);
 
     assertEquals(snap.persisted, true, '应来自 KV');
     assertEquals(snap.recent.length, 3, 'recent 条数');
@@ -272,10 +289,8 @@ Deno.test({
         outputTokens: 0,
       });
     }
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-
     resetUsageStats();
-    const snap = await getStatsSnapshot();
+    const snap = await waitForStats((s) => s.lastHour.requests === 30);
     assertEquals(snap.recent.length, 10, '展示条数（KV 内保留 20 条，展示截 10）');
     assertEquals(snap.recent[0].model, 'x29', '最新一条没有被竞争吃掉');
     assertEquals(snap.lastHour.requests, 30, 'lastHour 计满 30 条');
@@ -299,9 +314,7 @@ Deno.test({
       inputTokens: 0,
       outputTokens: 0,
     });
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    const now = await getStatsSnapshot();
+    const now = await waitForStats((s) => s.lastHour.requests === 1);
     assertEquals(now.lastHour.requests, 1, '当下窗口内');
 
     // 把「现在」推到 2 小时后：那条记录应滑出窗口

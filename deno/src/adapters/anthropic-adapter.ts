@@ -116,6 +116,7 @@ export class AnthropicApiAdapter {
       outwardModel,
       logContext,
       collectHistoryToolUseIds(request.messages),
+      collectToolInputKeys(request.tools),
     );
     const elapsed = Date.now() - startTime;
 
@@ -324,6 +325,7 @@ export class AnthropicApiAdapter {
     outwardModel: string,
     logContext?: RequestLogContext,
     historyToolUseIds?: Set<string>,
+    toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -338,7 +340,12 @@ export class AnthropicApiAdapter {
       throw new Error(`${this.provider} API error: ${message}`);
     }
 
-    const content = this.normalizeContent(raw.content, logContext, historyToolUseIds);
+    const content = this.normalizeContent(
+      raw.content,
+      logContext,
+      historyToolUseIds,
+      toolInputKeys,
+    );
     const usage = this.normalizeUsage(raw.usage);
     const stopReason = this.normalizeStopReason(raw.stop_reason);
     const hasToolUse = content.some((block) => block.type === 'tool_use');
@@ -361,6 +368,7 @@ export class AnthropicApiAdapter {
     content: unknown,
     logContext?: RequestLogContext,
     historyToolUseIds?: Set<string>,
+    toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
   ): AnthropicResponseContent[] {
     if (!Array.isArray(content) || content.length === 0) {
       throw new Error(`${this.provider} API response missing content array`);
@@ -413,7 +421,11 @@ export class AnthropicApiAdapter {
       return normalized;
     }
 
-    const converted = this.normalizeTextualToolUseBlocks(normalized, historyToolUseIds);
+    const converted = this.normalizeTextualToolUseBlocks(
+      normalized,
+      historyToolUseIds,
+      toolInputKeys,
+    );
     if (converted.toolUseCount > 0) {
       logWarn('textual_tool_use_normalized', {
         ...this.contextFields(logContext),
@@ -430,6 +442,15 @@ export class AnthropicApiAdapter {
         replayedCount: converted.replayedCount,
       });
     }
+    if (converted.unparsedCount > 0) {
+      // 这条日志就是"Claude Code 莫名停下、要人说'请继续'"的直接证据。
+      // 没有它就只能靠翻聊天记录截图复原现场。
+      logWarn('textual_tool_use_unparsed', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        unparsedCount: converted.unparsedCount,
+      }, 'Textual tool call could not be restored; turn will end early');
+    }
 
     return converted.content;
   }
@@ -437,10 +458,17 @@ export class AnthropicApiAdapter {
   private normalizeTextualToolUseBlocks(
     blocks: AnthropicResponseContent[],
     historyToolUseIds?: Set<string>,
-  ): { content: AnthropicResponseContent[]; toolUseCount: number; replayedCount: number } {
+    toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+  ): {
+    content: AnthropicResponseContent[];
+    toolUseCount: number;
+    replayedCount: number;
+    unparsedCount: number;
+  } {
     const next: AnthropicResponseContent[] = [];
     let toolUseCount = 0;
     let replayedCount = 0;
+    let unparsedCount = 0;
 
     for (const block of blocks) {
       if (block.type !== 'text') {
@@ -461,8 +489,13 @@ export class AnthropicApiAdapter {
       };
 
       for (const line of block.text.split(/\r?\n/)) {
-        const toolUse = this.parseTextualToolUseLine(line);
+        const toolUse = this.parseTextualToolUseLine(line, toolInputKeys);
         if (!toolUse) {
+          // 形状像调用却没解析出来 = 兜底网漏了一次，回合会退化成 end_turn。
+          // 单独计数并告警，否则用户只会看到"助手莫名停下"，无从诊断。
+          if (TEXTUAL_TOOL_LINE_SHAPE.test(line.trim())) {
+            unparsedCount += 1;
+          }
           pendingText.push(line);
           continue;
         }
@@ -489,7 +522,7 @@ export class AnthropicApiAdapter {
       next.push(...convertedParts);
     }
 
-    return { content: next, toolUseCount, replayedCount };
+    return { content: next, toolUseCount, replayedCount, unparsedCount };
   }
 
   /**
@@ -501,7 +534,10 @@ export class AnthropicApiAdapter {
    *
    * 不还原就会退化成纯文本 + stop_reason=end_turn，Claude Code 据此结束 agent 循环。
    */
-  private parseTextualToolUseLine(line: string): AnthropicResponseContent | undefined {
+  private parseTextualToolUseLine(
+    line: string,
+    toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+  ): AnthropicResponseContent | undefined {
     const trimmed = line.trim();
     const match = trimmed.match(
       /^Previous assistant tool request:\s*name=(\S+)\s+id=(\S+)\s+input_json=(.+)$/,
@@ -519,7 +555,7 @@ export class AnthropicApiAdapter {
     }
 
     try {
-      const input = parseLooseToolInputJson(inputText);
+      const input = parseLooseToolInputJson(inputText, toolInputKeys?.get(name));
       if (!input) {
         return undefined;
       }
@@ -716,17 +752,23 @@ export class AnthropicApiAdapter {
 /**
  * 解析模型模仿产出的 input_json。
  *
- * 先按严格 JSON 解析；失败时做一次保守修补后重试。
+ * 三级递进，每级都比上一级更宽容，但都必须以「能解析成合法对象」收尾；
+ * 全部失败就返回 undefined，老实退回文本 —— 宁可少还原一次，也不能伪造
+ * 出参数错误的工具调用（对 Bash/Write 这类写操作尤其重要）。
  *
- * 为什么需要修补：转录由 `JSON.stringify` 生成，Windows 路径在里面是
- * `C:\\Users`（双反斜杠）。模型模仿时几乎必然按人类写法还原成 `C:\Users`，
- * 产出的不是合法 JSON —— `JSON.parse` 抛 "Bad escaped character"，兜底失效，
- * 响应退化成 end_turn，Claude Code 随即停止 agent 循环。
+ * 1. 严格 JSON。
+ * 2. 补未转义的反斜杠。转录由 `JSON.stringify` 生成，Windows 路径在里面是
+ *    `C:\\Users`；模型模仿时几乎必然按人类写法还原成 `C:\Users`，
+ *    `JSON.parse` 抛 "Bad escaped character"。
+ * 3. 补未转义的内层双引号。命令里带引号是常态（`echo "x"`、`python -c "…"`、
+ *    `curl -H "…"`），模型模仿时同样不会转义，字面量边界因此错位。
  *
- * 修补后仍解析不了（如括号不闭合）就返回 undefined，老实退回文本 ——
- * 宁可少还原一次，也不能伪造出参数错误的工具调用。
+ * 三级失败会让响应退化成 end_turn，Claude Code 判定回合结束、agent 循环停止。
  */
-function parseLooseToolInputJson(inputText: string): unknown {
+function parseLooseToolInputJson(
+  inputText: string,
+  allowedKeys?: ReadonlySet<string>,
+): unknown {
   try {
     return JSON.parse(inputText);
   } catch {
@@ -736,8 +778,210 @@ function parseLooseToolInputJson(inputText: string): unknown {
   try {
     return JSON.parse(repairJsonBackslashes(inputText));
   } catch {
+    // 继续尝试修补
+  }
+
+  const quoted = escapeInnerQuotes(inputText, allowedKeys);
+  if (!quoted) {
     return undefined;
   }
+
+  try {
+    return JSON.parse(repairJsonBackslashes(quoted));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 把字符串值内部未转义的双引号补成 `\"`，据此还原正确的字面量边界。
+ *
+ * 难点是判断一个 `"` 到底是「值结束」还是「值内容」。通用 JSON 修复器只能
+ * 看字符串猜，于是在 `{"command":"echo "a", b"}` 这类输入上必须在「截断」和
+ * 「合并」之间赌一把——赌错方向会把 `rm -rf /tmp/x` 截成 `rm -rf /`。
+ *
+ * 但我们是协议代理，手里有这个工具的 `input_schema`，于是可以把猜测换成
+ * **有判据的假设检验**：一个 `"` 只有在其后紧跟 `,"<本工具声明过的键>":`
+ * 时才算值结束。`echo "a", b` 里的逗号后面是 ` b`，不是合法键，因此不构成
+ * 终止符，命令不会被截断。
+ *
+ * 候选取**最早**的合法键终止符（而不是最晚）：取最晚会把后续字段一并吞进
+ * 前一个值。若一个合法键终止符都没有，才退化为「值一直延伸到对象结束」——
+ * 这个方向只会让内容偏多，不会截断，对 shell 命令是更安全的失败方向。
+ *
+ * 拿不到 schema（请求未带 tools，或工具名对不上）时退回「键形」正则判据，
+ * 弱一些，但仍远强于裸逗号。
+ *
+ * 已知局限：命令内容里若真的出现 `","<本工具的合法键>":` 会被误判为字段
+ * 分隔。构造出这种命令需要刻意为之，实践中不出现。
+ */
+function escapeInnerQuotes(
+  text: string,
+  allowedKeys?: ReadonlySet<string>,
+): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) {
+    return undefined;
+  }
+
+  let out = '{';
+  let index = 1;
+
+  const skipWhitespace = () => {
+    while (index < trimmed.length && /\s/.test(trimmed[index] ?? '')) {
+      out += trimmed[index];
+      index += 1;
+    }
+  };
+
+  while (true) {
+    skipWhitespace();
+    if (trimmed[index] === '}') {
+      return out + trimmed.slice(index);
+    }
+    // 键本身被模型写坏的情况实践中不出现，按严格规则读；读不出就整体放弃。
+    if (trimmed[index] !== '"') {
+      return undefined;
+    }
+
+    const key = readStringLiteral(trimmed, index);
+    if (!key) {
+      return undefined;
+    }
+    out += `"${key.body}"`;
+    index = key.end;
+
+    skipWhitespace();
+    if (trimmed[index] !== ':') {
+      return undefined;
+    }
+    out += ':';
+    index += 1;
+    skipWhitespace();
+
+    if (trimmed[index] === '"') {
+      const end = findStringValueEnd(trimmed, index, allowedKeys);
+      if (end === undefined) {
+        return undefined;
+      }
+      out += `"${escapeRawQuotes(trimmed.slice(index + 1, end))}"`;
+      index = end + 1;
+    } else {
+      const end = findNonStringValueEnd(trimmed, index);
+      if (end === undefined) {
+        return undefined;
+      }
+      out += trimmed.slice(index, end);
+      index = end;
+    }
+
+    skipWhitespace();
+    if (trimmed[index] === ',') {
+      out += ',';
+      index += 1;
+      continue;
+    }
+    if (trimmed[index] === '}') {
+      return out + trimmed.slice(index);
+    }
+    return undefined;
+  }
+}
+
+/** 值内容里一个 `"` 是否构成字面量结束：后面必须是合法键，或对象结束。 */
+function isValueTerminator(
+  text: string,
+  after: number,
+  allowedKeys?: ReadonlySet<string>,
+): 'key' | 'end' | undefined {
+  const rest = text.slice(after);
+  if (/^\s*\}\s*$/.test(rest)) {
+    return 'end';
+  }
+  const nextKey = rest.match(/^\s*,\s*"([^"\\]*)"\s*:/);
+  if (!nextKey) {
+    return undefined;
+  }
+  const name = nextKey[1] ?? '';
+  const looksLikeKey = allowedKeys ? allowedKeys.has(name) : /^[A-Za-z_-][\w-]*$/.test(name);
+  return looksLikeKey ? 'key' : undefined;
+}
+
+/** 定位字符串值的结束引号；start 指向起始引号。 */
+function findStringValueEnd(
+  text: string,
+  start: number,
+  allowedKeys?: ReadonlySet<string>,
+): number | undefined {
+  let objectEnd: number | undefined;
+
+  for (let i = start + 1; i < text.length; i += 1) {
+    if (text[i] === '\\') {
+      i += 1; // 连同被转义的字符整体跳过
+      continue;
+    }
+    if (text[i] !== '"') {
+      continue;
+    }
+
+    const kind = isValueTerminator(text, i + 1, allowedKeys);
+    if (kind === 'key') {
+      return i; // 最早的合法键终止符即为答案
+    }
+    if (kind === 'end' && objectEnd === undefined) {
+      objectEnd = i;
+    }
+  }
+
+  return objectEnd;
+}
+
+/** 定位非字符串值（数字/布尔/null/数组/对象）的结束位置。 */
+function findNonStringValueEnd(text: string, start: number): number | undefined {
+  let depth = 0;
+
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '"') {
+      const literal = readStringLiteral(text, i);
+      if (!literal) return undefined;
+      i = literal.end - 1;
+      continue;
+    }
+    if (char === '[' || char === '{') {
+      depth += 1;
+      continue;
+    }
+    if (char === ']' || char === '}') {
+      if (depth === 0) return i;
+      depth -= 1;
+      continue;
+    }
+    if (char === ',' && depth === 0) {
+      return i;
+    }
+  }
+
+  return undefined;
+}
+
+/** 保留已转义的 `\"`，把裸引号补成 `\"`。反斜杠的修补交给后一级。 */
+function escapeRawQuotes(body: string): string {
+  let out = '';
+  let index = 0;
+
+  while (index < body.length) {
+    const char = body[index];
+    if (char === '\\') {
+      out += char + (body[index + 1] ?? '');
+      index += 2;
+      continue;
+    }
+    out += char === '"' ? '\\"' : char;
+    index += 1;
+  }
+
+  return out;
 }
 
 /** JSON 规范允许的转义字符。其余跟在反斜杠后的字符都属于非法转义。 */
@@ -884,6 +1128,39 @@ function rewritePlainLiteral(body: string): string {
 /** 盘符前缀 —— 判定该字面量整体是 Windows 路径。 */
 function looksLikeWindowsPath(body: string): boolean {
   return /^[A-Za-z]:\\/.test(body);
+}
+
+/**
+ * 「这一行形状像文本工具调用」的判据，只看结构不看 JSON 是否合法。
+ * 用于统计兜底漏掉的次数——解析失败与「本来就不是调用」必须分开计数，
+ * 否则前者会静默混进普通文本里，只表现为"助手莫名停下"。
+ */
+const TEXTUAL_TOOL_LINE_SHAPE =
+  /^(Previous assistant tool request:\s*name=\S+\s+id=\S+\s+input_json=\{|\[tool_use:[^\]]+\]\s+id=\S+\s+input=\{)/;
+
+/**
+ * 采集各工具 `input_schema` 声明的合法键。
+ *
+ * 这是 schema 制导修复的判据来源：修复未转义的内层双引号时，靠它判断
+ * 一个 `"` 后面跟的到底是真字段分隔，还是命令内容里恰好出现的逗号加引号。
+ * 通用 JSON 修复器没有这个信息，只能猜。
+ */
+function collectToolInputKeys(
+  tools: AnthropicRequest['tools'],
+): Map<string, ReadonlySet<string>> {
+  const map = new Map<string, ReadonlySet<string>>();
+
+  for (const tool of tools ?? []) {
+    const name = (tool as { name?: unknown }).name;
+    const properties = (tool as { input_schema?: { properties?: unknown } })
+      .input_schema?.properties;
+    if (typeof name !== 'string' || !properties || typeof properties !== 'object') {
+      continue;
+    }
+    map.set(name, new Set(Object.keys(properties as Record<string, unknown>)));
+  }
+
+  return map;
 }
 
 /**

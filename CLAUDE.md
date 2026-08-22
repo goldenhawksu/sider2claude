@@ -134,6 +134,22 @@ RouterEngine
      不还原——否则 `Bash`/`Write` 这类写操作会被重复执行一次。
   4. 防模仿提示词（`applyToolProtocolInstruction`）点名的格式必须与上下文里
      真实出现的转录格式一致，否则等于没禁。
+  5. `input_json` 的解析必须容错，`parseLooseToolInputJson` 是三级递进：
+     严格 JSON → 补未转义反斜杠 → 补未转义内层双引号。**每加一类畸形都要
+     有对应的实测载荷做测试**，因为漏一类就等于「Claude Code 每隔几轮停一次」。
+     - 反斜杠：Windows 路径 `C:\Users`、正则 `\s` 等非法转义；
+     - 内层双引号：`echo "x"`、`python -c "…"`、`curl -H "…"`——带引号是
+       Bash 调用的常态，这一类命中率极高。
+  6. **修内层双引号靠 schema 制导，不是靠猜。** 一个 `"` 只有在其后紧跟
+     `,"<本工具 input_schema 声明过的键>":` 时才算值结束，键集由
+     `collectToolInputKeys(request.tools)` 采集并一路透传到解析器。
+     通用 JSON 修复器没有这个信息，只能在「截断」与「合并」之间赌，
+     赌错方向会把 `rm -rf /tmp/x` 截成 `rm -rf /`。
+     候选取**最早**的合法键终止符；一个都没有才退化为「值延伸到对象结束」——
+     这个方向只会让内容偏多，不会截断，对 shell 命令是更安全的失败方向。
+     动 `escapeInnerQuotes` 时不要改掉这两条取向。
+  7. 还原失败必须走 `textual_tool_use_unparsed` 告警。没有它，现象只是
+     「助手莫名停下、要人说『请继续』」，只能靠翻聊天记录截图复原现场。
 
 ## 模型清单
 
@@ -311,7 +327,8 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - DeepSeek 响应侧 `thinking` / `redacted_thinking` 透传。
 - Claude Code 工具续轮历史转录，避免 DeepSeek `content[].thinking` passback 400。
 - 文本工具调用兜底：两种转录格式都能还原成 `tool_use` 且 `stop_reason` 改判，
-  复述历史 id 不还原，普通文本不误判。
+  复述历史 id 不还原，普通文本不误判；`input_json` 的三类畸形（未转义反斜杠、
+  非法转义、未转义内层双引号）都有实测载荷用例，且命令不得被截断。
 - Sider 的 SSE 内业务错误码（如 1135 用量超限）必须上抛，不能吞成空回复。
 - 带工具的 `tool_result` 续轮不得被会话延续规则路由回 Sider。
 - 重复响应缓存按流式隔离，流式响应不得被等价非流式请求回放。
@@ -335,6 +352,12 @@ Deno 集成回归测试库（打真实实例，`deno task test:e2e`）：
 结果分三态：`pass` / `fail` / `upstream`。上游受限（Sider 配额、DeepSeek
 网络抖动）归入 `upstream`，单独列出且不计入失败、不影响退出码——这样上游
 波动不会把回归门禁刷红。退出码只看 `fail`。
+
+确定性测试里**不要用固定 `setTimeout` 等 KV 落库**。写入是 fire-and-forget，
+`['live']` 还要排队串行提交，耗时随机器负载浮动；实测与 `deno fmt` 并发时
+固定等待会偶发不够，让门禁无故变红——一个会偶发红的门禁等于没有门禁。
+用 `deno/test/usage-stats-kv.test.ts` 里的 `waitForStats` 轮询到期望状态，
+顺带把该文件的耗时从 ~1.5s 降到 ~40ms。
 
 服务级黑盒测试（Node 侧，`test/` 目录）：
 

@@ -264,4 +264,77 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     const userContent = calls[0].body.messages[0].content;
     expect(userContent as string).not.toContain('Tool protocol:');
   });
+
+  const BASH_TOOL = {
+    name: 'Bash',
+    description: 'Run a shell command',
+    input_schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        description: { type: 'string' },
+        timeout: { type: 'number' },
+      },
+      required: ['command'],
+    },
+  };
+
+  const sendWithBashTool = () =>
+    newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'run' }],
+      max_tokens: 128,
+      tools: [BASH_TOOL],
+    } as unknown as AnthropicRequest);
+
+  // 实测卡死载荷：命令里带引号是 Bash 调用的常态，模型模仿转录时不会转义，
+  // 解析失败就会退化成 end_turn，Claude Code 据此结束回合、要人说"请继续"。
+  test('还原内层双引号未转义的工具调用（实测卡死载荷）', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: String
+        .raw`Previous assistant tool request: name=Bash id=call_q1 input_json={"command":"echo "=== cwd ==="; pwd; find /d -name "*.sqlite" | head -5","description":"Diagnose KV file location"}`,
+    }]);
+
+    const response = await sendWithBashTool();
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      name: 'Bash',
+      input: {
+        command: 'echo "=== cwd ==="; pwd; find /d -name "*.sqlite" | head -5',
+        description: 'Diagnose KV file location',
+      },
+    });
+  });
+
+  // 截断比合并危险得多：赌错方向能把 rm -rf /tmp/x 截成 rm -rf /
+  test('内容里的逗号不构成字段分隔，命令不得被截断', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: String.raw`Previous assistant tool request: name=Bash id=call_q3 input_json={"command":"echo "a", b"}`,
+    }]);
+
+    const response = await sendWithBashTool();
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      input: { command: 'echo "a", b' },
+    });
+  });
+
+  test('后继键属于本工具 schema 时才切分字段', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: String
+        .raw`Previous assistant tool request: name=Bash id=call_q5 input_json={"command":"echo "hi"","description":"say hi"}`,
+    }]);
+
+    const response = await sendWithBashTool();
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      input: { command: 'echo "hi"', description: 'say hi' },
+    });
+  });
 });

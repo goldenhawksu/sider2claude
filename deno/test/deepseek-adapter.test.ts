@@ -961,3 +961,164 @@ Deno.test('DeepSeek adapter 结构化 tool_use 存在时不触发文本兜底', 
     restore();
   }
 });
+
+/**
+ * 未转义的内层双引号。
+ *
+ * 这是「Claude Code 每隔几轮就停下、要人说『请继续』」的实测根因：转录格式被
+ * 模型模仿后，只要命令里带引号（`echo "x"`、`python -c "…"`、`curl -H "…"`，
+ * 也就是绝大多数 Bash 调用），产出的 input_json 就不是合法 JSON，兜底解析
+ * 失败，响应退化成 stop_reason=end_turn，客户端据此结束回合。
+ *
+ * 修复靠 schema 制导：一个 `"` 只有在其后紧跟 `,"<本工具声明过的键>":` 时
+ * 才算值结束。通用 JSON 修复器没有 schema，只能在「截断」与「合并」之间赌，
+ * 赌错方向会把 `rm -rf /tmp/x` 截成 `rm -rf /`。
+ */
+const BASH_TOOL = {
+  name: 'Bash',
+  description: 'Run a shell command',
+  input_schema: {
+    type: 'object',
+    properties: {
+      command: { type: 'string' },
+      description: { type: 'string' },
+      timeout: { type: 'number' },
+    },
+    required: ['command'],
+  },
+};
+
+/** 用 Bash 工具（带 schema）发一次请求；实际载荷由 stubUpstreamContent 决定。 */
+function sendWithBashTool() {
+  return newAdapter().sendRequest({
+    model: 'claude-opus-4.6',
+    messages: [{ role: 'user', content: 'run' }],
+    max_tokens: 128,
+    tools: [BASH_TOOL],
+  } as unknown as AnthropicRequest);
+}
+
+Deno.test('DeepSeek adapter 还原 echo 内层双引号未转义的工具调用（实测卡死载荷）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q1 input_json={"command":"echo "=== cwd ==="; pwd; find /d -name "*.sqlite" | head -5","description":"Diagnose KV file location"}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    // 核心：必须改判成 tool_use，否则 Claude Code 认为回合结束而停下
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(
+        response.content[0].input.command,
+        'echo "=== cwd ==="; pwd; find /d -name "*.sqlite" | head -5',
+      );
+      assertEquals(response.content[0].input.description, 'Diagnose KV file location');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 还原 python -c 内层双引号 + 非法转义并存的调用', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q2 input_json={"command":"TOKEN=$(python -c "import re\nm=re.match(r'A\s*=\s*(.+)', l)") && curl -H "Authorization: Bearer $TOKEN" http://x/stats.json","description":"Trigger cleanup"}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      const command = String(response.content[0].input.command);
+      // 内层引号还原
+      assertEquals(command.includes('python -c "import re'), true);
+      assertEquals(command.includes('curl -H "Authorization: Bearer $TOKEN"'), true);
+      // 正则里的 \s 是非法 JSON 转义，必须补成字面反斜杠而不是被吞掉
+      assertEquals(command.includes(String.raw`r'A\s*=\s*(.+)'`), true);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 不因内容里的逗号截断命令（截断比合并危险）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    // 逗号后是 ` b`，不是 `"<合法键>":`，因此不构成字段分隔
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q3 input_json={"command":"echo "a", b"}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].input.command, 'echo "a", b');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 只在后继键属于本工具 schema 时才切分字段', async () => {
+  // `b` 不是 Bash 的合法参数，`","b":` 因此只是命令内容，不是字段分隔。
+  // 注意 `}` 前只有一个引号，单字段读法下值只能到 c 为止——这是唯一自洽解。
+  // 关键性质是没有被截断成 `echo "a"`。
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q4 input_json={"command":"echo "a","b":"c"}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].input.command, 'echo "a","b":"c');
+      assertEquals(response.content[0].input.b, undefined);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 后继键合法时正常切分（不把后续字段吞进前一个值）', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q5 input_json={"command":"echo "hi"","description":"say hi"}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].input.command, 'echo "hi"');
+      assertEquals(response.content[0].input.description, 'say hi');
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test('DeepSeek adapter 修复引号时保留非字符串值', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text: String
+      .raw`Previous assistant tool request: name=Bash id=call_q6 input_json={"command":"echo "x"","timeout":5000}`,
+  }]);
+
+  try {
+    const response = await sendWithBashTool();
+    assertEquals(response.stop_reason, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].input.command, 'echo "x"');
+      assertEquals(response.content[0].input.timeout, 5000);
+    }
+  } finally {
+    restore();
+  }
+});
