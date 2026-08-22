@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: '远端部署地址 (如 https://deno-sider2claude.example.com)'
-        required: true
+        description: '远端部署地址（留空则用 DEPLOY_URL secret，再退到默认部署地址）'
+        required: false
         type: string
         default: ''
       run_integration:
@@ -19,6 +19,12 @@ on:
         required: false
         type: boolean
         default: false
+
+# 目标地址优先级：手动输入 > DEPLOY_URL secret > 此默认值。
+# 这是公开可访问的部署地址，写在这里让 workflow 开箱即用；
+# 换环境时配 DEPLOY_URL secret 覆盖即可，不必改这个文件。
+env:
+  DEFAULT_DEPLOY_URL: https://sider2claude.asu.deno.net
 
 jobs:
   # ── 冒烟验证（零上游成本） ──
@@ -42,15 +48,13 @@ jobs:
 
       - name: 确定目标地址
         id: target
+        env:
+          INPUT_URL: ${{ github.event.inputs.target_url }}
+          SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          if [[ -n "${{ github.event.inputs.target_url }}" ]]; then
-            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
-          elif [[ -n "${{ secrets.DEPLOY_URL }}" ]]; then
-            echo "url=${{ secrets.DEPLOY_URL }}" >> $GITHUB_OUTPUT
-          else
-            echo "::error::未设置目标地址，请通过 workflow_dispatch 手动触发并填写 target_url 或设置 DEPLOY_URL secret"
-            exit 1
-          fi
+          URL="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "目标地址: $URL"
 
       - name: 健康检查
         run: |
@@ -127,14 +131,13 @@ jobs:
 
       - name: 确定目标地址
         id: target
+        env:
+          INPUT_URL: ${{ github.event.inputs.target_url }}
+          SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          if [[ -n "${{ github.event.inputs.target_url }}" ]]; then
-            echo "url=${{ github.event.inputs.target_url }}" >> $GITHUB_OUTPUT
-          elif [[ -n "${{ secrets.DEPLOY_URL }}" ]]; then
-            echo "url=${{ secrets.DEPLOY_URL }}" >> $GITHUB_OUTPUT
-          else
-            echo "url=" >> $GITHUB_OUTPUT
-          fi
+          URL="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "目标地址: $URL"
 
       - name: 运行集成测试
         env:
@@ -152,18 +155,51 @@ jobs:
 
     steps:
       - name: 报告结果
+        env:
+          SMOKE: ${{ needs.smoke-verify.result }}
+          INTEGRATION: ${{ needs.integration-regression.result }}
         run: |
-          echo "## 生产环境验证结果" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | 结果 | 说明 |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| smoke-verify | ${{ needs.smoke-verify.result }} | 零上游消耗冒烟测试 |" >> $GITHUB_STEP_SUMMARY
-          echo "| integration-regression | ${{ needs.integration-regression.result }} | 集成回归 (可选) |" >> $GITHUB_STEP_SUMMARY
+          # skipped 是合法状态，不能与 failure 混为一谈：
+          # - smoke-verify 在 CI 未通过时被跳过，真正的失败信号由 CI workflow 给出，
+          #   这里再红一次只是重复报警，还会让人误以为线上服务出了问题；
+          # - integration-regression 默认就不跑（仅 workflow_dispatch 且显式勾选时执行）。
+          describe() {
+            case "$1" in
+              success)   echo "✅ 通过" ;;
+              skipped)   echo "⏭️ 未执行" ;;
+              cancelled) echo "⚪ 已取消" ;;
+              *)         echo "❌ 失败" ;;
+            esac
+          }
 
-          if [[ "${{ needs.smoke-verify.result }}" != "success" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "❌ 冒烟测试未通过，远端服务可能有问题。" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## 生产环境验证结果"
+            echo ""
+            echo "| Job | 结果 | 说明 |"
+            echo "|---|---|---|"
+            echo "| smoke-verify | $(describe "$SMOKE") | 零上游消耗冒烟测试 |"
+            echo "| integration-regression | $(describe "$INTEGRATION") | 集成回归（默认不跑，消耗上游配额）|"
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
+
+          # 只有真失败才让本 workflow 变红。
+          if [[ "$SMOKE" == "failure" ]]; then
+            echo "❌ 冒烟测试失败，远端服务可能有问题。" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ 生产验证通过。" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$INTEGRATION" == "failure" ]]; then
+            echo "❌ 集成回归失败，远端服务功能异常。" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          # 只有冒烟确实跑过并通过，才算验证通过；
+          # skipped / cancelled 都不是"通过"，但也不该报红。
+          if [[ "$SMOKE" == "success" ]]; then
+            echo "✅ 生产验证通过。" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "⏭️ 冒烟测试未执行完成（$SMOKE）：可能是上游的确定性回归未通过，" >> $GITHUB_STEP_SUMMARY
+          echo "或本次事件不满足触发条件。本 workflow 不重复报警，" >> $GITHUB_STEP_SUMMARY
+          echo "请以 CI / Deterministic Regression 的结果为准。" >> $GITHUB_STEP_SUMMARY
