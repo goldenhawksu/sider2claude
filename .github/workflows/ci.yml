@@ -21,14 +21,19 @@ jobs:
         with:
           deno-version: v2.x
 
+      # 统一复用 deno.json 里的 task，避免 CI 与本地的权限/参数各写一份而漂移。
+      # 单元测试用了动态 import()，缺少 --allow-read 会直接失败。
       - name: Deno check (主入口)
-        run: deno check deno/main.ts
+        run: deno task check
 
       - name: Deno test (单元测试)
-        run: deno test --allow-env deno/test
+        run: deno task test
 
       - name: Deno check (sider probe)
         run: deno check deno/tools/probe-sider-capabilities.ts
+
+      - name: Deno check (集成测试库)
+        run: deno check deno/test/integration/run.ts
 
   # ── Bun/Node 类型检查 ──
   bun-typecheck:
