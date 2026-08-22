@@ -101,7 +101,9 @@ function trendChart(trend: TrendBucket[]): string {
   const y = (v: number) => PAD_T + plotH - (v / peak) * plotH;
 
   const line = (pick: (b: TrendBucket) => number) =>
-    trend.map((b, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(' ');
+    trend.map((b, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(pick(b)).toFixed(1)}`).join(
+      ' ',
+    );
   const area = (pick: (b: TrendBucket) => number) =>
     `${line(pick)} L${x(trend.length - 1).toFixed(1)},${(PAD_T + plotH).toFixed(1)} L${
       x(0).toFixed(1)
@@ -110,7 +112,9 @@ function trendChart(trend: TrendBucket[]): string {
   // 4 条横向参考线，recessive 处理
   const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => {
     const gy = PAD_T + plotH - f * plotH;
-    return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${gy.toFixed(1)}" class="grid"/>
+    return `<line x1="${PAD_L}" y1="${gy.toFixed(1)}" x2="${W - 12}" y2="${
+      gy.toFixed(1)
+    }" class="grid"/>
       <text x="${PAD_L - 8}" y="${(gy + 4).toFixed(1)}" class="tick" text-anchor="end">${
       compact(Math.round(peak * f))
     }</text>`;
@@ -168,6 +172,63 @@ function backendBar(snapshot: UsageSnapshot): string {
   </div>`;
 }
 
+/**
+ * 自动刷新：每 5 秒拉一次 `/stats`，只替换内容变化的区域。
+ *
+ * 为什么不用 `<meta http-equiv="refresh">`：整页重载会闪白、滚动位置归零、
+ * 图表重绘 —— 正是要避免的抖动。
+ *
+ * 为什么不改成客户端读 `/stats.json` 自己渲染：donut / trendChart / 表格
+ * 的渲染逻辑都在服务端，客户端重画等于把它们再写一遍，双份逻辑必然漂移。
+ * 直接取服务端渲染好的 HTML，用 DOMParser 解析后按区域比对，逻辑只有一份。
+ *
+ * 不抖动的三个手段：
+ * 1. 逐区域比对 innerHTML，**完全相同就不写 DOM** —— 没有写入就没有重绘，
+ *    SVG 不闪、文本选中不丢、tooltip 不消失；
+ * 2. 页面不可见时（切到别的标签页）跳过拉取，回来立刻拉一次；
+ * 3. 请求失败静默跳过，保留当前视图，下个周期再试。
+ */
+const REFRESH_SCRIPT = `<script>
+(function () {
+  var REGIONS = ['page-sub', 'tiles', 'donut-card', 'trend-card',
+    'backend-card', 'tools-card', 'recent-card', 'page-footer'];
+  var INTERVAL_MS = 5000;
+  var inFlight = false;
+
+  function apply(doc) {
+    for (var i = 0; i < REGIONS.length; i++) {
+      var id = REGIONS[i];
+      var next = doc.getElementById(id);
+      var current = document.getElementById(id);
+      if (!next || !current) continue;
+      // 内容一致就跳过写入：这是「不抖动」的关键，写入即重绘。
+      if (current.innerHTML === next.innerHTML) continue;
+      current.innerHTML = next.innerHTML;
+    }
+  }
+
+  function tick() {
+    if (inFlight || document.hidden) return;
+    inFlight = true;
+    fetch(location.pathname, { headers: { 'Accept': 'text/html' }, cache: 'no-store' })
+      .then(function (res) { return res.ok ? res.text() : Promise.reject(res.status); })
+      .then(function (html) {
+        apply(new DOMParser().parseFromString(html, 'text/html'));
+      })
+      .catch(function () {
+        // 网络抖动或实例回收：保留当前视图，下个周期再试。
+      })
+      .then(function () { inFlight = false; });
+  }
+
+  setInterval(tick, INTERVAL_MS);
+  // 从后台切回来时立刻补一次，避免看到过期数据。
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) tick();
+  });
+})();
+</script>`;
+
 export function renderStatsPage(snapshot: UsageSnapshot): string {
   const { totals } = snapshot;
   // 超过槽位数的模型折叠为「其他」，绝不循环取色
@@ -187,26 +248,30 @@ export function renderStatsPage(snapshot: UsageSnapshot): string {
 
   const modelRows = shown.length === 0
     ? `<tr><td colspan="5" class="empty-row">暂无数据</td></tr>`
-    : shown.map((m, i) => `<tr>
+    : shown.map((m, i) =>
+      `<tr>
         <td><i class="dot" style="background:var(--s${i + 1})"></i>${esc(m.model)}</td>
         <td class="num">${m.requests}</td>
         <td class="num">${compact(m.totalTokens)}</td>
         <td class="num muted">${compact(m.inputTokens)}</td>
         <td class="num muted">${compact(m.outputTokens)}</td>
-      </tr>`).join('');
+      </tr>`
+    ).join('');
 
   const recentRows = snapshot.recent.length === 0
     ? `<tr><td colspan="6" class="empty-row">暂无数据</td></tr>`
-    : snapshot.recent.map((r) => `<tr>
+    : snapshot.recent.map((r) =>
+      `<tr>
         <td class="num muted">${hhmm(r.time)}</td>
         <td><span class="tag ${r.backend}">${r.backend}</span></td>
         <td>${esc(r.model)}</td>
         <td>${r.fallback ? '<span class="tag warn">fallback</span>' : ''}${
-      r.stream ? '<span class="tag ghost">stream</span>' : ''
-    }</td>
+        r.stream ? '<span class="tag ghost">stream</span>' : ''
+      }</td>
         <td>${r.tools.length ? esc(r.tools.join(', ')) : '<span class="muted">—</span>'}</td>
         <td class="num muted">${r.ms}ms</td>
-      </tr>`).join('');
+      </tr>`
+    ).join('');
 
   const toolRows = snapshot.tools.length === 0
     ? `<p class="muted small">暂无工具调用</p>`
@@ -282,7 +347,7 @@ h1 { font-size: 18px; margin: 0; font-weight: 600; }
   border-radius: 10px; padding: 16px;
 }
 .card h2 { font-size: 13px; margin: 0 0 14px; font-weight: 600; color: var(--ink-2); }
-.tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; }
+.tile .v { font-size: 26px; font-weight: 650; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
 .tile .k { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .donut-wrap { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .donut-num { font-size: 24px; font-weight: 650; fill: var(--ink); }
@@ -331,10 +396,12 @@ a { color: var(--s1); }
 <body>
 <header>
   <h1>Sider2Claude 用量统计</h1>
-  <span class="sub">自 ${esc(hhmm(snapshot.since))} 起 · 近 24 小时趋势 · 时间为 ${DISPLAY_TZ_LABEL} · <a href="/">服务信息</a></span>
+  <span class="sub" id="page-sub">自 ${
+    esc(hhmm(snapshot.since))
+  } 起 · 近 24 小时趋势 · 时间为 ${DISPLAY_TZ_LABEL} · <a href="/">服务信息</a></span>
 </header>
 
-<div class="grid-3">
+<div class="grid-3" id="tiles">
   <div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
   <div class="card tile"><div class="v">${
     compact(totals.inputTokens + totals.outputTokens)
@@ -344,7 +411,7 @@ a { color: var(--s1); }
 </div>
 
 <div class="row">
-  <div class="card">
+  <div class="card" id="donut-card">
     <h2>模型分布</h2>
     <div class="donut-wrap">
       <svg viewBox="0 0 180 180" width="150" height="150" role="img"
@@ -356,7 +423,7 @@ a { color: var(--s1); }
       </table>
     </div>
   </div>
-  <div class="card">
+  <div class="card" id="trend-card">
     <h2>Token 使用趋势（近 24 小时）</h2>
     <div class="legend">
       <span><i style="background:var(--s1)"></i>输入 Token</span>
@@ -367,7 +434,7 @@ a { color: var(--s1); }
 </div>
 
 <div class="row">
-  <div class="card">
+  <div class="card" id="backend-card">
     <h2>后端占比</h2>
     ${backendBar(snapshot)}
     <p class="muted small" style="margin:12px 0 0">
@@ -376,13 +443,13 @@ a { color: var(--s1); }
       · fallback ${snapshot.lastHour.fallbacks}）
     </p>
   </div>
-  <div class="card">
+  <div class="card" id="tools-card">
     <h2>工具调用频次</h2>
     ${toolRows}
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="recent-card">
   <h2>最近请求</h2>
   <table>
     <thead><tr><th>时间</th><th>后端</th><th>模型</th><th>标记</th><th>工具</th>
@@ -391,12 +458,17 @@ a { color: var(--s1); }
   </table>
 </div>
 
-<footer>
+<footer id="page-footer">
   ${esc(snapshot.note)}<br>
-  ${snapshot.persisted ? '聚合数据已持久化（Deno KV）。' : '⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。'}
+  ${
+    snapshot.persisted
+      ? '聚合数据已持久化（Deno KV）。'
+      : '⚠️ 聚合数据未持久化：仅统计当前实例，且实例回收后清零。'
+  }
   缓存回放 ${totals.cachedReplays} 次（命中重复响应缓存、未触达上游，故不计入上方请求数）。
   流式请求 ${totals.streaming} 次；Sider 流式不回传 token 用量，Token 总量以非流式请求为准。
 </footer>
+${REFRESH_SCRIPT}
 </body>
 </html>`;
 }

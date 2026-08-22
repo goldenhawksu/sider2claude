@@ -141,3 +141,82 @@ Deno.test('stats 页面：标注时区，避免读者误读为本地时间', () 
   const html = renderStatsPage(snapshot());
   assertIncludes(html, 'UTC+8', '时区标注');
 });
+
+/**
+ * 自动刷新：每 5 秒拉一次最新页面，只替换内容变化的区域。
+ *
+ * 「不抖动」在这里的可验证含义：
+ * 1. 不用 <meta http-equiv="refresh">，那会整页重载、滚动位置归零、闪白；
+ * 2. 每个可变区域都有稳定的 id，供局部替换定位；
+ * 3. 内容未变化时不写 DOM（否则 SVG 会重绘、文本会闪）；
+ * 4. 布局尺寸不随数据变化跳动（数字用 tabular-nums、图表固定 viewBox）。
+ */
+Deno.test('stats 页面：不使用整页 meta refresh（会闪白并丢失滚动位置）', () => {
+  const html = renderStatsPage(snapshot());
+  assertEquals(/http-equiv=["']?refresh/i.test(html), false, 'meta refresh');
+});
+
+Deno.test('stats 页面：内联刷新脚本，间隔为 5 秒', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, '<script>', '内联脚本');
+  assertIncludes(html, '5000', '刷新间隔 5 秒');
+});
+
+Deno.test('stats 页面：所有可变区域都有稳定 id 供局部替换', () => {
+  const html = renderStatsPage(snapshot());
+  for (
+    const id of [
+      'tiles',
+      'donut-card',
+      'trend-card',
+      'backend-card',
+      'tools-card',
+      'recent-card',
+      'page-sub',
+      'page-footer',
+    ]
+  ) {
+    assertIncludes(html, `id="${id}"`, `区域 id ${id}`);
+  }
+});
+
+Deno.test('stats 页面：刷新脚本按区域比对，内容未变则不写 DOM', () => {
+  const html = renderStatsPage(snapshot());
+  // 逐区域比对 innerHTML，相同就跳过——这是「不抖动」的核心手段
+  assertIncludes(html, 'innerHTML', '区域内容比对');
+  assertIncludes(html, 'REGIONS', '区域清单');
+});
+
+Deno.test('stats 页面：刷新失败时静默重试，不破坏当前视图', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, 'catch', '错误兜底');
+});
+
+Deno.test('stats 页面：数字使用等宽字形，避免位数变化导致宽度跳动', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, 'tabular-nums', '等宽数字');
+  // 统计磁贴的大号数字也要等宽，否则 9->10 会推动整行
+  assertIncludes(html, '.tile .v', '磁贴数字样式');
+});
+
+Deno.test('stats 页面：区域数量与刷新脚本的 REGIONS 清单一致', () => {
+  const html = renderStatsPage(snapshot());
+  const declared = html.match(/var REGIONS = \[([^\]]+)\]/)?.[1] ?? '';
+  const ids = [...declared.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  assertEquals(ids.length, 8, 'REGIONS 条目数');
+  // 清单里的每个 id 都必须真的存在于页面，否则该区域永远不会被刷新
+  for (const id of ids) {
+    assertIncludes(html, `id="${id}"`, `REGIONS 中的 ${id} 对应元素`);
+  }
+});
+
+Deno.test('stats 页面：刷新在页面不可见时暂停，可见时立即补拉', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, 'document.hidden', '不可见时跳过');
+  assertIncludes(html, 'visibilitychange', '可见时补拉');
+});
+
+Deno.test('stats 页面：并发保护，上一次未回来不重复发起', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, 'inFlight', '并发保护');
+});

@@ -203,6 +203,14 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
   注意：开发机若本身在 UTC+8，`getHours()` 会碰巧正确，本地测不出问题，
   因此 `deno/test/stats-page.test.ts` 里有一例通过替换全局 `Date`
   模拟 UTC 运行时来守这条线，改时间渲染时不要删。
+- 页面每 5 秒自动刷新，**局部替换而非整页重载**：内联脚本重新 GET `/stats`，
+  用 `DOMParser` 解析后按 8 个区域 id 逐个比对 `innerHTML`，
+  **相同就不写 DOM**（写入即重绘，这是不抖动的关键）。
+  不用 `<meta http-equiv="refresh">`（闪白、滚动归零）；也不改成客户端读
+  `/stats.json` 自行渲染（donut/trendChart 逻辑会变成两份，必然漂移）。
+  另有并发保护（`inFlight`）、页面不可见时暂停、失败静默重试。
+  新增可变区域时必须同时加 `id` 并登记进脚本的 `REGIONS`，
+  否则该区域永远不刷新；已有测试断言两者数量与对应关系一致。
 
 实现在 `src/utils/usage-stats.ts` 与 `deno/src/utils/usage-stats.ts`（双侧一致，
 `stats-page.ts` 同）。
