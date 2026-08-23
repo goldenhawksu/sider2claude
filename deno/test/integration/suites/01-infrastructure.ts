@@ -66,7 +66,16 @@ export const suite: Suite = {
         bailIfUpstreamLimited(chat, '用量统计用例上游限流');
         assertStatus(chat, 200);
 
-        const usage = (await api.get('/', {})).json.usage;
+        // KV 写入是 fire-and-forget 异步，且 Deno Deploy 多实例下读/写可能跨实例，
+        // 发请求后立刻读经常还看不到计数增长。轮询等待，容忍异步落库的延迟——
+        // 只有真等了 10 秒仍不增长才判失败（那才说明统计链路坏了）。
+        const deadline = Date.now() + 10_000;
+        let usage = (await api.get('/', {})).json.usage;
+        while (usage.totals.requests <= before && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          usage = (await api.get('/', {})).json.usage;
+        }
+
         assertTrue(
           usage.totals.requests > before,
           `请求计数增长（before=${before} after=${usage.totals.requests}）`,

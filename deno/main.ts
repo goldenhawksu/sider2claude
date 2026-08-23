@@ -24,6 +24,20 @@ const app = new Hono();
 // 环境变量 - Deno Deploy 方式
 const PORT = parseInt(getEnv('PORT', '8000'), 10);
 
+/**
+ * 服务版本：语义化版本 + 构建标识。
+ *
+ * 不再写死版本号。历史教训：`1.0.0-2025.10.17-deno` 这个字符串从 2025-10 起就
+ * 没人更新过，而代码一直在变，导致集成回归测出「生产实例缺某个路由修复」时，
+ * version 却显示得和本地一模一样，无从判断部署到了哪一版。
+ *
+ * Deno Deploy 给每个部署一个唯一的 `DENO_DEPLOYMENT_ID`，截前 8 位作为构建标识，
+ * 本地开发无该变量时用 `local`。这样 /health 一眼能看出「这是哪个部署」。
+ */
+const SERVICE_VERSION = '1.0.0';
+const buildTag = getEnv('DENO_DEPLOYMENT_ID');
+const VERSION = buildTag ? `${SERVICE_VERSION}+${buildTag.slice(0, 8)}` : `${SERVICE_VERSION}-local`;
+
 // 中间件
 app.use(
   '*',
@@ -41,7 +55,7 @@ app.get('/health', (c) => {
   return c.json({
     status: 'ok',
     service: 'sider2claude',
-    version: '1.0.0-2025.10.17-deno',
+    version: VERSION,
     timestamp: new Date().toISOString(),
     tech_stack: 'hono + deno',
     runtime: 'Deno Deploy',
@@ -53,7 +67,7 @@ app.get('/', async (c) => {
   return c.json({
     name: 'Sider2Claude',
     description: 'Convert Sider AI API to Anthropic API format for Claude Code compatibility',
-    version: '1.0.0-deno',
+    version: VERSION,
     tech_stack: 'hono + deno',
     runtime: 'Deno Deploy',
     endpoints: {
