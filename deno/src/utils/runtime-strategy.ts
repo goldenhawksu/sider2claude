@@ -32,22 +32,24 @@ let refreshInFlight: Promise<SiderStrategy | undefined> | undefined;
  * 顺序：进程内运行时覆盖（来自网页或上次从 KV 刷到的值）> 环境变量。
  * 同步返回，永不阻塞请求路径。
  */
-export function currentSiderStrategy(fallback: SiderStrategy): SiderStrategy {
+export function currentSiderStrategy(fallback: SiderStrategy, now = Date.now()): SiderStrategy {
   if (override) return override;
 
-  if (cached && Date.now() - cached.at < TTL_MS) {
+  if (cached && now - cached.at < TTL_MS) {
     return cached.value;
   }
 
-  // 缓存过期：后台异步刷新，本轮先按已缓存/环境变量值跑，不阻塞。
-  if (!cached) {
-    void refreshStrategy();
-  }
+  // 缓存过期或为空：后台异步刷新，本轮先按已缓存/环境变量值跑，不阻塞。
+  // 必须让「过期」也触发刷新——曾经只在 `!cached` 时刷新，导致缓存一旦被设置
+  // 就永不更新：实例 A 网页切到 max 后写 KV，实例 B 却因早期缓存过 conservative
+  // 而永久停在 conservative，多实例策略分叉（实测同一时刻 /health 与 / 返回不同策略）。
+  // refreshInFlight 会去重并发刷新，最多每 TTL 触发一次 KV 读，开销可接受。
+  void refreshStrategy(now);
   return cached?.value ?? fallback;
 }
 
 /** 强制刷新（也用于测试推进）。 */
-export async function refreshStrategy(): Promise<SiderStrategy | undefined> {
+export async function refreshStrategy(now = Date.now()): Promise<SiderStrategy | undefined> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     const kv = await getKv();
@@ -56,7 +58,7 @@ export async function refreshStrategy(): Promise<SiderStrategy | undefined> {
       const entry = await kv.get<{ strategy: SiderStrategy }>(STRATEGY_KEY);
       const value = entry.value?.strategy;
       if (value === 'conservative' || value === 'pro' || value === 'max') {
-        cached = { at: Date.now(), value };
+        cached = { at: now, value };
       }
     } catch {
       // 静默：KV 抖动时沿用现有值，策略配置永远不该拖垮路由。
