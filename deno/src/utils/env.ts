@@ -59,12 +59,19 @@ function ensureDotenvLoaded(): void {
 
   dotenvLoaded = true;
 
-  try {
-    const text = Deno.readTextFileSync('.env');
-    parseDotenv(text).forEach((value, key) => dotenvCache.set(key, value));
-  } catch {
-    // Deno Deploy、CI 或无 --allow-read 时没有 .env 很正常，安静降级即可。
+  // 按优先级找第一个存在的 dotenv：`deno/.env` 是本运行时的配置源，
+  // 根 `.env` 仅作旧布局的兼容回退。找到一个就停——两份都读会让"改了哪个生效"
+  // 变成猜谜，而这正是此前 Z.AI 切换只改 deno/.env 却不生效的坑。
+  for (const path of ['deno/.env', '.env']) {
+    try {
+      const text = Deno.readTextFileSync(path);
+      parseDotenv(text).forEach((value, key) => dotenvCache.set(key, value));
+      return;
+    } catch {
+      // 该路径不存在就试下一个
+    }
   }
+  // Deno Deploy、CI 或无 --allow-read 时一个都没有很正常，安静降级即可。
 }
 
 function parseDotenv(text: string): Map<string, string> {

@@ -41,8 +41,14 @@ deno task probe:sider
 统一配置读取由 `src/utils/env.ts` 和 `deno/src/utils/env.ts` 提供：
 
 1. 运行时环境变量优先。
-2. 根目录 `.env` 兜底。
+2. dotenv 文件兜底：**`deno/.env` 是唯一配置源**，找不到才回退仓库根 `.env`（旧布局兼容）。
+   两个运行时与集成测试（`deno/test/integration/config.ts`）走同一优先级——三者必须一致，
+   否则测试会拿着不匹配的 `AUTH_TOKEN` 打出一片 401。
 3. 调用方默认值最后。
+
+注意第 2 条的一个陷阱：`withEnv` 之类只能删**环境变量**，删不掉 dotenv 里的值。
+所以「把某个变量设为 undefined 来验证代码默认值」是错的——那只会落到 dotenv。
+测试要验证默认值就显式传该值，不要依赖「本地 dotenv 恰好等于默认值」。
 
 关键变量：
 
@@ -538,4 +544,4 @@ npm run test:integration
 - 不把 Sider token 或 DeepSeek key 写入源码、测试输出或文档。
 - Deno 与 Node/Bun 双运行时的核心逻辑要同步。
 - 修改路由、模型、DeepSeek adapter 时必须补测试。
-- `.env` 只作为本地配置输入，不能提交。
+- `deno/.env` 只作为本地配置输入，不能提交（已被 .gitignore 覆盖）。

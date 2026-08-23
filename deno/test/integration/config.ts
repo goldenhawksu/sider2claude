@@ -18,8 +18,10 @@ function read(key: string, defaultValue = ''): string {
 
 function loadDotenv(): Map<string, string> {
   const values = new Map<string, string>();
-  try {
-    const text = Deno.readTextFileSync('.env');
+  // 与 src/utils/env.ts 同一优先级：`deno/.env` 是配置源，根 `.env` 仅作兼容回退。
+  // 集成测试必须和被测服务读同一份，否则会拿着不匹配的 AUTH_TOKEN 打出一片 401。
+  const text = readFirstDotenv(['deno/.env', '.env']);
+  if (text !== undefined) {
     for (const rawLine of text.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#')) continue;
@@ -38,10 +40,20 @@ function loadDotenv(): Map<string, string> {
       }
       values.set(key, value);
     }
-  } catch {
-    // 没有 .env 时靠环境变量，安静降级。
   }
   return values;
+}
+
+/** 按优先级返回第一个可读到的 dotenv 内容；都没有时返回 undefined（靠环境变量）。 */
+function readFirstDotenv(paths: string[]): string | undefined {
+  for (const path of paths) {
+    try {
+      return Deno.readTextFileSync(path);
+    } catch {
+      // 该路径不存在就试下一个，安静降级。
+    }
+  }
+  return undefined;
 }
 
 export interface IntegrationConfig {

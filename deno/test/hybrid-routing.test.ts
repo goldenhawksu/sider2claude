@@ -67,12 +67,21 @@ function request(overrides: Partial<AnthropicRequest> = {}): AnthropicRequest {
   };
 }
 
-Deno.test('配置加载：DeepSeek 是默认能力补齐后端', () => {
+/**
+ * 显式给出 DeepSeek 上游三项，验证它们被完整读取、且路由默认落到 Sider。
+ *
+ * 刻意**不**用「把 DEEPSEEK_BASE_URL 设为 undefined 来验证官方默认值」那种写法：
+ * `withEnv` 只能删进程环境变量，而 getEnv 的优先级是「环境变量 > dotenv > 默认值」，
+ * 删掉环境变量只会落到本地 dotenv，不会落到代码里的默认值。那种写法能通过
+ * 纯粹是因为本地 dotenv 恰好也指向官方 DeepSeek——一旦本地切到别的兼容端
+ * （如 Z.AI）就会失败，测的其实是「你本地配了什么」，不是代码行为。
+ */
+Deno.test('配置加载：DeepSeek 上游三项被完整读取，路由默认落到 Sider', () => {
   withEnv({
     SIDER_AUTH_TOKEN: 'sider-token',
     DEEPSEEK_API_KEY: 'deepseek-token',
-    DEEPSEEK_BASE_URL: undefined,
-    DEEPSEEK_MODEL: undefined,
+    DEEPSEEK_BASE_URL: 'https://api.deepseek.com/anthropic',
+    DEEPSEEK_MODEL: 'deepseek-v4-flash',
     DEFAULT_BACKEND: undefined,
   }, () => {
     const config = loadBackendConfig();

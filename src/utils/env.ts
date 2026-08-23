@@ -50,12 +50,17 @@ function ensureDotenvLoaded(): void {
   }
 
   dotenvLoaded = true;
-  if (!existsSync('.env')) {
+
+  // 与 Deno 侧同一优先级：`deno/.env` 是配置源，根 `.env` 仅作旧布局兼容回退。
+  // 找到第一个就停，避免"改了哪份生效"变成猜谜。
+  for (const path of ['deno/.env', '.env']) {
+    if (!existsSync(path)) {
+      continue;
+    }
+    const text = readFileSync(path, 'utf8');
+    parseDotenv(text).forEach((value, key) => dotenvCache.set(key, value));
     return;
   }
-
-  const text = readFileSync('.env', 'utf8');
-  parseDotenv(text).forEach((value, key) => dotenvCache.set(key, value));
 }
 
 function parseDotenv(text: string): Map<string, string> {
