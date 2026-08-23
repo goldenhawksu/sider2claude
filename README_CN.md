@@ -97,13 +97,12 @@ REQUEST_TIMEOUT=30000
 
 兼容旧变量：
 
-- `ANTHROPIC_BASE_URL` 仅在指向 `deepseek.com` 时作为 `DEEPSEEK_BASE_URL` 的旧别名。
-- `ANTHROPIC_API_KEY` 仅在没有非 DeepSeek 的 `ANTHROPIC_BASE_URL` 干扰时作为 `DEEPSEEK_API_KEY`
-  的旧别名。
 - `DEFAULT_BACKEND=anthropic` 会被兼容映射为 `deepseek`。
 
-推荐始终使用 `DEEPSEEK_*` 配置工具能力兜底，避免和 Claude Code 客户端自己的 `ANTHROPIC_BASE_URL`
-混淆。
+工具能力兜底上游统一走 `DEEPSEEK_*` 一套配置，**没有 `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_API_KEY` 这两个环境变量**。`DEEPSEEK_BASE_URL` 可指向任意 Anthropic 兼容端：
+要用 Z.AI 的 GLM-5.3，只需把 `DEEPSEEK_BASE_URL` 改成 Z.AI 的 Anthropic 兼容入口、
+`DEEPSEEK_API_KEY` 改成 Z.AI 的 key、`DEEPSEEK_MODEL` 改成 GLM-5.3 的模型名，其余不用动。
 
 不要把真实 token 写入源码或文档。
 

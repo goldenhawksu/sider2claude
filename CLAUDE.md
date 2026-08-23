@@ -69,13 +69,16 @@ SIDER_MAX_INPUT_CHARS=30000
 SIDER_STRATEGY=conservative
 ```
 
-兼容旧变量：
+工具能力兜底上游统一走 `DEEPSEEK_*` 一套配置，**没有 `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_API_KEY` 这两个环境变量**（历史上曾作为兼容别名，已移除）。
+`DEEPSEEK_BASE_URL` 可指向任意 Anthropic 兼容端：要用 Z.AI 的 GLM-5.3，只需把
+`DEEPSEEK_BASE_URL` 改成 Z.AI 的 Anthropic 兼容入口、`DEEPSEEK_API_KEY` 改成 Z.AI 的 key、
+`DEEPSEEK_MODEL` 改成 GLM-5.3 的模型名，其余不用动。
 
-- `ANTHROPIC_BASE_URL` 仅在指向 `deepseek.com` 时兼容为 `DEEPSEEK_BASE_URL`
-- `ANTHROPIC_API_KEY` 仅在没有非 DeepSeek 的 `ANTHROPIC_BASE_URL` 干扰时兼容为 `DEEPSEEK_API_KEY`
-- `DEFAULT_BACKEND=anthropic` -> `deepseek`
+`DEFAULT_BACKEND=anthropic` 仍兼容为 `deepseek`（那是路由后端名，不是上游配置变量）。
 
-服务端优先使用 `DEEPSEEK_*`。不要把 Claude Code 客户端用的 `ANTHROPIC_BASE_URL=http://localhost:4141` 当作 DeepSeek 上游配置。
+不要把 Claude Code 客户端连到本服务用的 `ANTHROPIC_BASE_URL=http://localhost:4141`
+当作服务端的 DeepSeek 上游配置——那是客户端视角的变量，服务端只认 `DEEPSEEK_*`。
 
 不要打印或提交真实 token。
 

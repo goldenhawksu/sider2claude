@@ -67,14 +67,12 @@ function request(overrides: Partial<AnthropicRequest> = {}): AnthropicRequest {
   };
 }
 
-Deno.test('配置加载：DeepSeek 是默认能力补齐后端，并兼容旧 ANTHROPIC_* 环境变量', () => {
+Deno.test('配置加载：DeepSeek 是默认能力补齐后端', () => {
   withEnv({
     SIDER_AUTH_TOKEN: 'sider-token',
     DEEPSEEK_API_KEY: 'deepseek-token',
     DEEPSEEK_BASE_URL: undefined,
     DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_BASE_URL: undefined,
     DEFAULT_BACKEND: undefined,
   }, () => {
     const config = loadBackendConfig();
@@ -89,78 +87,21 @@ Deno.test('配置加载：DeepSeek 是默认能力补齐后端，并兼容旧 AN
   });
 });
 
-Deno.test('配置加载：旧 ANTHROPIC_BASE_URL 不会覆盖 DeepSeek 官方默认入口', () => {
+Deno.test('配置加载：显式 DEEPSEEK_BASE_URL 覆盖默认入口', () => {
   withEnv({
     SIDER_AUTH_TOKEN: 'sider-token',
     DEEPSEEK_API_KEY: 'deepseek-token',
-    DEEPSEEK_BASE_URL: undefined,
-    DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_BASE_URL: 'https://legacy-compatible.example.com',
+    DEEPSEEK_BASE_URL: 'https://api.z.ai/anthropic',
+    DEEPSEEK_MODEL: 'glm-5.3',
     DEFAULT_BACKEND: undefined,
   }, () => {
     const config = loadBackendConfig();
 
     assertEquals(config.deepseek.enabled, true);
-    assertEquals(config.deepseek.provider, 'deepseek');
-    assertEquals(config.deepseek.baseUrl, 'https://api.deepseek.com/anthropic');
-  });
-});
-
-Deno.test('配置加载：显式 DEEPSEEK_BASE_URL 仍可覆盖默认入口', () => {
-  withEnv({
-    SIDER_AUTH_TOKEN: 'sider-token',
-    DEEPSEEK_API_KEY: 'deepseek-token',
-    DEEPSEEK_BASE_URL: 'https://deepseek-proxy.example.com/anthropic',
-    DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_BASE_URL: 'https://legacy-compatible.example.com',
-    DEFAULT_BACKEND: undefined,
-  }, () => {
-    const config = loadBackendConfig();
-
-    assertEquals(config.deepseek.enabled, true);
+    // 非 deepseek.com 的入口标记为 anthropic-compatible，仅作日志标签，不影响功能
     assertEquals(config.deepseek.provider, 'anthropic-compatible');
-    assertEquals(config.deepseek.baseUrl, 'https://deepseek-proxy.example.com/anthropic');
-  });
-});
-
-Deno.test('配置加载：旧 ANTHROPIC_API_KEY 可作为 DeepSeek key 兼容别名', () => {
-  withEnv({
-    SIDER_AUTH_TOKEN: 'sider-token',
-    DEEPSEEK_API_KEY: undefined,
-    DEEPSEEK_BASE_URL: undefined,
-    DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: 'legacy-deepseek-token',
-    ANTHROPIC_BASE_URL: undefined,
-    DEFAULT_BACKEND: undefined,
-  }, () => {
-    const config = loadBackendConfig();
-
-    assertEquals(config.deepseek.enabled, true);
-    assertEquals(config.deepseek.provider, 'deepseek');
-    assertEquals(config.deepseek.baseUrl, 'https://api.deepseek.com/anthropic');
-    assertEquals(config.deepseek.apiKey, 'legacy-deepseek-token');
-  });
-});
-
-Deno.test('配置加载：非 DeepSeek 的旧 ANTHROPIC_BASE_URL 会阻止旧 key 误启用官方 DeepSeek', () => {
-  withEnv({
-    SIDER_AUTH_TOKEN: 'sider-token',
-    DEEPSEEK_API_KEY: undefined,
-    DEEPSEEK_BASE_URL: undefined,
-    DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: 'legacy-proxy-token',
-    ANTHROPIC_BASE_URL: 'https://legacy-compatible.example.com',
-    DEFAULT_BACKEND: undefined,
-  }, () => {
-    const config = loadBackendConfig();
-
-    assertEquals(config.sider.enabled, true);
-    assertEquals(config.deepseek.enabled, false);
-    assertEquals(config.deepseek.provider, 'deepseek');
-    assertEquals(config.deepseek.baseUrl, 'https://api.deepseek.com/anthropic');
-    assertEquals(config.deepseek.apiKey, '');
+    assertEquals(config.deepseek.baseUrl, 'https://api.z.ai/anthropic');
+    assertEquals(config.deepseek.model, 'glm-5.3');
   });
 });
 
@@ -170,8 +111,6 @@ Deno.test('配置加载：同一环境只加载一次，环境变化时重新加
     DEEPSEEK_API_KEY: 'deepseek-token',
     DEEPSEEK_BASE_URL: undefined,
     DEEPSEEK_MODEL: undefined,
-    ANTHROPIC_API_KEY: undefined,
-    ANTHROPIC_BASE_URL: undefined,
     DEFAULT_BACKEND: undefined,
   }, () => {
     const first = loadBackendConfig();

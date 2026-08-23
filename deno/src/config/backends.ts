@@ -62,8 +62,6 @@ const CONFIG_SIGNATURE_KEYS = [
   'DEEPSEEK_BASE_URL',
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_MODEL',
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_API_KEY',
   'DEFAULT_BACKEND',
   'AUTO_FALLBACK',
   'PREFER_SIDER_FOR_CHAT',
@@ -77,7 +75,10 @@ let cachedConfigSignature = '';
 /**
  * 加载后端配置。
  *
- * 新配置项使用 DEEPSEEK_*；ANTHROPIC_* 保留为旧部署的兼容别名。
+ * 工具能力兜底统一走 `DEEPSEEK_*` 一套配置。`DEEPSEEK_BASE_URL` 可以指向任意
+ * Anthropic 兼容端——例如要用 Z.AI 的 GLM-5.3，只需把 `DEEPSEEK_BASE_URL` 改成
+ * Z.AI 的 Anthropic 兼容入口、`DEEPSEEK_API_KEY` 改成 Z.AI 的 key、
+ * `DEEPSEEK_MODEL` 改成 GLM-5.3 的模型名，其余不用动。
  */
 export function loadBackendConfig(): BackendConfig {
   const signature = buildConfigSignature();
@@ -136,37 +137,11 @@ function buildConfigSignature(): string {
 }
 
 function resolveDeepSeekBaseUrl(): string {
-  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
-  if (explicitDeepSeekUrl) {
-    return explicitDeepSeekUrl;
-  }
-
-  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
-  if (legacyAnthropicUrl?.includes('deepseek.com')) {
-    return legacyAnthropicUrl;
-  }
-
-  return 'https://api.deepseek.com/anthropic';
+  return getEnv('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com/anthropic';
 }
 
 function resolveDeepSeekApiKey(): string {
-  const explicitDeepSeekKey = getEnv('DEEPSEEK_API_KEY');
-  if (explicitDeepSeekKey) {
-    return explicitDeepSeekKey;
-  }
-
-  const legacyAnthropicKey = getEnv('ANTHROPIC_API_KEY');
-  if (!legacyAnthropicKey) {
-    return '';
-  }
-
-  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
-  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
-  if (explicitDeepSeekUrl || !legacyAnthropicUrl || legacyAnthropicUrl.includes('deepseek.com')) {
-    return legacyAnthropicKey;
-  }
-
-  return '';
+  return getEnv('DEEPSEEK_API_KEY') || '';
 }
 
 function parseDefaultBackend(value?: string): Backend {

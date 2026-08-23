@@ -60,8 +60,6 @@ const CONFIG_SIGNATURE_KEYS = [
   'DEEPSEEK_BASE_URL',
   'DEEPSEEK_API_KEY',
   'DEEPSEEK_MODEL',
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_API_KEY',
   'DEFAULT_BACKEND',
   'AUTO_FALLBACK',
   'PREFER_SIDER_FOR_CHAT',
@@ -128,37 +126,11 @@ function buildConfigSignature(): string {
 }
 
 function resolveDeepSeekBaseUrl(): string {
-  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
-  if (explicitDeepSeekUrl) {
-    return explicitDeepSeekUrl;
-  }
-
-  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
-  if (legacyAnthropicUrl?.includes('deepseek.com')) {
-    return legacyAnthropicUrl;
-  }
-
-  return 'https://api.deepseek.com/anthropic';
+  return getEnv('DEEPSEEK_BASE_URL') || 'https://api.deepseek.com/anthropic';
 }
 
 function resolveDeepSeekApiKey(): string {
-  const explicitDeepSeekKey = getEnv('DEEPSEEK_API_KEY');
-  if (explicitDeepSeekKey) {
-    return explicitDeepSeekKey;
-  }
-
-  const legacyAnthropicKey = getEnv('ANTHROPIC_API_KEY');
-  if (!legacyAnthropicKey) {
-    return '';
-  }
-
-  const explicitDeepSeekUrl = getEnv('DEEPSEEK_BASE_URL');
-  const legacyAnthropicUrl = getEnv('ANTHROPIC_BASE_URL');
-  if (explicitDeepSeekUrl || !legacyAnthropicUrl || legacyAnthropicUrl.includes('deepseek.com')) {
-    return legacyAnthropicKey;
-  }
-
-  return '';
+  return getEnv('DEEPSEEK_API_KEY') || '';
 }
 
 function parseDefaultBackend(value?: string): Backend {
