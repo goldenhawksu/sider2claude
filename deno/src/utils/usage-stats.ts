@@ -14,7 +14,10 @@
 
 import type { Backend, SiderStrategy } from '../config/backends.ts';
 import { getSiderThrottleSnapshot, type SiderThrottleStat } from './sider-throttle.ts';
-import { currentEffectiveSiderStrategy } from '../config/backends.ts';
+import {
+  currentEffectiveSiderStrategy,
+  resolveEffectiveSiderStrategy,
+} from '../config/backends.ts';
 import {
   persistCachedReplay,
   type PersistentStats,
@@ -415,9 +418,12 @@ export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot>
 
 async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
   const local = getUsageSnapshot(now);
+  // 展示路径等 KV 读回来再定策略：getUsageSnapshot 里用的是同步版，冷实例上会先
+  // 返回环境变量兜底值，多实例下 /stats 每 5 秒自动刷新就会周期性跳回默认档。
+  const siderStrategy = await resolveEffectiveSiderStrategy();
   const persistent = await readPersistentStats(now);
   if (!persistent) {
-    return local;
+    return { ...local, siderStrategy };
   }
 
   const pct = (part: number) =>
@@ -444,6 +450,7 @@ async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
 
   return {
     ...local,
+    siderStrategy,
     since: new Date(persistent.since).toISOString(),
     totals: { ...persistent.totals },
     backendShare: {

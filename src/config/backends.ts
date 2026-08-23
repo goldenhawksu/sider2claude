@@ -6,7 +6,7 @@
 
 import { consola } from 'consola';
 import { getEnv } from '../utils/env';
-import { currentSiderStrategy } from '../utils/runtime-strategy';
+import { currentSiderStrategy, resolveSiderStrategy } from '../utils/runtime-strategy';
 
 export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash';
 
@@ -167,6 +167,14 @@ export function siderHandlesTools(strategy: SiderStrategy): boolean {
  */
 export function currentEffectiveSiderStrategy(): SiderStrategy {
   return currentSiderStrategy(parseSiderStrategy(getEnv('SIDER_STRATEGY')));
+}
+
+/**
+ * 同上，但等 KV 读回来再返回（供 /stats 等展示路径使用）。
+ * Node 侧无 KV，行为与同步版一致；保持与 Deno 侧 API 对称。
+ */
+export async function resolveEffectiveSiderStrategy(): Promise<SiderStrategy> {
+  return await resolveSiderStrategy(parseSiderStrategy(getEnv('SIDER_STRATEGY')));
 }
 
 function validateConfig(config: BackendConfig): void {

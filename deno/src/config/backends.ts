@@ -8,7 +8,7 @@
  */
 
 import { getEnv } from '../utils/env.ts';
-import { currentSiderStrategy } from '../utils/runtime-strategy.ts';
+import { currentSiderStrategy, resolveSiderStrategy } from '../utils/runtime-strategy.ts';
 
 export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash';
 
@@ -182,6 +182,16 @@ export function siderHandlesTools(strategy: SiderStrategy): boolean {
  */
 export function currentEffectiveSiderStrategy(): SiderStrategy {
   return currentSiderStrategy(parseSiderStrategy(getEnv('SIDER_STRATEGY')));
+}
+
+/**
+ * 同上，但**等 KV 读回来再返回**。供 `/stats` 等展示路径使用。
+ *
+ * 同步版在冷实例上会先返回环境变量兜底值，多实例下 `/stats` 每 5 秒自动刷新
+ * 就会周期性跳回默认档；展示路径宁可多等一次 KV 读，也不能显示错的策略。
+ */
+export async function resolveEffectiveSiderStrategy(): Promise<SiderStrategy> {
+  return await resolveSiderStrategy(parseSiderStrategy(getEnv('SIDER_STRATEGY')));
 }
 
 function validateConfig(config: BackendConfig): void {

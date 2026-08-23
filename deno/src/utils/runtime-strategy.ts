@@ -48,6 +48,31 @@ export function currentSiderStrategy(fallback: SiderStrategy, now = Date.now()):
   return cached?.value ?? fallback;
 }
 
+/**
+ * 当前生效的策略，**等 KV 读回来再返回**。供 `/stats` 这类展示路径使用。
+ *
+ * 与同步版的分工：路由热路径每个请求都要读策略，绝不能为此阻塞，宁可用稍旧的值；
+ * 而展示路径一旦显示错的策略，用户看到的就是「刚切完又跳回 Conservative」——
+ * 这种错比慢几十毫秒严重得多。
+ *
+ * 修的是同步版一个绕不开的窗口：冷实例（刚被 Deploy 拉起、或缓存已回收）第一次
+ * 被调用时 KV 还没读回来，只能返回 fallback（环境变量）。多实例下 `/stats` 每 5 秒
+ * 自动刷新会随机命中这类冷实例，页面就会周期性跳回默认档。
+ */
+export async function resolveSiderStrategy(
+  fallback: SiderStrategy,
+  now = Date.now(),
+): Promise<SiderStrategy> {
+  if (override) return override;
+
+  if (cached && now - cached.at < TTL_MS) {
+    return cached.value;
+  }
+
+  await refreshStrategy(now);
+  return cached?.value ?? fallback;
+}
+
 /** 强制刷新（也用于测试推进）。 */
 export async function refreshStrategy(now = Date.now()): Promise<SiderStrategy | undefined> {
   if (refreshInFlight) return refreshInFlight;

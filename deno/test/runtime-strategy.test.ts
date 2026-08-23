@@ -14,6 +14,7 @@ import {
   currentSiderStrategy,
   refreshStrategy,
   resetRuntimeStrategy,
+  resolveSiderStrategy,
 } from '../src/utils/runtime-strategy.ts';
 import { closeStatsKv, getKv } from '../src/utils/usage-stats-kv.ts';
 
@@ -88,6 +89,43 @@ Deno.test({
       await refreshStrategy(T0);
       assertEquals(currentSiderStrategy('pro', T0), 'pro', 'KV 空时回退环境变量兜底');
       assertEquals(currentSiderStrategy('conservative', T0), 'conservative', '兜底值可任意传入');
+    });
+  },
+});
+
+/**
+ * 冷实例窗口：这是 `/stats` 页面「自动刷新后跳回 Conservative」的真凶。
+ *
+ * 同步版 currentSiderStrategy 在缓存为空时只能 fire-and-forget 触发刷新、
+ * 本轮返回环境变量兜底值。多实例下 /stats 每 5 秒刷新会随机命中刚拉起的冷实例，
+ * 页面就周期性跳回默认档；用户手动刷新时若命中热实例又是对的，于是看起来
+ * 像「自动刷新会重置策略」。展示路径必须用 resolveSiderStrategy 等 KV 读回来。
+ */
+Deno.test({
+  name: 'runtime-strategy：冷实例下异步版等到 KV 真值，同步版才会先吐兜底值',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: async () => {
+    await withMemoryKv(async () => {
+      resetRuntimeStrategy();
+      const kv = await getKv();
+      await kv!.set(KEY, { strategy: 'pro', at: T0 });
+
+      // 冷实例：缓存为空。同步版拿不到 KV 值，只能返回兜底——这就是页面看到的错值
+      resetRuntimeStrategy();
+      assertEquals(
+        currentSiderStrategy('conservative', T0),
+        'conservative',
+        '同步版在冷实例上返回兜底值（问题现象）',
+      );
+
+      // 异步版在同样的冷实例上必须拿到 KV 里的真值
+      resetRuntimeStrategy();
+      assertEquals(
+        await resolveSiderStrategy('conservative', T0),
+        'pro',
+        '异步版等到 KV 真值（修复）',
+      );
     });
   },
 });

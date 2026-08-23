@@ -22,6 +22,14 @@ export function setSiderStrategy(strategy: SiderStrategy): void {
   override = strategy;
 }
 
+/**
+ * 与 Deno 侧同名的异步版，供 `/stats` 等展示路径使用。
+ * Node 侧无 KV、没有冷启动窗口，同步版已是准确值，这里直接转发保持双侧 API 对称。
+ */
+export async function resolveSiderStrategy(fallback: SiderStrategy): Promise<SiderStrategy> {
+  return override ?? fallback;
+}
+
 /** 兼容 Deno 侧的异步刷新签名；Node 侧无 KV，恒为 no-op。 */
 export async function refreshStrategy(): Promise<SiderStrategy | undefined> {
   return override;
