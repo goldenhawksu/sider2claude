@@ -1,15 +1,33 @@
-
-
 /**
  * 响应格式转换器
  * 将 Sider API 响应转换为 Anthropic API 格式
  */
 
-import type { 
-  SiderParsedResponse, 
-  AnthropicResponse, 
-  AnthropicResponseContent 
+import type {
+  AnthropicResponse,
+  AnthropicResponseContent,
+  SiderParsedResponse,
 } from '../types/index.ts';
+import type { AnthropicRequest } from '../types/anthropic.ts';
+import { restoreToolUseFromText } from './textual-tool-use.ts';
+
+/**
+ * Sider 承接工具请求时没接住的信号。
+ *
+ * Max 策略下 Sider 靠文本契约发起工具调用（见 utils/textual-tool-use.ts）。
+ * 模型若输出了形状像调用、却解析不出来的行，这一轮就没法还原成 `tool_use`——
+ * 直接把纯文本交给 Claude Code 会让它判定回合结束、agent 循环停住。抛出本错误
+ * 让上层 fallback 到 DeepSeek 重做一次，比让用户对着停住的助手说「请继续」好。
+ *
+ * 注意判据不是「没有 tool_use」：契约明确允许模型在不需要工具时直接作答，
+ * 那是正常回答，不该兜底。
+ */
+export class SiderToolRestoreError extends Error {
+  constructor(public readonly unparsedCount: number) {
+    super(`Sider produced ${unparsedCount} textual tool call(s) that could not be restored`);
+    this.name = 'SiderToolRestoreError';
+  }
+}
 
 /**
  * 转换 Sider 响应到 Anthropic 格式
@@ -17,14 +35,14 @@ import type {
 export function convertSiderToAnthropic(
   siderResponse: SiderParsedResponse,
   originalModel: string,
-  options: { includeThinking?: boolean } = {}
+  options: { includeThinking?: boolean; restoreToolUse?: AnthropicRequest } = {},
 ): AnthropicResponse {
   // 合并所有文本内容
   const fullText = combineTextParts(siderResponse);
-  
+
   // 计算 token 使用量 (简单估算)
   const usage = estimateTokenUsage(siderResponse, fullText);
-  
+
   // 生成响应 ID
   const responseId = generateResponseId();
 
@@ -39,10 +57,22 @@ export function convertSiderToAnthropic(
       thinking: thinkingText,
     });
   }
-  content.push({
-    type: 'text',
-    text: fullText,
-  });
+
+  // Max 策略：Sider 按注入的契约用文本发起工具调用，在这里还原成结构化块。
+  if (options.restoreToolUse) {
+    const restored = restoreToolUseFromText(fullText, options.restoreToolUse);
+    if (restored.unparsedCount > 0) {
+      throw new SiderToolRestoreError(restored.unparsedCount);
+    }
+    content.push(...restored.content);
+  } else {
+    content.push({
+      type: 'text',
+      text: fullText,
+    });
+  }
+
+  const hasToolUse = content.some((block) => block.type === 'tool_use');
 
   // 构建 Anthropic 响应
   const anthropicResponse: AnthropicResponse = {
@@ -51,15 +81,19 @@ export function convertSiderToAnthropic(
     role: 'assistant',
     content,
     model: originalModel, // 使用原始请求的模型名
-    stop_reason: 'end_turn', // 正常结束
+    // 还原出 tool_use 后必须改判：留着 end_turn 会让 Claude Code 认为回合结束，
+    // agent 循环就此停住——这正是文本工具调用兜底要解决的问题。
+    stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
     usage: usage,
     // 包含 Sider 会话信息（如果有的话）
-    ...(siderResponse.conversationId && siderResponse.messageIds ? {
-      sider_session: {
-        conversation_id: siderResponse.conversationId,
-        message_ids: siderResponse.messageIds,
+    ...(siderResponse.conversationId && siderResponse.messageIds
+      ? {
+        sider_session: {
+          conversation_id: siderResponse.conversationId,
+          message_ids: siderResponse.messageIds,
+        },
       }
-    } : {}),
+      : {}),
   };
 
   console.log('Response conversion completed:', {
@@ -69,7 +103,9 @@ export function convertSiderToAnthropic(
     inputTokens: usage.input_tokens,
     outputTokens: usage.output_tokens,
     hasReasoning: siderResponse.reasoningParts.length > 0,
-    conversationId: siderResponse.conversationId ? siderResponse.conversationId.substring(0, 12) + '...' : 'none',
+    conversationId: siderResponse.conversationId
+      ? siderResponse.conversationId.substring(0, 12) + '...'
+      : 'none',
     hasSessionInfo: !!siderResponse.conversationId,
   });
 
@@ -82,19 +118,19 @@ export function convertSiderToAnthropic(
  */
 export function getSessionHeaders(siderResponse: SiderParsedResponse): Record<string, string> {
   const headers: Record<string, string> = {};
-  
+
   if (siderResponse.conversationId) {
     headers['X-Conversation-ID'] = siderResponse.conversationId;
-    
+
     if (siderResponse.messageIds?.assistant) {
       headers['X-Assistant-Message-ID'] = siderResponse.messageIds.assistant;
     }
-    
+
     if (siderResponse.messageIds?.user) {
       headers['X-User-Message-ID'] = siderResponse.messageIds.user;
     }
   }
-  
+
   return headers;
 }
 
@@ -104,7 +140,7 @@ export function getSessionHeaders(siderResponse: SiderParsedResponse): Record<st
 function combineTextParts(siderResponse: SiderParsedResponse): string {
   // 合并最终文本内容
   const finalText = siderResponse.textParts.join('').trim();
-  
+
   if (!finalText) {
     // 如果没有最终文本，返回提示信息
     return 'Response received but no text content was generated.';
@@ -117,18 +153,18 @@ function combineTextParts(siderResponse: SiderParsedResponse): string {
  * 估算 token 使用量
  */
 function estimateTokenUsage(
-  siderResponse: SiderParsedResponse, 
-  outputText: string
+  siderResponse: SiderParsedResponse,
+  outputText: string,
 ): { input_tokens: number; output_tokens: number } {
   // 简单的 token 估算 (1 token ≈ 4 字符)
   // 这里可以后续使用 gpt-tokenizer 进行精确计算
-  
+
   const outputTokens = Math.ceil(outputText.length / 4);
-  
+
   // 推理内容也计入输出 token (如果有的话)
   const reasoningLength = siderResponse.reasoningParts.join('').length;
   const reasoningTokens = Math.ceil(reasoningLength / 4);
-  
+
   return {
     input_tokens: 10, // 暂时固定值，后续可以根据实际请求计算
     output_tokens: outputTokens + reasoningTokens,
@@ -149,10 +185,10 @@ function generateResponseId(): string {
  */
 export function createErrorResponse(
   error: Error,
-  originalModel: string = 'unknown'
+  originalModel: string = 'unknown',
 ): AnthropicResponse {
   const responseId = generateResponseId();
-  
+
   const errorResponse: AnthropicResponse = {
     id: responseId,
     type: 'message',
@@ -202,7 +238,10 @@ export function validateAnthropicResponse(response: AnthropicResponse): void {
     throw new Error('Response missing required field: model');
   }
 
-  if (!response.usage || typeof response.usage.input_tokens !== 'number' || typeof response.usage.output_tokens !== 'number') {
+  if (
+    !response.usage || typeof response.usage.input_tokens !== 'number' ||
+    typeof response.usage.output_tokens !== 'number'
+  ) {
     throw new Error('Response usage information is invalid');
   }
 }

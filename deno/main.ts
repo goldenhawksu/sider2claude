@@ -16,6 +16,8 @@ import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
 import { getStatsSnapshot } from './src/utils/usage-stats.ts';
 import { renderStatsPage } from './src/utils/stats-page.ts';
+import { setSiderStrategy } from './src/utils/runtime-strategy.ts';
+import { readSiderTelemetry } from './src/utils/sider-telemetry.ts';
 
 const app = new Hono();
 
@@ -85,6 +87,23 @@ app.get('/stats', async (c) => {
 
 app.get('/stats.json', async (c) => {
   return c.json(await getStatsSnapshot());
+});
+
+// 网页切换调度策略。用户已明确不考虑安全问题，故不挂 requireAuth。
+// 写进 KV 让多实例最多 3 秒收敛；当前实例立即生效。
+app.post('/stats/strategy', async (c) => {
+  const body = await c.req.json().catch(() => ({})) as { strategy?: unknown };
+  const strategy = body.strategy;
+  if (strategy !== 'conservative' && strategy !== 'pro' && strategy !== 'max') {
+    return c.json({ error: `invalid strategy: ${String(strategy)}` }, 400);
+  }
+  setSiderStrategy(strategy);
+  return c.json({ status: 'ok', strategy });
+});
+
+// 运行遥测原始记录，供离线分析优化调度策略。
+app.get('/stats/telemetry.json', async (c) => {
+  return c.json({ records: await readSiderTelemetry() });
 });
 
 // 注册 API 路由

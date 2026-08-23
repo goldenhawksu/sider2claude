@@ -6,7 +6,12 @@
  * 跨进程持久性无法在单测里验证，属 Deploy 平台行为。
  */
 
-import { getStatsSnapshot, recordUsage, resetUsageStats } from '../src/utils/usage-stats.ts';
+import {
+  getStatsSnapshot,
+  recordUsage,
+  resetSnapshotCache,
+  resetUsageStats,
+} from '../src/utils/usage-stats.ts';
 import type { UsageSnapshot } from '../src/utils/usage-stats.ts';
 import { closeStatsKv } from '../src/utils/usage-stats-kv.ts';
 
@@ -38,17 +43,25 @@ function assertEquals<T>(actual: T, expected: T, what = '值') {
  * 等待会偶发不够，让回归门禁无故变红——一个会偶发红的门禁等于没有门禁。
  *
  * 超时后照常返回最后一次快照，让断言给出真实差异而不是"超时"这种无信息报错。
+ *
+ * 每轮必须先清快照缓存：生产上那层 3 秒 TTL 缓存是为了让 /stats 的扫描频率
+ * 与客户端数解耦，但在这里它会让轮询反复拿到同一份旧快照，把「25ms 轮询到
+ * 就绪」退化成「每次都等满 3 秒」。测试要看的是 KV 的真实状态，不是缓存。
  */
 async function waitForStats(
   ready: (snapshot: UsageSnapshot) => boolean,
   timeoutMs = 8_000,
 ): Promise<UsageSnapshot> {
   const deadline = Date.now() + timeoutMs;
-  let snapshot = await getStatsSnapshot();
+  const read = async () => {
+    resetSnapshotCache();
+    return await getStatsSnapshot();
+  };
+  let snapshot = await read();
 
   while (!ready(snapshot) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
-    snapshot = await getStatsSnapshot();
+    snapshot = await read();
   }
 
   return snapshot;

@@ -20,9 +20,20 @@ import {
 import { siderClient } from '../utils/sider-client.ts';
 import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
 import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-availability.ts';
+import {
+  recordSiderOversize,
+  recordSiderQuotaExhausted as recordThrottleQuota,
+  recordSiderSuccess,
+} from '../utils/sider-throttle.ts';
 import { classifyDeepSeekReason, recordCachedReplay, recordUsage } from '../utils/usage-stats.ts';
+import { buildToolContract } from '../utils/textual-tool-use.ts';
+import { persistSiderTelemetry } from '../utils/sider-telemetry.ts';
 import type { DeepSeekReason } from '../utils/usage-stats.ts';
-import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter.ts';
+import {
+  convertSiderToAnthropic,
+  getSessionHeaders,
+  SiderToolRestoreError,
+} from '../utils/response-converter.ts';
 import {
   cleanupExpiredConversations,
   getConversationStats,
@@ -31,7 +42,13 @@ import {
   cleanupExpiredSiderSessions,
   getSiderSessionStats,
 } from '../utils/sider-session-manager.ts';
-import { type Backend, getBackendDisplayName, loadBackendConfig } from '../config/backends.ts';
+import {
+  type Backend,
+  getBackendDisplayName,
+  loadBackendConfig,
+  siderHandlesTools,
+  usesAdaptiveThrottle,
+} from '../config/backends.ts';
 import { RouterEngine } from '../routing/router-engine.ts';
 import type { RoutingDecision } from '../routing/router-engine.ts';
 import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter.ts';
@@ -177,7 +194,13 @@ messagesRouter.post('/', async (c: Context) => {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
         }
       } else {
-        response = await callSider(anthropicRequest, auth.token, conversationId, parentMessageId);
+        response = await callSider(
+          anthropicRequest,
+          auth.token,
+          logContext,
+          conversationId,
+          parentMessageId,
+        );
 
         if (conversationId || response.sider_session?.conversation_id) {
           routerEngine.recordSessionBackend(
@@ -194,8 +217,6 @@ messagesRouter.post('/', async (c: Context) => {
         backendDisplayName: getBackendDisplayName(decision.backend),
         error: serializeError(error),
       }, `${getBackendDisplayName(decision.backend)} failed:`);
-
-      noteSiderQuotaExhaustion(error, anthropicRequest.model, logContext);
 
       if (!decision.allowFallback || !config.routing.autoFallback) {
         throw error;
@@ -219,7 +240,13 @@ messagesRouter.post('/', async (c: Context) => {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
         }
       } else if (fallbackBackend === 'sider' && config.sider.enabled) {
-        response = await callSider(anthropicRequest, auth.token, conversationId, parentMessageId);
+        response = await callSider(
+          anthropicRequest,
+          auth.token,
+          logContext,
+          conversationId,
+          parentMessageId,
+        );
         selectedBackend = 'sider';
       } else {
         throw error;
@@ -358,25 +385,72 @@ messagesRouter.post('/', async (c: Context) => {
 });
 
 /**
- * Sider 报 1135（用量超限）时，把该模型标记为熔断。
+ * 把一次 Sider 调用的结果喂回限流层。
  *
- * 只认 1135：其余错误码是上游故障或请求问题，不代表额度耗尽，
- * 熔断它们会把偶发抖动放大成长时间不可用。
+ * `conservative` 只记熔断，且只认 1135：其余错误码是上游故障或请求问题，
+ * 不代表额度耗尽，熔断它们会把偶发抖动放大成长时间不可用。
+ *
+ * `pro` / `max` 下三种信号各驱动一个维度：
+ * - 成功 -> 上探频次与体量上限；
+ * - 1135 -> 乘性降速，连续多次才升级为熔断；
+ * - 603  -> 把体量上限直接降到失败载荷以下。
+ *
+ * 603 在保守策略下没有反馈渠道——那时体量上限是写死的静态值，撞了也学不到东西。
  */
-function noteSiderQuotaExhaustion(
-  error: unknown,
+function noteSiderOutcome(
   model: string,
+  payloadChars: number,
+  error: unknown,
   logContext: RequestLogContext,
+  elapsedMs = 0,
+  hasTools = false,
+  restoredToolUse = false,
 ): void {
-  if (!(error instanceof SiderUpstreamError) || error.siderCode !== 1135) {
-    return;
+  const adaptive = usesAdaptiveThrottle(config.routing.siderStrategy);
+  const siderCode = error instanceof SiderUpstreamError ? error.siderCode : 0;
+
+  if (!error) {
+    if (adaptive) {
+      recordSiderSuccess(model, payloadChars);
+    }
+  } else if (siderCode === 1135) {
+    if (adaptive) {
+      recordThrottleQuota(model);
+    } else {
+      recordSiderQuotaExhausted(model);
+    }
+    logWarn('sider_quota_cooldown', {
+      requestId: logContext.requestId,
+      model,
+      strategy: config.routing.siderStrategy,
+      cooldownMs: adaptive ? undefined : siderCooldownMsFor(model),
+    }, `Sider quota exhausted for ${model}`);
+  } else if (siderCode === 603 && adaptive) {
+    recordSiderOversize(model, payloadChars);
+    logWarn('sider_oversize_learned', {
+      requestId: logContext.requestId,
+      model,
+      payloadChars,
+    }, `Sider rejected ${payloadChars} chars; lowering the learned size limit for ${model}`);
   }
-  recordSiderQuotaExhausted(model);
-  logWarn('sider_quota_cooldown', {
-    requestId: logContext.requestId,
+
+  // 运行遥测：每轮 Sider 调用记一条白名单字段，供离线分析优化调度。
+  persistSiderTelemetry({
+    ts: Date.now(),
     model,
-    cooldownMs: siderCooldownMsFor(model),
-  }, `Sider quota exhausted for ${model}; routing will skip Sider until cooldown ends`);
+    strategy: config.routing.siderStrategy,
+    payloadChars,
+    ok: !error,
+    siderCode,
+    ms: elapsedMs,
+    hasTools,
+    restoredToolUse,
+  });
+}
+
+/** 本次实际投给 Sider 的载荷字符数 —— 自适应体量学习的输入。 */
+function siderPayloadChars(request: SiderRequest): number {
+  return request.multi_content?.[0]?.text?.length ?? 0;
 }
 
 function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
@@ -553,12 +627,28 @@ async function buildSiderRequest(
     siderRequest.parent_message_id = parentMessageId;
   }
 
+  // Max 策略：Sider 的 `tools` 字段只认它自己的原生工具（search/web_browse/…），
+  // Anthropic 工具定义会被 buildSafeToolsConfig 直接丢弃。所以工具能力只能靠
+  // 把契约拼进正文——这也正是 probe 验证时的做法。
+  if (siderToolContractEnabled(anthropicRequest)) {
+    const block = siderRequest.multi_content?.[0];
+    if (block) {
+      block.text = `${block.text}\n\n${buildToolContract(anthropicRequest.tools)}`;
+    }
+  }
+
   return { siderRequest, siderAuthToken };
+}
+
+/** Max 策略 + 请求确实带了工具时，才给 Sider 注入工具契约。 */
+function siderToolContractEnabled(request: AnthropicRequest): boolean {
+  return siderHandlesTools(config.routing.siderStrategy) && !!request.tools?.length;
 }
 
 async function callSider(
   anthropicRequest: AnthropicRequest,
   authToken: string,
+  logContext: RequestLogContext,
   conversationId?: string,
   parentMessageId?: string,
 ): Promise<AnthropicResponse> {
@@ -569,10 +659,41 @@ async function callSider(
     parentMessageId,
   );
 
-  const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
-  return convertSiderToAnthropic(siderResponse, anthropicRequest.model, {
-    includeThinking: isThinkingEnabled(anthropicRequest),
-  });
+  // 反馈埋在这里而不是外层 catch：只有这一层同时握有「实际投出的载荷长度」
+  // 与「上游返回的错误码」，而自适应体量学习两者缺一不可。
+  const payloadChars = siderPayloadChars(siderRequest);
+  const startedAt = Date.now();
+  const hasTools = siderToolContractEnabled(anthropicRequest);
+
+  try {
+    const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
+    const response = convertSiderToAnthropic(siderResponse, anthropicRequest.model, {
+      includeThinking: isThinkingEnabled(anthropicRequest),
+      // 带上原始请求 = 开启文本工具调用还原（需要 tools 的 input_schema 做 schema
+      // 制导修复，以及历史 tool_use id 来识别模型在复述而非发起新调用）。
+      ...(hasTools ? { restoreToolUse: anthropicRequest } : {}),
+    });
+    noteSiderOutcome(
+      anthropicRequest.model,
+      payloadChars,
+      undefined,
+      logContext,
+      Date.now() - startedAt,
+      hasTools,
+      response.content.some((b) => b.type === 'tool_use'),
+    );
+    return response;
+  } catch (error) {
+    noteSiderOutcome(
+      anthropicRequest.model,
+      payloadChars,
+      error,
+      logContext,
+      Date.now() - startedAt,
+      hasTools,
+    );
+    throw error;
+  }
 }
 
 const SSE_HEADERS = {
@@ -714,6 +835,20 @@ async function handleStreamingRequest(
     routerEngine.recordSessionBackend(conversationId, 'sider');
   }
 
+  // Max 策略下的工具请求必须走合成流：Sider 是把工具调用当**正文文本**吐出来的
+  // （`[tool_use:X] id=Y input={...}`），真流式逐 delta 直发会把这一行当普通回答
+  // 推给客户端，等到发现要还原时字已经吐出去了。先非流式收完、还原成 tool_use
+  // 再合成 SSE，顺带让「还原失败」和「上游报错」都能在吐字之前拦下来转投 DeepSeek。
+  if (siderToolContractEnabled(anthropicRequest)) {
+    return createSiderSynthesizedStreamingResponse(
+      anthropicRequest,
+      authToken,
+      logContext,
+      conversationId,
+      parentMessageId,
+    );
+  }
+
   const { siderRequest, siderAuthToken } = await buildSiderRequest(
     anthropicRequest,
     authToken,
@@ -724,23 +859,179 @@ async function handleStreamingRequest(
   return createTrueSiderStreamingResponse(
     siderRequest,
     siderAuthToken,
-    anthropicRequest.model,
-    isThinkingEnabled(anthropicRequest),
+    anthropicRequest,
     logContext,
   );
 }
 
 /**
+ * Sider 合成流（Max 策略的工具请求专用）。
+ *
+ * 与真流式的区别只有一个，但很关键：**先把响应收完再开始吐**。Sider 靠文本契约
+ * 表达工具调用，那一行只有在整段文本到手后才能还原成 `tool_use`；边收边吐就来不及了。
+ *
+ * 收完再吐还换来一个好处：这一刻还没向客户端发过任何内容块，因此「上游报错」与
+ * 「调用还原失败」都能干净地转投 DeepSeek，不必依赖真流式那个「还没吐字符」的
+ * 脆弱窗口。代价是首字延迟等于整个 Sider 响应时长——工具回合本来就要等结果，
+ * 这个代价可以接受。
+ */
+function createSiderSynthesizedStreamingResponse(
+  anthropicRequest: AnthropicRequest,
+  authToken: string,
+  logContext: RequestLogContext,
+  conversationId?: string,
+  parentMessageId?: string,
+): Response {
+  const encoder = new TextEncoder();
+  const streamStartedAt = Date.now();
+  const outwardModel = anthropicRequest.model;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      const send = (event: unknown) => {
+        if (closed) return;
+        controller.enqueue(encodeSSEEvent(encoder, event));
+      };
+      const safeClose = () => {
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
+      };
+
+      send({
+        type: 'message_start',
+        message: {
+          id: generateStreamMessageId(),
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model: outwardModel,
+          stop_reason: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+
+      let backend: Backend = 'sider';
+      let response: AnthropicResponse;
+      try {
+        response = await callSider(
+          anthropicRequest,
+          authToken,
+          logContext,
+          conversationId,
+          parentMessageId,
+        );
+      } catch (error) {
+        logWarn('sider_tool_turn_failed', {
+          requestId: logContext.requestId,
+          requestHash: logContext.requestHash,
+          model: outwardModel,
+          restoreFailure: error instanceof SiderToolRestoreError,
+          error: serializeError(error),
+        }, 'Sider could not serve this tool turn; falling back to DeepSeek');
+
+        if (!capabilityAdapter) {
+          send({
+            type: 'error',
+            error: {
+              type: error instanceof SiderUpstreamError
+                ? mapErrorStatusToType(error.statusCode)
+                : 'api_error',
+              message: error instanceof Error ? error.message : 'Sider tool turn failed',
+            },
+          });
+          safeClose();
+          return;
+        }
+
+        try {
+          response = await capabilityAdapter.sendRequest(
+            { ...anthropicRequest, stream: false },
+            logContext,
+          );
+          backend = 'deepseek';
+          if (conversationId) {
+            routerEngine.recordSessionBackend(conversationId, 'deepseek');
+          }
+        } catch (fallbackError) {
+          logError('stream_fallback_failed', {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            model: outwardModel,
+            error: serializeError(fallbackError),
+          }, 'DeepSeek fallback for Sider tool turn failed:');
+          send({
+            type: 'error',
+            error: { type: 'api_error', message: 'Both backends failed for this tool turn' },
+          });
+          safeClose();
+          return;
+        }
+      }
+
+      sendAnthropicResponseContentAsStream(response, send);
+      send({
+        type: 'message_delta',
+        delta: { stop_reason: response.stop_reason },
+        usage: { output_tokens: response.usage?.output_tokens ?? 0 },
+      });
+      send({ type: 'message_stop' });
+
+      const elapsedMs = Date.now() - streamStartedAt;
+      const toolUses = response.content
+        .filter((block) => block.type === 'tool_use')
+        .map((block) => block.name);
+      logInfo('stream_completed', {
+        requestId: logContext.requestId,
+        requestHash: logContext.requestHash,
+        backend,
+        model: outwardModel,
+        mode: 'sider_synthesized',
+        stopReason: response.stop_reason,
+        toolUses: toolUses.length,
+        elapsedMs,
+      });
+      recordUsage({
+        model: outwardModel,
+        backend,
+        fallback: backend !== 'sider',
+        deepseekReason: backend === 'deepseek' ? 'fallback' : undefined,
+        toolUses,
+        stream: true,
+        ms: elapsedMs,
+        inputTokens: response.usage?.input_tokens ?? 0,
+        outputTokens: response.usage?.output_tokens ?? 0,
+      });
+      safeClose();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      ...SSE_HEADERS,
+      'X-Request-ID': logContext.requestId,
+      'X-Request-Hash': logContext.requestHash,
+    },
+  });
+}
+
+/**
  * Sider 真流式：用 content block 状态机把 Sider SSE 事件实时映射为 Anthropic SSE。
  * reasoning_content -> thinking 块（仅在请求开启 thinking 时）；text -> text 块。
+ *
+ * Sider 失败时会尝试**无感**切到 DeepSeek，见下方 catch 块的说明。
  */
 function createTrueSiderStreamingResponse(
   siderRequest: SiderRequest,
   siderAuthToken: string,
-  outwardModel: string,
-  includeThinking: boolean,
+  anthropicRequest: AnthropicRequest,
   logContext: RequestLogContext,
 ): Response {
+  const outwardModel = anthropicRequest.model;
+  const includeThinking = isThinkingEnabled(anthropicRequest);
+  const payloadChars = siderPayloadChars(siderRequest);
   const encoder = new TextEncoder();
   const streamStartedAt = Date.now();
 
@@ -889,6 +1180,7 @@ function createTrueSiderStreamingResponse(
         });
         send({ type: 'message_stop' });
         const elapsedMs = Date.now() - streamStartedAt;
+        noteSiderOutcome(outwardModel, payloadChars, undefined, logContext, elapsedMs);
         logInfo('stream_completed', {
           requestId: logContext.requestId,
           requestHash: logContext.requestHash,
@@ -929,7 +1221,75 @@ function createTrueSiderStreamingResponse(
           model: outwardModel,
           error: serializeError(error),
         }, 'Sider streaming failed:');
-        noteSiderQuotaExhaustion(error, outwardModel, logContext);
+        noteSiderOutcome(
+          outwardModel,
+          payloadChars,
+          error,
+          logContext,
+          Date.now() - streamStartedAt,
+        );
+
+        // 无感切到 DeepSeek。
+        //
+        // 窗口条件是「一个内容块都还没开过」：此时客户端只收到过 message_start，
+        // 而那个事件不带任何后端烙印（id 本地生成、model 是客户端请求的模型名），
+        // 所以改由 DeepSeek 续吐，客户端在协议上无法区分。一旦已经吐过内容就没有
+        // 回退空间了——那时切换会让文本断裂或重复，只能老实报错。
+        //
+        // 这条兜底是激进投递策略的前置安全网：主动碰撞 Sider 的额度上限意味着
+        // 失败会变多，没有它，用户就会直接看到失败。
+        if (
+          currentBlock === null && blockIndex === -1 && capabilityAdapter &&
+          config.routing.autoFallback
+        ) {
+          try {
+            const response = await capabilityAdapter.sendRequest(
+              { ...anthropicRequest, stream: false },
+              logContext,
+            );
+            sendAnthropicResponseContentAsStream(response, send);
+            send({
+              type: 'message_delta',
+              delta: { stop_reason: response.stop_reason },
+              usage: { output_tokens: response.usage?.output_tokens ?? 0 },
+            });
+            send({ type: 'message_stop' });
+
+            const fallbackMs = Date.now() - streamStartedAt;
+            logWarn('stream_fallback_succeeded', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              fromBackend: 'sider',
+              toBackend: 'deepseek',
+              model: outwardModel,
+              elapsedMs: fallbackMs,
+            }, 'Sider stream failed before any content; served by DeepSeek instead');
+            recordUsage({
+              model: outwardModel,
+              backend: 'deepseek',
+              fallback: true,
+              deepseekReason: 'fallback',
+              toolUses: response.content
+                .filter((block) => block.type === 'tool_use')
+                .map((block) => block.name),
+              stream: true,
+              ms: fallbackMs,
+              inputTokens: response.usage?.input_tokens ?? 0,
+              outputTokens: response.usage?.output_tokens ?? 0,
+            });
+            safeClose();
+            return;
+          } catch (fallbackError) {
+            logError('stream_fallback_failed', {
+              requestId: logContext.requestId,
+              requestHash: logContext.requestHash,
+              model: outwardModel,
+              error: serializeError(fallbackError),
+            }, 'DeepSeek fallback for Sider stream failed:');
+            // 落到下面的 error 事件，把原始的 Sider 错误告诉客户端
+          }
+        }
+
         ensureStart();
         closeBlock();
         send({

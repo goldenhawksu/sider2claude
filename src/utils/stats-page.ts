@@ -18,6 +18,12 @@
 import type { ModelStat, TrendBucket, UsageSnapshot } from './usage-stats';
 
 /** HTML 转义：模型名与工具名来自请求，必须当作不可信输入。 */
+function strategyLabel(strategy: string): string {
+  if (strategy === 'pro') return 'Pro';
+  if (strategy === 'max') return 'Max';
+  return 'Conservative';
+}
+
 function esc(value: unknown): string {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -432,6 +438,13 @@ tr:last-child td { border-bottom: 0; }
 .tnum { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 12px; }
 footer { color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.7; }
 a { color: var(--s1); }
+#strategy-control { display: flex; align-items: center; gap: 8px; margin: 4px 0 18px; flex-wrap: wrap; }
+.strategy-label { font-size: 13px; color: var(--muted); }
+.strategy-btn { font: inherit; font-size: 13px; padding: 4px 12px; border: 1px solid var(--border);
+  border-radius: 6px; background: transparent; color: var(--ink-2); cursor: pointer; }
+.strategy-btn:hover { border-color: var(--s1); color: var(--ink); }
+.strategy-btn.active { background: var(--s1); border-color: var(--s1); color: #fff; }
+#strategy-status { min-height: 1em; }
 </style>
 </head>
 <body>
@@ -441,6 +454,17 @@ a { color: var(--s1); }
     esc(hhmm(snapshot.since))
   } 起 · 近 24 小时趋势 · 时间为 ${DISPLAY_TZ_LABEL} · <a href="/">服务信息</a></span>
 </header>
+
+<div id="strategy-control">
+  <span class="strategy-label">调度策略</span>
+  ${
+    (['conservative', 'pro', 'max'] as const).map((st) =>
+      `<button class="strategy-btn${snapshot.siderStrategy === st ? ' active' : ''}"
+        data-strategy="${st}" type="button">${strategyLabel(st)}</button>`
+    ).join('')
+  }
+  <span class="muted small" id="strategy-status"></span>
+</div>
 
 <div class="grid-3" id="tiles">
   <div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
@@ -519,6 +543,42 @@ a { color: var(--s1); }
   流式请求 ${totals.streaming} 次；Sider 流式不回传 token 用量，Token 总量以非流式请求为准。
 </footer>
 ${REFRESH_SCRIPT}
+${STRATEGY_SCRIPT}
 </body>
 </html>`;
 }
+
+/**
+ * 策略切换交互。与 REFRESH_SCRIPT 分开写：那是「定时拉取 + 逐区域 diff」，
+ * 这是「点击 -> POST -> 更新高亮」，两个事件驱动模型。
+ * 控件放在所有 REGIONS 之外，自动刷新不会碰到它。
+ */
+const STRATEGY_SCRIPT = `<script>
+(function () {
+  var buttons = document.querySelectorAll('#strategy-control .strategy-btn');
+  var status = document.getElementById('strategy-status');
+  function setActive(strategy) {
+    buttons.forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-strategy') === strategy);
+    });
+  }
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var strategy = btn.getAttribute('data-strategy');
+      if (!strategy) return;
+      if (status) status.textContent = '切换中…';
+      fetch('/stats/strategy', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ strategy: strategy }),
+      }).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        setActive(strategy);
+        if (status) status.textContent = '已切换，最多 3 秒内全实例生效';
+      }).catch(function () {
+        if (status) status.textContent = '切换失败';
+      });
+    });
+  });
+})();
+</script>`;

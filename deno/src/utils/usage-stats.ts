@@ -12,7 +12,9 @@
  * KV 任何读写失败都静默回退进程内，绝不影响请求路径。
  */
 
-import type { Backend } from '../config/backends.ts';
+import type { Backend, SiderStrategy } from '../config/backends.ts';
+import { getSiderThrottleSnapshot, type SiderThrottleStat } from './sider-throttle.ts';
+import { currentEffectiveSiderStrategy } from '../config/backends.ts';
 import {
   persistCachedReplay,
   type PersistentStats,
@@ -162,6 +164,13 @@ export interface UsageSnapshot {
   trend: TrendBucket[];
   /** 工具调用频次 Top 8，按次数降序。 */
   tools: Array<{ name: string; count: number }>;
+  /**
+   * Sider 自适应限流器的当前状态（`SIDER_STRATEGY=pro` / `max` 才有内容）。
+   *
+   * 这是**进程内实时状态**而非累计计数，因此不进 KV：令牌桶余量按实例累加
+   * 毫无意义，跨实例覆盖写也只会让看板在不同实例的状态之间跳动。
+   */
+  siderThrottle: SiderThrottleStat[];
   /** 最近请求（新在前）。不含任何消息内容或 token。 */
   recent: Array<{
     time: string;
@@ -175,6 +184,16 @@ export interface UsageSnapshot {
     ms: number;
     tokens: number;
   }>;
+  /**
+   * 开服以来的累计请求数，仅供页脚做一行对照。
+   *
+   * 看板主体已统一到近 24 小时窗口——趋势图、模型表、顶部磁贴、后端占比同一口径。
+   * 混用两种口径正是此前「归因三项之和对不上 DeepSeek 总数」的来源：归因字段是
+   * 后加的，全时累计把没有该字段的旧数据永久带着，账永远平不了。
+   */
+  lifetimeRequests: number;
+  /** 当前生效的 Sider 调度策略（供页面策略控件高亮当前项）。 */
+  siderStrategy: SiderStrategy;
   note: string;
   /** 聚合数据是否来自持久层（跨实例）；false 表示仅当前进程。 */
   persisted: boolean;
@@ -341,6 +360,9 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
     models,
     trend: buildTrend(now),
     tools,
+    siderThrottle: getSiderThrottleSnapshot(now),
+    lifetimeRequests: totals.requests,
+    siderStrategy: currentEffectiveSiderStrategy(),
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
       model: record.model,
@@ -352,9 +374,28 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
       ms: record.ms,
       tokens: record.inputTokens + record.outputTokens,
     })),
-    note: '进程内统计，实例重启后清零；Deno Deploy 各隔离实例独立，仅代表当前实例',
+    note: '近 24 小时窗口；进程内统计，实例重启后清零，仅代表当前实例',
     persisted: false,
   };
+}
+
+/**
+ * 快照缓存。
+ *
+ * `/stats` 每 5 秒自动刷新，**每个打开页面的客户端各触发一次**，而每次
+ * `readPersistentStats()` 都要全量扫 KV 前缀。24 小时窗口把模型 × 小时也纳入
+ * 扫描后这个代价更明显。缓存把扫描频率与客户端数解耦：无论几个人在看，
+ * 最多每 3 秒扫一次。
+ *
+ * TTL 取 3 秒而非 5 秒：略小于页面刷新间隔，保证每次刷新都能看到新数据，
+ * 不会因为缓存与刷新周期同相而出现「刷新了却没变化」的假死感。
+ */
+const SNAPSHOT_CACHE_TTL_MS = 3_000;
+let cachedSnapshot: { at: number; value: UsageSnapshot } | undefined;
+
+/** 仅供测试：清掉快照缓存，避免用例之间互相看到对方的数据。 */
+export function resetSnapshotCache(): void {
+  cachedSnapshot = undefined;
 }
 
 /**
@@ -363,6 +404,16 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
  * `/stats`、`/stats.json`、`GET /` 的 usage 都应使用本函数。
  */
 export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot> {
+  if (cachedSnapshot && now - cachedSnapshot.at < SNAPSHOT_CACHE_TTL_MS) {
+    return cachedSnapshot.value;
+  }
+
+  const snapshot = await buildStatsSnapshot(now);
+  cachedSnapshot = { at: now, value: snapshot };
+  return snapshot;
+}
+
+async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
   const local = getUsageSnapshot(now);
   const persistent = await readPersistentStats(now);
   if (!persistent) {
@@ -408,6 +459,7 @@ export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot>
     tools: persistent.tools.slice(0, 8),
     trend,
     lastHour: persistent.lastHour,
+    lifetimeRequests: persistent.lifetimeRequests,
     recent: persistent.recent.slice(0, RECENT_DISPLAY).map((entry) => ({
       time: new Date(entry.at).toISOString(),
       model: entry.model,
@@ -419,7 +471,7 @@ export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot>
       ms: entry.ms,
       tokens: entry.tokens,
     })),
-    note: '统计持久化于 Deno KV，跨实例、跨重启累计',
+    note: '近 24 小时窗口；持久化于 Deno KV，跨实例、跨重启',
     persisted: true,
   };
 }
@@ -431,4 +483,7 @@ export function resetUsageStats(): void {
   modelStats.clear();
   trendBuckets.clear();
   recent.length = 0;
+  // 快照缓存也要清：否则复位后第一次读还会拿到上一个用例的数据，
+  // 表现为「明明 reset 了断言却看到旧值」这种极难定位的偶发失败。
+  resetSnapshotCache();
 }

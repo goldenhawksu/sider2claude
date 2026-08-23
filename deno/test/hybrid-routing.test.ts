@@ -53,6 +53,7 @@ function baseConfig(): BackendConfig {
       autoFallback: true,
       preferSiderForSimpleChat: true,
       debugMode: false,
+      siderStrategy: 'conservative',
     },
   };
 }

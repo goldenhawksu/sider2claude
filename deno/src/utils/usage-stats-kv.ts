@@ -59,13 +59,42 @@ const MODEL_FIELDS = new Set([
   'deepseekRouting',
 ]);
 
-/** 趋势桶里允许累加的字段。 */
+/**
+ * 趋势桶里允许累加的字段。
+ *
+ * 与 `totals` 逐字段对齐：看板的顶部磁贴与后端占比都由 24 个趋势桶求和得出，
+ * 少一个字段那一项就恒为 0。新增 totals 字段时必须同步加进来。
+ */
 const TREND_FIELDS = new Set([
   'requests',
   'sider',
   'deepseek',
   'inputTokens',
   'outputTokens',
+  'fallbacks',
+  'streaming',
+  'toolCalls',
+  'cachedReplays',
+  'deepseekTools',
+  'deepseekFallback',
+  'deepseekRouting',
+]);
+
+/**
+ * 模型 × 小时的字段集。
+ *
+ * 比 MODEL_FIELDS 少一个 `sider`：它恒等于 `requests - deepseek`，存进去只是
+ * 让每个模型每小时多占一个 key。这类 key 数量是「活跃模型 × 25 桶 × 字段数」，
+ * 省一个字段就是省 25 × 模型数个 key，而 /stats 每次刷新都要扫它们。
+ */
+const MODEL_HOUR_FIELDS = new Set([
+  'requests',
+  'inputTokens',
+  'outputTokens',
+  'deepseek',
+  'deepseekTools',
+  'deepseekFallback',
+  'deepseekRouting',
 ]);
 
 type Mutate = Parameters<Deno.AtomicOperation['mutate']>[0];
@@ -77,7 +106,7 @@ let kvPromise: Promise<Deno.Kv | null> | null = null;
  * 测试因此能覆盖全链路），区别只在介质：memory 重启即清、不落文件。
  * 失败只记一次日志，此后永久降级为 null（纯进程内统计）。
  */
-function getKv(): Promise<Deno.Kv | null> {
+export function getKv(): Promise<Deno.Kv | null> {
   if (!kvPromise) {
     kvPromise = (async () => {
       try {
@@ -151,11 +180,29 @@ export function persistUsage(record: UsageRecord): void {
       sum([...m, reasonField], 1);
     }
 
+    // 趋势桶承担双重职责：既画趋势图，又是看板 24 小时窗口下 totals 的来源，
+    // 因此这里要写全 totals 的每一个字段，不能只写画图用的那几个。
     const t = ['stats', 'trend', bucket];
     sum([...t, 'requests'], 1);
     sum([...t, record.backend], 1);
     sum([...t, 'inputTokens'], record.inputTokens);
     sum([...t, 'outputTokens'], record.outputTokens);
+    if (record.fallback) sum([...t, 'fallbacks'], 1);
+    if (record.stream) sum([...t, 'streaming'], 1);
+    sum([...t, 'toolCalls'], record.toolUses.length);
+    if (reasonField) sum([...t, reasonField], 1);
+
+    // 模型 × 小时、工具 × 小时：独立前缀，不塞进 ['stats']。
+    // 塞进去会让 collect() 那一次全量前缀扫描从几百 key 涨到几千，
+    // 而 /stats 每 5 秒就扫一次。独立前缀便于单独度量与回收。
+    const mh = ['mstat', bucket, record.model];
+    sum([...mh, 'requests'], 1);
+    sum([...mh, 'inputTokens'], record.inputTokens);
+    sum([...mh, 'outputTokens'], record.outputTokens);
+    if (record.backend === 'deepseek') sum([...mh, 'deepseek'], 1);
+    if (reasonField) sum([...mh, reasonField], 1);
+
+    for (const name of record.toolUses) sum(['tstat', bucket, name], 1);
 
     await kv.atomic()
       .mutate(...ops)
@@ -275,8 +322,16 @@ export function persistCachedReplay(): void {
   void (async () => {
     const kv = await getKv();
     if (!kv) return;
+    // 同时写全时累计与当前小时桶：前者留作页脚的历史对照，
+    // 后者才是看板 24 小时窗口的数据来源。
+    const bucket = Math.floor(Date.now() / BUCKET_MS) * BUCKET_MS;
     await kv.atomic()
       .mutate({ key: ['stats', 'cachedReplays'], type: 'sum', value: new Deno.KvU64(1n) })
+      .mutate({
+        key: ['stats', 'trend', bucket, 'cachedReplays'],
+        type: 'sum',
+        value: new Deno.KvU64(1n),
+      })
       .commit()
       .catch(() => {});
   })();
@@ -323,6 +378,13 @@ export interface PersistentStats {
   recent: LiveRecent[];
   /** 由分钟桶求和得到的滑动 1 小时窗口。 */
   lastHour: { requests: number; sider: number; deepseek: number; fallbacks: number };
+  /**
+   * 开服以来的累计请求数。
+   *
+   * 看板主体已统一到 24 小时窗口，这个数只在页脚做一行对照——留着它是因为
+   * `['stats', ...]` 的全时累计一直在写，丢掉等于把历史数据藏起来。
+   */
+  lifetimeRequests: number;
 }
 
 /** 读取持久化聚合；带超时，KV 不可用或超时返回 null。 */
@@ -383,80 +445,110 @@ async function collect(kv: Deno.Kv, now: number): Promise<PersistentStats | null
   };
 
   const models: PersistentStats['models'] = [];
-  const tools: PersistentStats['tools'] = [];
+  const toolCounts = new Map<string, number>();
   const trend: PersistentStats['trend'] = [];
-  const staleTrendKeys: Deno.KvKey[] = [];
+  const staleKeys: Deno.KvKey[] = [];
+  let lifetimeRequests = 0;
 
-  // 前缀扫描模型与工具；个人代理量级下条目数有限
+  // 窗口起点：早于它的桶既不参与聚合，也顺手回收。
+  const windowStart = now - TREND_RETENTION_MS;
+
   for await (const entry of kv.list({ prefix: ['stats'] })) {
     const key = entry.key;
     const value = num(entry.value);
-
-    if (key[1] === 'model' && key.length === 4) {
-      const model = key[2] as string;
-      const field = key[3] as string;
-      let row = models.find((m) => m.model === model);
-      if (!row) {
-        row = {
-          model,
-          requests: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          sider: 0,
-          deepseek: 0,
-          deepseekTools: 0,
-          deepseekFallback: 0,
-          deepseekRouting: 0,
-        };
-        models.push(row);
-      }
-      if (MODEL_FIELDS.has(field)) {
-        (row as unknown as Record<string, number>)[field] += value;
-      }
-      continue;
-    }
 
     if (key[1] === 'trend' && key.length === 4) {
       const bucket = Number(key[2]);
       const field = key[3] as string;
       // 趋势桶永不覆盖写，服务长跑会无限堆积；而 /stats 每 5 秒全扫一次，
       // 堆积直接变成刷新开销。在这里顺手回收，不额外扫一遍。
-      if (now - bucket > TREND_RETENTION_MS) {
-        staleTrendKeys.push(key);
+      if (bucket < windowStart) {
+        staleKeys.push(key);
         continue;
       }
+      if (!TREND_FIELDS.has(field)) continue;
+
       let row = trend.find((t) => t.bucket === bucket);
       if (!row) {
         row = { bucket, requests: 0, inputTokens: 0, outputTokens: 0, sider: 0, deepseek: 0 };
         trend.push(row);
       }
-      if (TREND_FIELDS.has(field)) {
+      if (field in row) {
         (row as unknown as Record<string, number>)[field] += value;
       }
-      continue;
-    }
-
-    if (key[1] === 'tool' && key.length === 3) {
-      tools.push({ name: key[2] as string, count: value });
-      continue;
-    }
-
-    if (key.length === 2 && key[1] !== 'since') {
-      const field = key[1] as string;
+      // 看板已统一到 24 小时窗口：totals 由窗口内的桶求和得出，
+      // 而不是读 `['stats', field]` 那份开天辟地以来的累计。
       if (field in totals) {
         (totals as unknown as Record<string, number>)[field] += value;
       }
+      continue;
+    }
+
+    // 全时累计只留一个数给页脚做对照，其余字段不再驱动看板。
+    if (key.length === 2 && key[1] === 'requests') {
+      lifetimeRequests += value;
     }
   }
+
+  // 模型 × 小时（独立前缀，与上面那次扫描分开，便于单独度量开销）
+  for await (const entry of kv.list({ prefix: ['mstat'] })) {
+    const key = entry.key;
+    if (key.length !== 4) continue;
+    const bucket = Number(key[1]);
+    if (bucket < windowStart) {
+      staleKeys.push(key);
+      continue;
+    }
+    const field = key[3] as string;
+    if (!MODEL_HOUR_FIELDS.has(field)) continue;
+
+    const model = key[2] as string;
+    let row = models.find((m) => m.model === model);
+    if (!row) {
+      row = {
+        model,
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        sider: 0,
+        deepseek: 0,
+        deepseekTools: 0,
+        deepseekFallback: 0,
+        deepseekRouting: 0,
+      };
+      models.push(row);
+    }
+    (row as unknown as Record<string, number>)[field] += num(entry.value);
+  }
+
+  // sider 不单独存，由 requests - deepseek 还原（省下每模型每小时一个 key）
+  for (const row of models) {
+    row.sider = Math.max(0, row.requests - row.deepseek);
+  }
+
+  // 工具 × 小时
+  for await (const entry of kv.list({ prefix: ['tstat'] })) {
+    const key = entry.key;
+    if (key.length !== 3) continue;
+    const bucket = Number(key[1]);
+    if (bucket < windowStart) {
+      staleKeys.push(key);
+      continue;
+    }
+    const name = key[2] as string;
+    toolCounts.set(name, (toolCounts.get(name) ?? 0) + num(entry.value));
+  }
+
+  const tools = [...toolCounts.entries()].map(([name, count]) => ({ name, count }));
 
   models.sort((a, b) => b.requests - a.requests);
   tools.sort((a, b) => b.count - a.count);
   trend.sort((a, b) => a.bucket - b.bucket);
 
   // fire-and-forget：回收失败不影响本次读取，下次扫描还会再遇到这些 key
-  if (staleTrendKeys.length > 0) {
+  if (staleKeys.length > 0) {
     void (async () => {
-      for (const key of staleTrendKeys) await kv.delete(key).catch(() => {});
+      for (const key of staleKeys) await kv.delete(key).catch(() => {});
     })();
   }
 
@@ -470,5 +562,6 @@ async function collect(kv: Deno.Kv, now: number): Promise<PersistentStats | null
     trend,
     recent: live.recent,
     lastHour: live.lastHour,
+    lifetimeRequests,
   };
 }

@@ -300,3 +300,173 @@ Deno.test('hybrid route maps missing user message validation to 400', async () =
     assertEquals(body.error?.message, 'At least one user message is required');
   });
 });
+
+/**
+ * 流式无感 fallback。
+ *
+ * 激进投递策略主动碰撞 Sider 的额度上限，失败会变多。而流式路径此前完全没有
+ * 后端兜底——Sider 一失败就把 Anthropic `error` 事件甩给客户端。没有这层兜底，
+ * 「优先投 Sider」等于「让用户天天看到失败」。
+ *
+ * 切换窗口的判据是「一个内容块都还没开过」：那时客户端只收到过 message_start，
+ * 而该事件不带任何后端烙印（id 本地生成、model 是客户端请求的模型名），
+ * 因此改由 DeepSeek 续吐在协议上不可区分。已经吐过内容就没有回退空间了。
+ */
+Deno.test('sider stream: 首个内容块之前失败 -> 静默改由 DeepSeek 承接', async () => {
+  const originalFetch = globalThis.fetch;
+  const { resetSiderAvailability } = await import('../src/utils/sider-availability.ts');
+  let deepseekCalls = 0;
+
+  try {
+    await withEnv({
+      AUTH_TOKEN: 'test-token-12345',
+      SIDER_AUTH_TOKEN: 'sider-token',
+      DEEPSEEK_API_KEY: 'deepseek-token',
+      DEEPSEEK_BASE_URL: 'https://api.deepseek.com/anthropic',
+      DEFAULT_BACKEND: 'sider',
+      PREFER_SIDER_FOR_CHAT: 'true',
+    }, async () => {
+      globalThis.fetch = ((input: string | URL | Request) => {
+        if (String(input).includes('sider.ai')) {
+          // Sider 在吐出任何文本之前就报用量超限（HTTP 200 + SSE 内 code != 0）
+          return Promise.resolve(
+            new Response(
+              `data: ${JSON.stringify({ code: 1135, msg: 'Usage limit reached' })}\n\n`,
+              { status: 200, headers: { 'content-type': 'text/event-stream' } },
+            ),
+          );
+        }
+
+        deepseekCalls += 1;
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: 'msg_fallback',
+              type: 'message',
+              role: 'assistant',
+              model: 'deepseek-v4-flash',
+              content: [{ type: 'text', text: '由 DeepSeek 兜底的回答' }],
+              stop_reason: 'end_turn',
+              usage: { input_tokens: 7, output_tokens: 11 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          ),
+        );
+      }) as typeof fetch;
+
+      const routeModule = await import(
+        `../src/routes/messages-hybrid.ts?test=${crypto.randomUUID()}`
+      );
+      const app = new Hono();
+      app.route('/v1/messages', routeModule.hybridMessagesRouter);
+
+      const response = await app.request('/v1/messages?beta=true', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer test-token-12345',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4.5',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 16,
+          stream: true,
+        }),
+      });
+
+      assertEquals(response.status, 200);
+      const events = parseSseEvents(await response.text());
+      const types = events.map((event) => event.type);
+
+      assertEquals(deepseekCalls, 1);
+      assertEquals(types.includes('error'), false);
+      assertEquals(types.filter((type) => type === 'message_start').length, 1);
+      assertEquals(types.at(-1), 'message_stop');
+
+      const delta = events.find((event) => event.type === 'content_block_delta');
+      assertExists(delta);
+      assertEquals(
+        (delta!.delta as { text?: string }).text,
+        '由 DeepSeek 兜底的回答',
+      );
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    // 1135 会写模块级熔断状态，不复位会顺着文件执行顺序泄漏给后续测试
+    resetSiderAvailability();
+  }
+});
+
+Deno.test('sider stream: 已经吐过内容后失败 -> 仍然报错，不做半路切换', async () => {
+  const originalFetch = globalThis.fetch;
+  const { resetSiderAvailability } = await import('../src/utils/sider-availability.ts');
+  let deepseekCalls = 0;
+
+  try {
+    await withEnv({
+      AUTH_TOKEN: 'test-token-12345',
+      SIDER_AUTH_TOKEN: 'sider-token',
+      DEEPSEEK_API_KEY: 'deepseek-token',
+      DEEPSEEK_BASE_URL: 'https://api.deepseek.com/anthropic',
+      DEFAULT_BACKEND: 'sider',
+      PREFER_SIDER_FOR_CHAT: 'true',
+    }, async () => {
+      globalThis.fetch = ((input: string | URL | Request) => {
+        if (String(input).includes('sider.ai')) {
+          // 先吐一段文本，再报错：此时切后端会让文本断裂或重复
+          const text = `data: ${
+            JSON.stringify({
+              code: 0,
+              msg: 'ok',
+              data: { type: 'text', model: 'claude-haiku-4.5', text: '已经开始回答' },
+            })
+          }\n\ndata: ${JSON.stringify({ code: 1135, msg: 'Usage limit reached' })}\n\n`;
+          return Promise.resolve(
+            new Response(text, {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+          );
+        }
+
+        deepseekCalls += 1;
+        return Promise.resolve(new Response('{}', { status: 200 }));
+      }) as typeof fetch;
+
+      const routeModule = await import(
+        `../src/routes/messages-hybrid.ts?test=${crypto.randomUUID()}`
+      );
+      const app = new Hono();
+      app.route('/v1/messages', routeModule.hybridMessagesRouter);
+
+      const response = await app.request('/v1/messages?beta=true', {
+        method: 'POST',
+        headers: {
+          authorization: 'Bearer test-token-12345',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4.5',
+          messages: [{ role: 'user', content: 'hello' }],
+          max_tokens: 16,
+          stream: true,
+        }),
+      });
+
+      const events = parseSseEvents(await response.text());
+      const error = events.find((event) => event.type === 'error');
+
+      assertEquals(deepseekCalls, 0);
+      assertExists(error);
+      assertEquals((error!.error as { type?: string }).type, 'rate_limit_error');
+
+      // 已经发出的文本必须保留，不能被兜底内容覆盖
+      const delta = events.find((event) => event.type === 'content_block_delta');
+      assertExists(delta);
+      assertEquals((delta!.delta as { text?: string }).text, '已经开始回答');
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetSiderAvailability();
+  }
+});

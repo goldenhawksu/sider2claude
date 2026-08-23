@@ -18,6 +18,11 @@ import {
   resetSiderAvailability,
   siderCooldownMsFor,
 } from '../src/utils/sider-availability.ts';
+import {
+  canUseSider,
+  recordSiderOversize,
+  resetSiderThrottle,
+} from '../src/utils/sider-throttle.ts';
 
 function assertEquals<T>(actual: T, expected: T, what = '值') {
   if (actual !== expected) {
@@ -25,7 +30,7 @@ function assertEquals<T>(actual: T, expected: T, what = '值') {
   }
 }
 
-function config(): BackendConfig {
+function config(siderStrategy: 'conservative' | 'pro' | 'max' = 'conservative'): BackendConfig {
   return {
     sider: { enabled: true, apiUrl: 'https://sider.ai/api/chat/v1/completions', authToken: 't' },
     deepseek: {
@@ -40,6 +45,7 @@ function config(): BackendConfig {
       autoFallback: true,
       preferSiderForSimpleChat: true,
       debugMode: false,
+      siderStrategy,
     },
   } as unknown as BackendConfig;
 }
@@ -212,4 +218,98 @@ Deno.test('熔断：复位入口可用，避免测试间状态泄漏', () => {
 
   resetSiderAvailability();
   assertEquals(engine.decide(req()).backend, 'sider', '复位后');
+});
+
+/**
+ * 第 2 期：SIDER_STRATEGY=aggressive 的自适应碰撞策略。
+ *
+ * 保守策略把 Sider 从「先试试，不行再兜底」变成了「永远不试」——静态 30K 门
+ * 对 Claude Code 恒成立（每轮重发完整 system + 全历史），实测 Sider 占比只剩 6%，
+ * 且 fallback 计数为 0：不是试了失败，是根本没试。
+ *
+ * 激进策略把三道门交给限流器，阈值由运行中的 603/1135 反馈学习。
+ */
+
+/** 限流器是模块级全局状态，测试前后都要复位，避免顺序相关的偶发失败。 */
+function aggressiveTest(name: string, fn: () => void) {
+  Deno.test(name, () => {
+    resetSiderAvailability();
+    resetSiderThrottle();
+    try {
+      fn();
+    } finally {
+      resetSiderThrottle();
+      resetSiderAvailability();
+    }
+  });
+}
+
+/** 35K 字符：超过保守策略的静态 30K 门，但在激进策略学到的 40K 上限之内。 */
+const MID_SIZE_TEXT = 'x'.repeat(35_000);
+
+aggressiveTest('策略：35K 请求在保守策略下被静态门挡掉，走 DeepSeek', () => {
+  const engine = new RouterEngine(config('conservative'));
+  const decision = engine.decide(req({ messages: [{ role: 'user', content: MID_SIZE_TEXT }] }));
+
+  assertEquals(decision.backend, 'deepseek', '后端');
+  assertEquals(decision.ruleId, 'rule_5_simple_chat_deepseek', '规则');
+});
+
+aggressiveTest('策略：同一个 35K 请求在激进策略下投给 Sider（核心差异）', () => {
+  const engine = new RouterEngine(config('pro'));
+  const decision = engine.decide(req({ messages: [{ role: 'user', content: MID_SIZE_TEXT }] }));
+
+  assertEquals(decision.backend, 'sider', '后端');
+  assertEquals(decision.ruleId, 'rule_5_simple_chat_prefer_sider', '规则');
+});
+
+aggressiveTest('策略：撞过 603 之后，同样的请求不再投 Sider（体量学习生效）', () => {
+  const engine = new RouterEngine(config('pro'));
+
+  // 上游用 603 告诉我们 34K 都不行，上限被降到 34000 * 0.85 = 28900
+  recordSiderOversize('claude-sonnet-5', 34_000);
+
+  const decision = engine.decide(req({ messages: [{ role: 'user', content: MID_SIZE_TEXT }] }));
+  assertEquals(decision.backend, 'deepseek', '学习后的后端');
+});
+
+aggressiveTest('策略：令牌桶耗尽后改投 DeepSeek，而不是硬撞限速', () => {
+  const engine = new RouterEngine(config('pro'));
+  const chat = () => engine.decide(req({ messages: [{ role: 'user', content: '你好' }] }));
+
+  // 初始速率 12/分，桶容量等于速率
+  for (let i = 0; i < 12; i += 1) {
+    assertEquals(chat().backend, 'sider', `第 ${i + 1} 次`);
+  }
+
+  assertEquals(chat().backend, 'deepseek', '令牌耗尽后的后端');
+});
+
+/**
+ * 检查与消耗必须分开：路由引擎在规则匹配的最开始就调用 siderUsable()，
+ * 但那一刻还不知道工具规则会不会把决策覆盖成 DeepSeek。若检查即扣费，
+ * 每个走 DeepSeek 的工具请求都会白扣一次 Sider 额度，纯对话就没得用了。
+ */
+aggressiveTest('策略：走 DeepSeek 的工具请求不消耗 Sider 令牌', () => {
+  const engine = new RouterEngine(config('pro'));
+  const tools = [{
+    name: 'Bash',
+    description: 'run',
+    input_schema: { type: 'object' as const, properties: { command: { type: 'string' } } },
+  }];
+
+  for (let i = 0; i < 30; i += 1) {
+    const decision = engine.decide(
+      req({ messages: [{ role: 'user', content: '跑一下测试' }], tools }),
+    );
+    assertEquals(decision.backend, 'deepseek', `第 ${i + 1} 次工具请求`);
+  }
+
+  // 30 次工具请求之后，纯对话仍应有令牌可用
+  assertEquals(canUseSider('claude-sonnet-5', 100).ok, true, '工具请求后的 Sider 可用性');
+  assertEquals(
+    engine.decide(req({ messages: [{ role: 'user', content: '你好' }] })).backend,
+    'sider',
+    '纯对话的后端',
+  );
 });

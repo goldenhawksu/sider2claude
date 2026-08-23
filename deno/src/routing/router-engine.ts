@@ -7,10 +7,15 @@
 
 import type { AnthropicRequest } from '../types/anthropic.ts';
 import type { Backend, BackendConfig } from '../config/backends.ts';
-import { getBackendDisplayName } from '../config/backends.ts';
+import {
+  getBackendDisplayName,
+  siderHandlesTools,
+  usesAdaptiveThrottle,
+} from '../config/backends.ts';
 import type { RequestAnalysis } from '../utils/request-analyzer.ts';
 import { RequestAnalyzer } from '../utils/request-analyzer.ts';
 import { isSiderCooling, siderCooldownRemainingMs } from '../utils/sider-availability.ts';
+import { canUseSider, consumeSiderSlot } from '../utils/sider-throttle.ts';
 import { getEnv } from '../utils/env.ts';
 
 export interface RoutingDecision {
@@ -52,6 +57,14 @@ export class RouterEngine {
     this.analyzer.logAnalysis(analysis, this.config.routing.debugMode);
 
     const decision = this.applyRoutingRules(analysis, request.model, conversationId);
+
+    // 决策定下来之后才扣令牌：applyRoutingRules 开头的可用性判断必须是只读的，
+    // 因为那一刻还不知道工具规则会不会把决策覆盖成 DeepSeek。若检查即扣费，
+    // 每个走 DeepSeek 的工具请求都会白扣一次 Sider 额度。
+    if (decision.backend === 'sider' && usesAdaptiveThrottle(this.config.routing.siderStrategy)) {
+      consumeSiderSlot(request.model);
+    }
+
     this.logDecision(decision, analysis);
 
     return decision;
@@ -61,10 +74,12 @@ export class RouterEngine {
    * Sider 现在能不能接这个请求。
    *
    * 只管「要不要**主动选**它」，不影响既有 fallback —— Sider 真失败时该兜底还是兜底。
-   * 三个否决项都来自实测，不是保守裁剪：
-   * - 没配置：无从谈起；
-   * - 配额熔断中：每个模型各有独立额度，撞上去只会拿到 1135 再兜底，白费往返；
-   * - 体量超限：会被 code 603 硬拒，同上。
+   *
+   * 两套策略，由 SIDER_STRATEGY 选择：
+   * - `conservative`（默认）：静态阈值 + 固定冷却熔断。三个否决项都来自实测——
+   *   没配置无从谈起；配额熔断中撞上去只会拿到 1135 再兜底；体量超限会被 603 硬拒。
+   * - `pro` / `max`：熔断/频次/体量三道门全部交给自适应限流器，阈值由运行中的
+   *   603/1135 反馈学习出来，而不是预设。见 utils/sider-throttle.ts。
    */
   private siderUsable(
     analysis: RequestAnalysis,
@@ -72,6 +87,9 @@ export class RouterEngine {
   ): { ok: true } | { ok: false; why: string } {
     if (!this.config.sider.enabled) {
       return { ok: false, why: 'Sider is not configured' };
+    }
+    if (usesAdaptiveThrottle(this.config.routing.siderStrategy)) {
+      return canUseSider(model, analysis.inputCharCount);
     }
     if (isSiderCooling(model)) {
       const seconds = Math.ceil(siderCooldownRemainingMs(model) / 1000);
@@ -84,6 +102,36 @@ export class RouterEngine {
       };
     }
     return { ok: true };
+  }
+
+  /**
+   * Max 策略：工具请求也先投 Sider。
+   *
+   * Sider 原生不提供 Anthropic `tool_use`，靠注入文本工具契约实现（probe 实测
+   * sonnet-5 在单轮、带引号命令、大 schema 等场景均 5/5）。因此这条规则**必须**
+   * 允许 fallback：还原不出调用、或上游报错时要能立刻转 DeepSeek 重做，
+   * 否则 Claude Code 会拿到一段纯文本、判定回合结束、agent 循环停住。
+   *
+   * 不在这里排除 opus 档：限流器会从 1135 反馈里学出该档额度撑不住，
+   * 几次之后自动熔断转 DeepSeek，比在路由里写死一个模型名单更准。
+   */
+  private siderToolsDecision(
+    siderReady: { ok: true } | { ok: false; why: string },
+    kind: string,
+    analysis: RequestAnalysis,
+  ): RoutingDecision | undefined {
+    if (!siderHandlesTools(this.config.routing.siderStrategy) || !siderReady.ok) {
+      return undefined;
+    }
+
+    const names = [...analysis.claudeCodeToolNames, ...analysis.mcpToolNames].slice(0, 3);
+    return {
+      backend: 'sider',
+      reason: `Max strategy: try Sider for ${kind} tools via text contract (${names.join(', ')})`,
+      confidence: 0.7,
+      allowFallback: true,
+      ruleId: 'rule_2_tools_sider_max',
+    };
   }
 
   private applyRoutingRules(
@@ -99,7 +147,11 @@ export class RouterEngine {
       // Sider 未被证明支持 Anthropic `tool_use`。本轮若带了需要 DeepSeek 承接的工具，
       // 就不能仅因为"延续上一回合"而回到 Sider：没有显式 X-Conversation-ID 的请求
       // 共享 `continuous-conversation` 这一个槽位，上一回合很可能是另一段纯对话。
-      const needsToolCapableBackend = analysis.hasClaudeCodeTools || analysis.hasMcpTools;
+      //
+      // Max 策略例外：那时 Sider 通过文本契约本来就能接工具，守卫的前提（Sider 接不了）
+      // 不再成立，继续拦着只会把能留在 Sider 的工具续轮白白推给 DeepSeek。
+      const needsToolCapableBackend = (analysis.hasClaudeCodeTools || analysis.hasMcpTools) &&
+        !siderHandlesTools(this.config.routing.siderStrategy);
       const siderCannotServe = previousBackend === 'sider' &&
         (needsToolCapableBackend || !siderReady.ok);
 
@@ -126,6 +178,9 @@ export class RouterEngine {
     }
 
     if (analysis.hasClaudeCodeTools) {
+      const siderTools = this.siderToolsDecision(siderReady, 'Claude Code', analysis);
+      if (siderTools) return siderTools;
+
       if (!this.config.deepseek.enabled) {
         console.warn('Claude Code tools detected, but DeepSeek is not configured.');
         return {
@@ -149,6 +204,9 @@ export class RouterEngine {
     }
 
     if (analysis.hasMcpTools) {
+      const siderTools = this.siderToolsDecision(siderReady, 'MCP', analysis);
+      if (siderTools) return siderTools;
+
       if (!this.config.deepseek.enabled) {
         console.warn('MCP tools detected, but DeepSeek is not configured.');
         return {

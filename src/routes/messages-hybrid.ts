@@ -23,11 +23,24 @@ import {
 } from '../utils/request-converter';
 import { siderClient, SiderUpstreamError } from '../utils/sider-client';
 import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-availability';
+import {
+  recordSiderOversize,
+  recordSiderQuotaExhausted as recordThrottleQuota,
+  recordSiderSuccess,
+} from '../utils/sider-throttle';
 import { classifyDeepSeekReason, recordUsage } from '../utils/usage-stats';
+import { buildToolContract } from '../utils/textual-tool-use';
+import { persistSiderTelemetry } from '../utils/sider-telemetry';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
 import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
 import { cleanupExpiredSiderSessions, getSiderSessionStats } from '../utils/sider-session-manager';
-import { type Backend, getBackendDisplayName, loadBackendConfig } from '../config/backends';
+import {
+  type Backend,
+  getBackendDisplayName,
+  loadBackendConfig,
+  usesAdaptiveThrottle,
+  siderHandlesTools,
+} from '../config/backends';
 import { RouterEngine } from '../routing/router-engine';
 import { AnthropicApiAdapter, AnthropicBackendError } from '../adapters/anthropic-adapter';
 import { consola } from 'consola';
@@ -128,7 +141,13 @@ messagesRouter.post('/', async (c: Context) => {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
         }
       } else {
-        response = await callSider(anthropicRequest, auth.token, conversationId, parentMessageId);
+        response = await callSider(
+          anthropicRequest,
+          auth.token,
+          logContext,
+          conversationId,
+          parentMessageId,
+        );
 
         if (conversationId || response.sider_session?.conversation_id) {
           routerEngine.recordSessionBackend(
@@ -146,8 +165,6 @@ messagesRouter.post('/', async (c: Context) => {
         backendDisplayName: getBackendDisplayName(decision.backend),
         error: serializeError(error),
       }, `${getBackendDisplayName(decision.backend)} failed:`);
-
-      noteSiderQuotaExhaustion(error, anthropicRequest.model, logContext);
 
       if (!decision.allowFallback || !config.routing.autoFallback) {
         throw error;
@@ -171,7 +188,13 @@ messagesRouter.post('/', async (c: Context) => {
           routerEngine.recordSessionBackend(conversationId, 'deepseek');
         }
       } else if (fallbackBackend === 'sider' && config.sider.enabled) {
-        response = await callSider(anthropicRequest, auth.token, conversationId, parentMessageId);
+        response = await callSider(
+          anthropicRequest,
+          auth.token,
+          logContext,
+          conversationId,
+          parentMessageId,
+        );
         selectedBackend = 'sider';
       } else {
         throw error;
@@ -314,25 +337,67 @@ messagesRouter.post('/', async (c: Context) => {
 });
 
 /**
- * Sider 报 1135（用量超限）时，把该模型标记为熔断。
+ * 把一次 Sider 调用的结果喂回限流层。
  *
- * 只认 1135：其余错误码是上游故障或请求问题，不代表额度耗尽，
- * 熔断它们会把偶发抖动放大成长时间不可用。
+ * `conservative` 只记熔断，且只认 1135：其余错误码是上游故障或请求问题，
+ * 不代表额度耗尽，熔断它们会把偶发抖动放大成长时间不可用。
+ *
+ * `pro` / `max` 下三种信号各驱动一个维度：
+ * - 成功 -> 上探频次与体量上限；
+ * - 1135 -> 乘性降速，连续多次才升级为熔断；
+ * - 603  -> 把体量上限直接降到失败载荷以下。
+ *
+ * 603 在保守策略下没有反馈渠道——那时体量上限是写死的静态值，撞了也学不到东西。
  */
-function noteSiderQuotaExhaustion(
-  error: unknown,
+function noteSiderOutcome(
   model: string,
+  payloadChars: number,
+  error: unknown,
   logContext: RequestLogContext,
+  elapsedMs = 0,
+  hasTools = false,
+  restoredToolUse = false,
 ): void {
-  if (!(error instanceof SiderUpstreamError) || error.siderCode !== 1135) {
-    return;
+  const adaptive = usesAdaptiveThrottle(config.routing.siderStrategy);
+  const siderCode = error instanceof SiderUpstreamError ? error.siderCode : 0;
+
+  if (!error) {
+    if (adaptive) {
+      recordSiderSuccess(model, payloadChars);
+    }
+  } else if (siderCode === 1135) {
+    if (adaptive) {
+      recordThrottleQuota(model);
+    } else {
+      recordSiderQuotaExhausted(model);
+    }
+    logWarn('sider_quota_cooldown', {
+      requestId: logContext.requestId,
+      model,
+      strategy: config.routing.siderStrategy,
+      cooldownMs: adaptive ? undefined : siderCooldownMsFor(model),
+    }, `Sider quota exhausted for ${model}`);
+  } else if (siderCode === 603 && adaptive) {
+    recordSiderOversize(model, payloadChars);
+    logWarn('sider_oversize_learned', {
+      requestId: logContext.requestId,
+      model,
+      payloadChars,
+    }, `Sider rejected ${payloadChars} chars; lowering the learned size limit for ${model}`);
   }
-  recordSiderQuotaExhausted(model);
-  logWarn('sider_quota_cooldown', {
-    requestId: logContext.requestId,
+
+  // Node 侧无 KV，遥测是 no-op；保留调用以保持双侧结构对称。
+  persistSiderTelemetry({
+    ts: Date.now(),
     model,
-    cooldownMs: siderCooldownMsFor(model),
-  }, `Sider quota exhausted for ${model}; routing will skip Sider until cooldown ends`);
+    strategy: config.routing.siderStrategy,
+    payloadChars,
+    ok: !error,
+    siderCode,
+    ms: elapsedMs,
+    hasTools,
+    restoredToolUse,
+  });
 }
 
 function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
@@ -487,9 +552,15 @@ messagesRouter.post('/sider-sessions/cleanup', (c: Context) => {
   }
 });
 
+/** Max 策略 + 请求确实带了工具时，才给 Sider 注入工具契约。 */
+function siderToolContractEnabled(request: AnthropicRequest): boolean {
+  return siderHandlesTools(config.routing.siderStrategy) && !!request.tools?.length;
+}
+
 async function callSider(
   anthropicRequest: AnthropicRequest,
   authToken: string,
+  logContext: RequestLogContext,
   conversationId?: string,
   parentMessageId?: string,
 ): Promise<AnthropicResponse> {
@@ -515,8 +586,52 @@ async function callSider(
     siderRequest.parent_message_id = parentMessageId;
   }
 
-  const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
-  return convertSiderToAnthropic(siderResponse, anthropicRequest.model);
+  // 反馈埋在这里而不是外层 catch：只有这一层同时握有「实际投出的载荷长度」
+  // 与「上游返回的错误码」，而自适应体量学习两者缺一不可。
+  // Max 策略：Sider 的 `tools` 字段只认它自己的原生工具（search/web_browse/…），
+  // Anthropic 工具定义会被 buildSafeToolsConfig 直接丢弃。所以工具能力只能靠
+  // 把契约拼进正文——这也正是 probe 验证时的做法。
+  if (siderToolContractEnabled(anthropicRequest)) {
+    const block = siderRequest.multi_content?.[0];
+    if (block) {
+      block.text = `${block.text}
+
+${buildToolContract(anthropicRequest.tools)}`;
+    }
+  }
+
+  const payloadChars = siderRequest.multi_content?.[0]?.text?.length ?? 0;
+  const startedAt = Date.now();
+  const hasTools = siderToolContractEnabled(anthropicRequest);
+
+  try {
+    const siderResponse = await siderClient.chat(siderRequest, siderAuthToken);
+    const response = convertSiderToAnthropic(siderResponse, anthropicRequest.model, {
+      // 带上原始请求 = 开启文本工具调用还原（需要 tools 的 input_schema 做 schema
+      // 制导修复，以及历史 tool_use id 来识别模型在复述而非发起新调用）。
+      ...(hasTools ? { restoreToolUse: anthropicRequest } : {}),
+    });
+    noteSiderOutcome(
+      anthropicRequest.model,
+      payloadChars,
+      undefined,
+      logContext,
+      Date.now() - startedAt,
+      hasTools,
+      response.content.some((b) => b.type === 'tool_use'),
+    );
+    return response;
+  } catch (error) {
+    noteSiderOutcome(
+      anthropicRequest.model,
+      payloadChars,
+      error,
+      logContext,
+      Date.now() - startedAt,
+      hasTools,
+    );
+    throw error;
+  }
 }
 
 function createStreamingResponse(response: AnthropicResponse, logContext: RequestLogContext) {

@@ -10,7 +10,9 @@
  * - 无持久化是有意的：这是观测便利，不是计费依据。
  */
 
-import type { Backend } from '../config/backends';
+import type { Backend, SiderStrategy } from '../config/backends';
+import { getSiderThrottleSnapshot, type SiderThrottleStat } from './sider-throttle';
+import { currentEffectiveSiderStrategy } from '../config/backends';
 
 /** 最近明细的保留上限；内存占用很小（每条约 200 字节）。 */
 const RECENT_LIMIT = 200;
@@ -154,6 +156,13 @@ export interface UsageSnapshot {
   trend: TrendBucket[];
   /** 工具调用频次 Top 8，按次数降序。 */
   tools: Array<{ name: string; count: number }>;
+  /**
+   * Sider 自适应限流器的当前状态（`SIDER_STRATEGY=pro` / `max` 才有内容）。
+   *
+   * 这是**进程内实时状态**而非累计计数，因此不进 KV：令牌桶余量按实例累加
+   * 毫无意义，跨实例覆盖写也只会让看板在不同实例的状态之间跳动。
+   */
+  siderThrottle: SiderThrottleStat[];
   /** 最近请求（新在前）。不含任何消息内容或 token。 */
   recent: Array<{
     time: string;
@@ -167,6 +176,10 @@ export interface UsageSnapshot {
     ms: number;
     tokens: number;
   }>;
+  /** 开服以来累计请求数，仅供页脚做一行对照。 */
+  lifetimeRequests: number;
+  /** 当前生效的 Sider 调度策略（供页面策略控件高亮当前项）。 */
+  siderStrategy: SiderStrategy;
   note: string;
   /** 聚合数据是否来自持久层；Node 运行时无 Deno KV，恒为 false。 */
   persisted: boolean;
@@ -331,6 +344,9 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
     models,
     trend: buildTrend(now),
     tools,
+    siderThrottle: getSiderThrottleSnapshot(now),
+    lifetimeRequests: totals.requests,
+    siderStrategy: currentEffectiveSiderStrategy(),
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
       model: record.model,

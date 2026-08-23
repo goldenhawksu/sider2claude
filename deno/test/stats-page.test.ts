@@ -47,6 +47,9 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
     backendShare: { sider: '67%', deepseek: '33%' },
     lastHour: { requests: 1, sider: 1, deepseek: 0, fallbacks: 0 },
     tools: [{ name: 'Read', count: 1 }],
+    siderThrottle: [],
+    lifetimeRequests: 1200,
+    siderStrategy: 'conservative',
     recent: [{
       time: '2026-08-22T01:05:00.000Z',
       model: 'claude-opus-4.6',
@@ -181,6 +184,7 @@ Deno.test('stats 页面：所有可变区域都有稳定 id 供局部替换', ()
       'trend-card',
       'backend-card',
       'tools-card',
+      'throttle-card',
       'recent-card',
       'page-sub',
       'page-footer',
@@ -213,7 +217,7 @@ Deno.test('stats 页面：区域数量与刷新脚本的 REGIONS 清单一致', 
   const html = renderStatsPage(snapshot());
   const declared = html.match(/var REGIONS = \[([^\]]+)\]/)?.[1] ?? '';
   const ids = [...declared.matchAll(/'([^']+)'/g)].map((m) => m[1]);
-  assertEquals(ids.length, 8, 'REGIONS 条目数');
+  assertEquals(ids.length, 9, 'REGIONS 条目数');
   // 清单里的每个 id 都必须真的存在于页面，否则该区域永远不会被刷新
   for (const id of ids) {
     assertIncludes(html, `id="${id}"`, `REGIONS 中的 ${id} 对应元素`);
@@ -339,4 +343,88 @@ Deno.test('stats 页面：最近明细标出该条走 DeepSeek 的原因', () =>
     }],
   }) as UsageSnapshot);
   assertIncludes(fell, '受限兜底', '兜底标记');
+});
+
+/**
+ * 激进策略下限流卡片是唯一的观测窗口：速率与体量上限碰撞收敛到了哪里、
+ * 某个模型为什么突然不走 Sider 了，没有这张表全都只能靠猜。
+ */
+Deno.test('stats 页面：限流卡片在保守策略下给出空态提示而非空白', () => {
+  const html = renderStatsPage(snapshot({ siderThrottle: [] }));
+  assertIncludes(html, 'id="throttle-card"', '限流卡片');
+  assertIncludes(html, 'Pro', '空态提示指明启用方式');
+});
+
+Deno.test('stats 页面：限流卡片展示速率、体量上限与熔断剩余', () => {
+  const html = renderStatsPage(snapshot({
+    siderThrottle: [
+      {
+        model: 'claude-opus-4.8',
+        ratePerMin: 4.3,
+        maxChars: 37_400,
+        cooldownMs: 42_000,
+        lastQuotaAt: Date.parse('2026-08-22T01:05:00.000Z'),
+        lastOversizeAt: 0,
+      },
+      {
+        model: 'claude-sonnet-5',
+        ratePerMin: 14.4,
+        maxChars: 44_000,
+        cooldownMs: 0,
+        lastQuotaAt: 0,
+        lastOversizeAt: 0,
+      },
+    ],
+  }));
+
+  assertIncludes(html, '4.3/min', 'opus 的收敛速率');
+  assertIncludes(html, '37,400', 'opus 学到的体量上限');
+  assertIncludes(html, '熔断 42s', '熔断剩余');
+  assertIncludes(html, '14.4/min', 'sonnet 的收敛速率');
+  // 最近一次受限时刻同样按 UTC+8 渲染（01:05Z -> 09:05）
+  assertIncludes(html, '1135 09:05', '最近受限时刻');
+});
+
+/**
+ * 口径统一：看板主体全部是近 24 小时窗口，与趋势图一致。
+ *
+ * 混用「全时累计 + 24 小时趋势」正是此前「归因三项之和对不上 DeepSeek 总数」的
+ * 来源——归因字段是后加的，全时累计把没有该字段的旧数据永久带着，账永远平不了。
+ * 历史累计降级为页脚的一行对照，避免两个口径并排展示导致误读。
+ */
+Deno.test('stats 页面：标注 24 小时口径，历史累计只在页脚做对照', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, '近 24 小时', '口径标注');
+  assertIncludes(html, '开服以来累计 1200 次请求', '页脚历史累计对照');
+});
+
+/**
+ * 策略切换控件。
+ *
+ * 两条硬约束：
+ * 1. 控件必须在所有 REGIONS 之外——放进任一可刷新区域，每 5 秒的 innerHTML
+ *    整体替换会冲掉用户正在操作的按钮焦点。
+ * 2. 三档都要渲染，且当前策略要高亮。
+ */
+Deno.test('stats 页面：策略控件渲染三档，且高亮当前策略', () => {
+  const html = renderStatsPage(snapshot({ siderStrategy: 'max' }));
+  assertIncludes(html, 'id="strategy-control"', '策略控件容器');
+  assertIncludes(html, 'data-strategy="conservative"', 'conservative 档');
+  assertIncludes(html, 'data-strategy="pro"', 'pro 档');
+  assertIncludes(html, 'data-strategy="max"', 'max 档');
+  // max 是当前策略，对应按钮要带 active 类
+  assertIncludes(html, 'data-strategy="max"', 'max 按钮');
+});
+
+Deno.test('stats 页面：策略控件不在 REGIONS 可刷新区域内（关键约束）', () => {
+  const html = renderStatsPage(snapshot());
+  const declared = html.match(/var REGIONS = \[([^\]]+)\]/)?.[1] ?? '';
+  const ids = [...declared.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  assertEquals(ids.includes('strategy-control'), false, '控件不得进入 REGIONS');
+});
+
+Deno.test('stats 页面：策略切换脚本 POST 到 /stats/strategy', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, "'/stats/strategy'", 'POST 目标');
+  assertIncludes(html, 'method:', 'POST 方法');
 });

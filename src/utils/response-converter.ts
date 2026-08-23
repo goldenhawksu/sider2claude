@@ -11,34 +11,68 @@ import type {
   AnthropicResponseContent 
 } from '../types';
 import { consola } from 'consola';
+import type { AnthropicRequest } from '../types/anthropic';
+import { restoreToolUseFromText } from './textual-tool-use';
+
+/**
+ * Sider 承接工具请求时没接住的信号。
+ *
+ * Max 策略下 Sider 靠文本契约发起工具调用（见 utils/textual-tool-use）。
+ * 模型若输出了形状像调用、却解析不出来的行，这一轮就没法还原成 `tool_use`——
+ * 直接把纯文本交给 Claude Code 会让它判定回合结束、agent 循环停住。抛出本错误
+ * 让上层 fallback 到 DeepSeek 重做一次，比让用户对着停住的助手说「请继续」好。
+ *
+ * 注意判据不是「没有 tool_use」：契约明确允许模型在不需要工具时直接作答，
+ * 那是正常回答，不该兜底。
+ */
+export class SiderToolRestoreError extends Error {
+  constructor(public readonly unparsedCount: number) {
+    super(`Sider produced ${unparsedCount} textual tool call(s) that could not be restored`);
+    this.name = 'SiderToolRestoreError';
+  }
+}
 
 /**
  * 转换 Sider 响应到 Anthropic 格式
  */
 export function convertSiderToAnthropic(
   siderResponse: SiderParsedResponse,
-  originalModel: string
+  originalModel: string,
+  options: { restoreToolUse?: AnthropicRequest } = {}
 ): AnthropicResponse {
   // 合并所有文本内容
   const fullText = combineTextParts(siderResponse);
-  
+
   // 计算 token 使用量 (简单估算)
   const usage = estimateTokenUsage(siderResponse, fullText);
-  
+
   // 生成响应 ID
   const responseId = generateResponseId();
+
+  const content: AnthropicResponseContent[] = [];
+  // Max 策略：Sider 按注入的契约用文本发起工具调用，在这里还原成结构化块。
+  if (options.restoreToolUse) {
+    const restored = restoreToolUseFromText(fullText, options.restoreToolUse);
+    if (restored.unparsedCount > 0) {
+      throw new SiderToolRestoreError(restored.unparsedCount);
+    }
+    content.push(...restored.content);
+  } else {
+    content.push({ type: 'text', text: fullText });
+  }
+
+  const hasToolUse = content.some((block) => block.type === 'tool_use');
 
   // 构建 Anthropic 响应
   const anthropicResponse: AnthropicResponse = {
     id: responseId,
     type: 'message',
     role: 'assistant',
-    content: [{
-      type: 'text',
-      text: fullText,
-    }] satisfies AnthropicResponseContent[],
+    content,
     model: originalModel, // 使用原始请求的模型名
-    stop_reason: 'end_turn', // 正常结束
+    // 还原出 tool_use 后必须改判：留着 end_turn 会让 Claude Code 认为回合结束，
+    // agent 循环就此停住——这正是文本工具调用兜底要解决的问题。
+    stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
     usage: usage,
     // 包含 Sider 会话信息（如果有的话）
     ...(siderResponse.conversationId && siderResponse.messageIds ? {
