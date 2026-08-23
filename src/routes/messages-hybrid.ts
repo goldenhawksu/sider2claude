@@ -22,6 +22,7 @@ import {
   validateAnthropicRequest,
 } from '../utils/request-converter';
 import { siderClient, SiderUpstreamError } from '../utils/sider-client';
+import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-availability';
 import { classifyDeepSeekReason, recordUsage } from '../utils/usage-stats';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
 import { cleanupExpiredConversations, getConversationStats } from '../utils/conversation-manager';
@@ -145,6 +146,8 @@ messagesRouter.post('/', async (c: Context) => {
         backendDisplayName: getBackendDisplayName(decision.backend),
         error: serializeError(error),
       }, `${getBackendDisplayName(decision.backend)} failed:`);
+
+      noteSiderQuotaExhaustion(error, anthropicRequest.model, logContext);
 
       if (!decision.allowFallback || !config.routing.autoFallback) {
         throw error;
@@ -309,6 +312,28 @@ messagesRouter.post('/', async (c: Context) => {
     );
   }
 });
+
+/**
+ * Sider 报 1135（用量超限）时，把该模型标记为熔断。
+ *
+ * 只认 1135：其余错误码是上游故障或请求问题，不代表额度耗尽，
+ * 熔断它们会把偶发抖动放大成长时间不可用。
+ */
+function noteSiderQuotaExhaustion(
+  error: unknown,
+  model: string,
+  logContext: RequestLogContext,
+): void {
+  if (!(error instanceof SiderUpstreamError) || error.siderCode !== 1135) {
+    return;
+  }
+  recordSiderQuotaExhausted(model);
+  logWarn('sider_quota_cooldown', {
+    requestId: logContext.requestId,
+    model,
+    cooldownMs: siderCooldownMsFor(model),
+  }, `Sider quota exhausted for ${model}; routing will skip Sider until cooldown ends`);
+}
 
 function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
   if (statusCode === 400) return 400;

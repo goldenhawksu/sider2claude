@@ -59,6 +59,9 @@ DEFAULT_BACKEND=sider
 AUTO_FALLBACK=true
 PREFER_SIDER_FOR_CHAT=true
 DEBUG_ROUTING=false
+
+# 超过此体量的请求不投 Sider（实测 44K 字符会被 code 603 硬拒）
+SIDER_MAX_INPUT_CHARS=30000
 ```
 
 兼容旧变量：
@@ -99,6 +102,8 @@ RouterEngine
 
 ## 路由原则
 
+- **成本前提**：Sider 是包年订阅（边际成本 0），DeepSeek 按量付费。因此策略是
+  「能用 Sider 完成的就不要用 DeepSeek，DeepSeek 只做能力补齐与兜底」。
 - 普通对话优先 Sider。
 - 出现 Claude Code 内置工具（如 `Bash`、`Read`、`Write`、`Edit`、`Task`）必须走 DeepSeek。
 - 出现 `mcp__...` 或未知自定义工具必须走 DeepSeek。
@@ -111,6 +116,24 @@ RouterEngine
 - 会话后端记忆有 TTL（1 小时）与容量上限（500 条，超出按最近使用淘汰），
   并随 `/v1/messages/conversations/cleanup` 一起回收。
 - 普通对话允许 fallback；工具请求不应 fallback 到 Sider，因为 Sider probe 未证明其支持 Anthropic `tool_use`。
+- **Sider 有两道硬约束，路由必须提前避让**（数字均来自实测，见「Sider Probe」一节）：
+  1. 单请求体量：约 32,000 字符通过、44,000 字符被 `code 603: Too many words in
+     the query` 硬拒。`SIDER_MAX_INPUT_CHARS`（默认 30,000）以上不投 Sider。
+  2. 用量额度**按模型分开**：超出返回 `code 1135`。实测同一时刻 sonnet-5 可用而
+     opus-4.8 已耗尽，因此熔断必须按模型隔离，一刀切会误伤还有额度的模型。
+  这两道门只影响「要不要**主动选** Sider」，不改变既有 fallback —— Sider 真失败
+  时该兜底还是兜底。实现在 `RouterEngine.siderUsable()` 与
+  `utils/sider-availability.ts`。
+- 熔断冷却分两档，依据是实测的额度窗口：**opus 档 1 小时**（单窗口仅 2~3 次，
+  等 200 秒仍未恢复，属小时/天级；若实际是天级，一天也只白撞 24 次），
+  **其余 60 秒**（约 6 次/分钟，与上游提示 "try again after 1 minutes" 一致）。
+  只有 `code 1135` 该触发熔断——其余错误码是上游故障，熔断它们会把偶发抖动
+  放大成长时间不可用。
+- 长文本判据（`detectLongFormSignals`）**只看最后一条 user 消息**，不看历史、
+  不看 assistant 回复、不看 `tool_result` 内容。曾经扫描整段对话，导致
+  「对话越长越必然误判」：判据是「出现创作动词 且 出现长文体裁词」，而任何一段
+  像样的编码对话里这两类词都必然出现，实测最后一轮只说「请继续」也会被判成
+  长文生成而路由去 DeepSeek。改这里时不要把输入换回全文。
 - Sider 用 `HTTP 200 + SSE 内 code != 0` 表达业务失败（如 1135 用量超限）。
   这类失败必须转成 `SiderUpstreamError` 上抛（1135 -> 429，其余 -> 502），
   非流式据此触发 fallback，流式在流内发 Anthropic `error` 事件。
@@ -193,6 +216,26 @@ SIDER_PROBE_OUTPUT=sider-capability-probe-results.json
 ```
 
 probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默认提交。
+
+### 深度 probe：Sider 能否承接工具循环
+
+`deno/tools/probe-sider-tool-loop.ts`（共用客户端 `sider-probe-client.ts`）回答的是
+可证伪的问题，不是"模型自称支不支持"。**客户端必须做限速感知**（节流 + 1135 冷却
+重试 + 被限样本从合规率分母剔除），否则测出来的是吞吐而不是能力。
+
+已得结论（2026-08，claude-sonnet-5 / opus 档）：
+
+- Sider **原生不提供** Anthropic `tool_use` 块；
+- 但**契约驱动的文本工具调用可靠**：sonnet-5 单轮 5/5、带引号命令 5/5、
+  无需工具时不乱调 5/5、结果续轮不重复调 5/5、15 工具大 schema 5/5，
+  多轮循环能收敛。还原可直接复用 `parseTextualToolUseLine`；
+- Sider **服务端保存会话**（`cid + parent_message_id`）：首轮 24KB 之后，
+  续轮只需发几百字节即可准确召回，因此 603 限制只约束**单轮新增内容**；
+- 真正的瓶颈是**吞吐与额度**，不是能力：约 6 次/分钟，且 opus 档单窗口仅 2~3 次、
+  200 秒不恢复。**opus 档无法承载 agent 循环**，sonnet 档可以。
+
+因此第 2 期（给 Sider 通道注入工具契约）若要做，**必须只对 sonnet / haiku 开，
+opus 档硬排除**——否则每次都白撞一次限速。
 
 ## 用量统计
 
@@ -320,6 +363,7 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/duplicate-cache-isolation.test.ts`
 - `deno/test/messages-hybrid-stream.test.ts`
 - `deno/test/usage-attribution.test.ts`
+- `deno/test/sider-first-routing.test.ts`
 
 重点覆盖：
 
@@ -332,6 +376,11 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - Sider 的 SSE 内业务错误码（如 1135 用量超限）必须上抛，不能吞成空回复。
 - 带工具的 `tool_result` 续轮不得被会话延续规则路由回 Sider。
 - 重复响应缓存按流式隔离，流式响应不得被等价非流式请求回放。
+- Sider-first 三条：长文本判据不误伤续轮（且真长文需求不被误伤）、超体量请求不投
+  Sider、熔断按模型隔离且到期自动恢复。
+  注意 `sider-availability` 是**模块级全局状态**：任何会真的触发 1135 的测试
+  （如 `sider-upstream-error.test.ts`）都必须在 finally 里 `resetSiderAvailability()`，
+  否则会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
 - DeepSeek 归因：带工具的请求记 `tools` 而非 `fallback`；Sider 受限兜底记
   `fallback`；DeepSeek 无工具真流式必须被计入统计（历史上漏埋）。
 

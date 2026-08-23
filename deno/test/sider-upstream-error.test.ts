@@ -5,6 +5,7 @@
  */
 
 import { Hono } from 'hono';
+import { resetSiderAvailability } from '../src/utils/sider-availability.ts';
 
 function assertEquals<T>(actual: T, expected: T) {
   if (actual !== expected) {
@@ -113,8 +114,7 @@ Deno.test('Sider 用量超限且禁用 fallback：返回 429 错误而非空回�
       PREFER_SIDER_FOR_CHAT: 'true',
       AUTO_FALLBACK: 'false',
     }, async () => {
-      globalThis.fetch = (() =>
-        Promise.resolve(siderResponse(SIDER_LIMIT_SSE))) as typeof fetch;
+      globalThis.fetch = (() => Promise.resolve(siderResponse(SIDER_LIMIT_SSE))) as typeof fetch;
 
       const app = await loadRoute();
       const response = await app.request('/v1/messages', chatRequest());
@@ -130,6 +130,9 @@ Deno.test('Sider 用量超限且禁用 fallback：返回 429 错误而非空回�
     });
   } finally {
     globalThis.fetch = originalFetch;
+    // 这些用例会真的触发 1135 并写入按模型的熔断状态（模块级全局）。
+    // 不复位就会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+    resetSiderAvailability();
   }
 });
 
@@ -172,6 +175,9 @@ Deno.test('Sider 用量超限且允许 fallback：非流式转由 DeepSeek 作�
     });
   } finally {
     globalThis.fetch = originalFetch;
+    // 这些用例会真的触发 1135 并写入按模型的熔断状态（模块级全局）。
+    // 不复位就会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+    resetSiderAvailability();
   }
 });
 
@@ -207,6 +213,9 @@ Deno.test('Sider 已作答时附带的非致命警告不应判定为失败', asy
     });
   } finally {
     globalThis.fetch = originalFetch;
+    // 这些用例会真的触发 1135 并写入按模型的熔断状态（模块级全局）。
+    // 不复位就会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+    resetSiderAvailability();
   }
 });
 
@@ -221,8 +230,7 @@ Deno.test('Sider 用量超限：流式在流内发 error 事件，且 SSE 带 ev
       PREFER_SIDER_FOR_CHAT: 'true',
       AUTO_FALLBACK: 'true',
     }, async () => {
-      globalThis.fetch = (() =>
-        Promise.resolve(siderResponse(SIDER_LIMIT_SSE))) as typeof fetch;
+      globalThis.fetch = (() => Promise.resolve(siderResponse(SIDER_LIMIT_SSE))) as typeof fetch;
 
       const app = await loadRoute();
       const response = await app.request('/v1/messages', chatRequest({ stream: true }));
@@ -246,6 +254,9 @@ Deno.test('Sider 用量超限：流式在流内发 error 事件，且 SSE 带 ev
     });
   } finally {
     globalThis.fetch = originalFetch;
+    // 这些用例会真的触发 1135 并写入按模型的熔断状态（模块级全局）。
+    // 不复位就会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+    resetSiderAvailability();
   }
 });
 
@@ -292,5 +303,8 @@ Deno.test('正常流式回复：SSE 事件带 event: 行且内容块完整', asy
     });
   } finally {
     globalThis.fetch = originalFetch;
+    // 这些用例会真的触发 1135 并写入按模型的熔断状态（模块级全局）。
+    // 不复位就会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+    resetSiderAvailability();
   }
 });

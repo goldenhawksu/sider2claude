@@ -10,6 +10,8 @@ import type { Backend, BackendConfig } from '../config/backends';
 import { getBackendDisplayName } from '../config/backends';
 import type { RequestAnalysis } from '../utils/request-analyzer';
 import { RequestAnalyzer } from '../utils/request-analyzer';
+import { isSiderCooling, siderCooldownRemainingMs } from '../utils/sider-availability';
+import { getEnv } from '../utils/env';
 import { consola } from 'consola';
 
 export interface RoutingDecision {
@@ -19,6 +21,15 @@ export interface RoutingDecision {
   allowFallback: boolean;
   ruleId: string;
 }
+
+/**
+ * 投给 Sider 的请求体量上限（字符）。
+ *
+ * 实测：32,000 字符通过，44,000 字符被 `code 603: Too many words in the query`
+ * 硬拒。取 30,000 留余量。超限的请求投过去必然失败，白费一个往返 —— 与其等
+ * fallback 兜底，不如一开始就别选 Sider。
+ */
+const SIDER_MAX_INPUT_CHARS = Number(getEnv('SIDER_MAX_INPUT_CHARS') ?? '') || 30_000;
 
 /**
  * 会话后端记忆的存活时间与容量上限。
@@ -41,16 +52,48 @@ export class RouterEngine {
     const analysis = this.analyzer.analyze(request);
     this.analyzer.logAnalysis(analysis, this.config.routing.debugMode);
 
-    const decision = this.applyRoutingRules(analysis, conversationId);
+    const decision = this.applyRoutingRules(analysis, request.model, conversationId);
     this.logDecision(decision, analysis);
 
     return decision;
   }
 
+  /**
+   * Sider 现在能不能接这个请求。
+   *
+   * 只管「要不要**主动选**它」，不影响既有 fallback —— Sider 真失败时该兜底还是兜底。
+   * 三个否决项都来自实测，不是保守裁剪：
+   * - 没配置：无从谈起；
+   * - 配额熔断中：每个模型各有独立额度，撞上去只会拿到 1135 再兜底，白费往返；
+   * - 体量超限：会被 code 603 硬拒，同上。
+   */
+  private siderUsable(
+    analysis: RequestAnalysis,
+    model: string,
+  ): { ok: true } | { ok: false; why: string } {
+    if (!this.config.sider.enabled) {
+      return { ok: false, why: 'Sider is not configured' };
+    }
+    if (isSiderCooling(model)) {
+      const seconds = Math.ceil(siderCooldownRemainingMs(model) / 1000);
+      return { ok: false, why: `Sider quota cooling down for ${model} (${seconds}s left)` };
+    }
+    if (analysis.inputCharCount > SIDER_MAX_INPUT_CHARS) {
+      return {
+        ok: false,
+        why: `Input ${analysis.inputCharCount} chars exceeds Sider limit ${SIDER_MAX_INPUT_CHARS}`,
+      };
+    }
+    return { ok: true };
+  }
+
   private applyRoutingRules(
     analysis: RequestAnalysis,
+    model: string,
     conversationId?: string,
   ): RoutingDecision {
+    const siderReady = this.siderUsable(analysis, model);
+
     if (analysis.type === 'tool_result_feedback' && conversationId) {
       const previousBackend = this.getSessionBackend(conversationId);
 
@@ -58,7 +101,8 @@ export class RouterEngine {
       // 就不能仅因为"延续上一回合"而回到 Sider：没有显式 X-Conversation-ID 的请求
       // 共享 `continuous-conversation` 这一个槽位，上一回合很可能是另一段纯对话。
       const needsToolCapableBackend = analysis.hasClaudeCodeTools || analysis.hasMcpTools;
-      const siderCannotServe = previousBackend === 'sider' && needsToolCapableBackend;
+      const siderCannotServe = previousBackend === 'sider' &&
+        (needsToolCapableBackend || !siderReady.ok);
 
       if (previousBackend && !siderCannotServe) {
         return {
@@ -71,10 +115,11 @@ export class RouterEngine {
       }
 
       if (siderCannotServe) {
-        consola.warn('Skipping tool result continuity: Sider cannot serve tool_use requests.', {
+        consola.warn('Skipping tool result continuity: Sider cannot serve this turn.', {
           conversationId: conversationId.substring(0, 12),
           claudeCodeTools: analysis.claudeCodeToolNames.slice(0, 3),
           mcpTools: analysis.mcpToolNames.slice(0, 3),
+          siderReady: siderReady.ok ? 'yes' : siderReady.why,
         });
       }
     }
@@ -122,7 +167,7 @@ export class RouterEngine {
     }
 
     if (analysis.hasSiderTools && !analysis.hasClaudeCodeTools && !analysis.hasMcpTools) {
-      if (this.config.sider.enabled) {
+      if (siderReady.ok) {
         return {
           backend: 'sider',
           reason: `Request contains only Sider native tools: ${analysis.siderToolNames.join(', ')}`,
@@ -156,7 +201,7 @@ export class RouterEngine {
     }
 
     if (analysis.type === 'simple_chat') {
-      if (this.config.routing.preferSiderForSimpleChat && this.config.sider.enabled) {
+      if (this.config.routing.preferSiderForSimpleChat && siderReady.ok) {
         return {
           backend: 'sider',
           reason: 'Simple chat, prefer Sider because Anthropic model text is available there.',
@@ -188,7 +233,7 @@ export class RouterEngine {
     }
 
     const defaultBackend = this.config.routing.defaultBackend;
-    if (defaultBackend === 'sider' && this.config.sider.enabled) {
+    if (defaultBackend === 'sider' && siderReady.ok) {
       return {
         backend: 'sider',
         reason: 'Default backend.',

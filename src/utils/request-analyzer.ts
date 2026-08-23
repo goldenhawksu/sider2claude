@@ -71,7 +71,11 @@ export class RequestAnalyzer {
    */
   analyze(request: AnthropicRequest): RequestAnalysis {
     const inputText = this.extractRequestText(request);
-    const longFormSignals = this.detectLongFormSignals(inputText, request);
+    // 长文本判据只看**当前这一轮用户意图**，不看历史。见 detectLongFormSignals 的说明。
+    const longFormSignals = this.detectLongFormSignals(
+      this.extractLatestUserText(request),
+      request,
+    );
     const analysis: RequestAnalysis = {
       type: this.detectRequestType(request),
       hasClaudeCodeTools: false,
@@ -124,6 +128,45 @@ export class RequestAnalyzer {
     }
 
     return parts.join('\n').trim();
+  }
+
+  /**
+   * 只取最后一条 user 消息的文本 —— 长文本判据的输入。
+   *
+   * 不能用整段对话：判据是「出现创作动词 且 出现长文体裁词」，而任何一段像样的
+   * 编码对话里这两类词都必然出现（"写个脚本""整理成文档""改一下 README"）。
+   * 用全文的结果是**对话越长越必然误判**，且与用户这一轮想干什么完全无关——
+   * 实测最后一轮只说「请继续」也会被判成长文生成而路由去 DeepSeek。
+   *
+   * 同样排除 assistant 回复与 tool_result 内容：Read 出来的一个 README
+   * 不代表用户要写 README。
+   */
+  private extractLatestUserText(request: AnthropicRequest): string {
+    for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+      const message = request.messages[index];
+      if (message?.role !== 'user') continue;
+      const text = this.extractLatestUserBlocks(message.content);
+      if (text.trim()) return text.trim();
+    }
+    return '';
+  }
+
+  /** 与 extractContentText 的差别：跳过 tool_result，它是工具产出不是用户意图。 */
+  private extractLatestUserBlocks(content: unknown): string {
+    if (typeof content === 'string') {
+      return content;
+    }
+    if (!Array.isArray(content)) {
+      return '';
+    }
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') return '';
+        const block = item as { type?: string; text?: string };
+        return block.type === 'text' && typeof block.text === 'string' ? block.text : '';
+      })
+      .filter(Boolean)
+      .join('\n');
   }
 
   private extractContentText(content: unknown): string {

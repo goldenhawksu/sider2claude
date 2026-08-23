@@ -16,9 +16,9 @@ export interface RequestAnalysis {
   longFormSignals: string[];
   inputCharCount: number;
   toolNames: string[];
-  claudeCodeToolNames: string[];  // Claude Code 工具名称
-  mcpToolNames: string[];          // MCP 工具名称
-  siderToolNames: string[];        // Sider 工具名称
+  claudeCodeToolNames: string[]; // Claude Code 工具名称
+  mcpToolNames: string[]; // MCP 工具名称
+  siderToolNames: string[]; // Sider 工具名称
   toolCount: number;
   messageCount: number;
   isMultiTurn: boolean;
@@ -70,7 +70,11 @@ export class RequestAnalyzer {
    */
   analyze(request: AnthropicRequest): RequestAnalysis {
     const inputText = this.extractRequestText(request);
-    const longFormSignals = this.detectLongFormSignals(inputText, request);
+    // 长文本判据只看**当前这一轮用户意图**，不看历史。见 detectLongFormSignals 的说明。
+    const longFormSignals = this.detectLongFormSignals(
+      this.extractLatestUserText(request),
+      request,
+    );
     const analysis: RequestAnalysis = {
       type: this.detectRequestType(request),
       hasClaudeCodeTools: false,
@@ -125,6 +129,45 @@ export class RequestAnalyzer {
     return parts.join('\n').trim();
   }
 
+  /**
+   * 只取最后一条 user 消息的文本 —— 长文本判据的输入。
+   *
+   * 不能用整段对话：判据是「出现创作动词 且 出现长文体裁词」，而任何一段像样的
+   * 编码对话里这两类词都必然出现（"写个脚本""整理成文档""改一下 README"）。
+   * 用全文的结果是**对话越长越必然误判**，且与用户这一轮想干什么完全无关——
+   * 实测最后一轮只说「请继续」也会被判成长文生成而路由去 DeepSeek。
+   *
+   * 同样排除 assistant 回复与 tool_result 内容：Read 出来的一个 README
+   * 不代表用户要写 README。
+   */
+  private extractLatestUserText(request: AnthropicRequest): string {
+    for (let index = request.messages.length - 1; index >= 0; index -= 1) {
+      const message = request.messages[index];
+      if (message?.role !== 'user') continue;
+      const text = this.extractLatestUserBlocks(message.content);
+      if (text.trim()) return text.trim();
+    }
+    return '';
+  }
+
+  /** 与 extractContentText 的差别：跳过 tool_result，它是工具产出不是用户意图。 */
+  private extractLatestUserBlocks(content: unknown): string {
+    if (typeof content === 'string') {
+      return content;
+    }
+    if (!Array.isArray(content)) {
+      return '';
+    }
+    return content
+      .map((item) => {
+        if (!item || typeof item !== 'object') return '';
+        const block = item as { type?: string; text?: string };
+        return block.type === 'text' && typeof block.text === 'string' ? block.text : '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+
   private extractContentText(content: unknown): string {
     if (typeof content === 'string') {
       return content;
@@ -171,18 +214,27 @@ export class RequestAnalyzer {
     const lowerText = normalized.toLowerCase();
 
     const asksToCreate =
-      /(做|制作|生成|输出|撰写|写|整理|设计|创建|起草|拟|改写|扩写|转换|转成|做成|生成一个|做一个)/.test(normalized) ||
-      /\b(create|generate|write|draft|compose|prepare|turn into|convert into|make)\b/i.test(normalized);
+      /(做|制作|生成|输出|撰写|写|整理|设计|创建|起草|拟|改写|扩写|转换|转成|做成|生成一个|做一个)/
+        .test(normalized) ||
+      /\b(create|generate|write|draft|compose|prepare|turn into|convert into|make)\b/i.test(
+        normalized,
+      );
     const hasSourceMaterial =
-      /(用以下内容|基于以下|根据以下|以下内容|素材如下|内容如下|source material|based on the following)/i.test(normalized);
+      /(用以下内容|基于以下|根据以下|以下内容|素材如下|内容如下|source material|based on the following)/i
+        .test(normalized);
     const presentationTarget =
       /\b(ppt|powerpoint|slide deck|slides?|presentation deck|presentation)\b/i.test(normalized) ||
       /(幻灯片|演示文稿|课件|汇报材料|路演材料)/.test(normalized);
     const longFormTarget =
-      /(PPT|ppt|幻灯片|演示文稿|课件|报告|文档|方案|大纲|讲稿|演讲稿|文章|长文|白皮书|脚本|提纲|邮件|README|readme)/.test(normalized) ||
-      /\b(report|document|doc|proposal|outline|article|essay|brief|script|deck|slides?)\b/i.test(normalized);
+      /(PPT|ppt|幻灯片|演示文稿|课件|报告|文档|方案|大纲|讲稿|演讲稿|文章|长文|白皮书|脚本|提纲|邮件|README|readme)/
+        .test(normalized) ||
+      /\b(report|document|doc|proposal|outline|article|essay|brief|script|deck|slides?)\b/i.test(
+        normalized,
+      );
 
-    if (presentationTarget && (asksToCreate || hasSourceMaterial || (request.max_tokens || 0) >= 1024)) {
+    if (
+      presentationTarget && (asksToCreate || hasSourceMaterial || (request.max_tokens || 0) >= 1024)
+    ) {
       signals.add('presentation');
     }
 
@@ -255,7 +307,9 @@ export class RequestAnalyzer {
       console.log(`│    - Claude Code: ${(analysis.hasClaudeCodeTools ? '✅' : '❌').padEnd(31)}│`);
       console.log(`│    - MCP Server: ${(analysis.hasMcpTools ? '✅' : '❌').padEnd(32)}│`);
       console.log(`│    - Sider Native: ${(analysis.hasSiderTools ? '✅' : '❌').padEnd(30)}│`);
-      console.log(`│    - Tool Names: ${analysis.toolNames.join(', ').substring(0, 31).padEnd(31)}│`);
+      console.log(
+        `│    - Tool Names: ${analysis.toolNames.join(', ').substring(0, 31).padEnd(31)}│`,
+      );
     } else {
       console.log('│    (No tools)                                     │');
     }
