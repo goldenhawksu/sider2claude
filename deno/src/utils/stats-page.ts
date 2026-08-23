@@ -61,9 +61,21 @@ function hhmm(iso: string): string {
 /** 分类槽位 1-8，超出的模型折叠成「其他」而不是循环取色。 */
 const SERIES_COUNT = 8;
 
-/** 环形图：按模型请求数构成。返回 SVG 弧段。 */
+/**
+ * 环形图：按模型请求数构成。返回 SVG 弧段。
+ *
+ * 分母刻意用**实际画出的扇区之和**，而不是外部传入的 `total`。
+ * `totals.requests` 由趋势桶求和、`models[]` 由模型×小时桶求和，是两套独立的
+ * KV 计数：窗口内若有一方缺数据（模型维度是后加的，早期桶只有总量没有模型行），
+ * 用 `total` 当分母会让弧长加起来不足一圈，圆环裂成一段缺口。
+ * 环形图表达的是**构成占比**，按自己画的扇区归一化才恒为完整的圆。
+ * `total` 仍用于中心的总请求数——那是另一个语义，不参与弧长计算。
+ */
 function donut(models: ModelStat[], total: number): string {
-  if (total === 0) {
+  const shownTotal = models.reduce((sum, m) => sum + m.requests, 0);
+
+  // 没有模型维度数据就画空环：此时即使 total > 0 也无扇区可画。
+  if (shownTotal === 0) {
     return `<circle cx="90" cy="90" r="62" fill="none" stroke="var(--grid)" stroke-width="26"/>
       <text x="90" y="90" class="donut-empty" text-anchor="middle" dominant-baseline="middle">暂无数据</text>`;
   }
@@ -72,7 +84,7 @@ function donut(models: ModelStat[], total: number): string {
   const C = 2 * Math.PI * R;
   let offset = 0;
   const arcs = models.map((m, i) => {
-    const frac = m.requests / total;
+    const frac = m.requests / shownTotal;
     const len = frac * C;
     // 2px 表面间隙：相邻扇区之间留缝，避免两色直接相接
     const gap = models.length > 1 ? 2 : 0;

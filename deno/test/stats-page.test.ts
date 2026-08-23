@@ -428,3 +428,44 @@ Deno.test('stats 页面：策略切换脚本 POST 到 /stats/strategy', () => {
   assertIncludes(html, "'/stats/strategy'", 'POST 目标');
   assertIncludes(html, 'method:', 'POST 方法');
 });
+
+/**
+ * 环形图必须永远是完整的圆。
+ *
+ * 曾经用外部传入的 `totals.requests` 当分母，而扇区来自 `models[]` —— 两者是
+ * 独立的 KV 计数（总量来自趋势桶，模型行来自后加的模型×小时桶）。窗口内只要
+ * 有一段请求发生在模型维度上线之前，就有总量、没有模型行，弧长加起来不足一圈，
+ * 圆环裂开一道缺口。改为按实际画出的扇区归一化后，无论两套计数差多少都恒为整圆。
+ */
+Deno.test('stats 页面：模型请求数之和小于总请求时，环形图仍是完整的圆', () => {
+  // 总量 100，但模型维度只有 30（70 次发生在模型桶上线之前）
+  const html = renderStatsPage(snapshot({
+    totals: { ...snapshot().totals, requests: 100 },
+    models: [
+      { ...snapshot().models[0]!, model: 'a', requests: 20 },
+      { ...snapshot().models[0]!, model: 'b', requests: 10 },
+    ],
+  }));
+
+  // 每段弧的 dasharray 是 "可见长度 空白长度"，可见长度之和 + 间隙 应铺满整个周长
+  const dashes = [...html.matchAll(/stroke-dasharray="([\d.]+) ([\d.]+)"/g)]
+    .map((m) => Number(m[1]));
+  assertEquals(dashes.length, 2, '扇区数');
+
+  const C = 2 * Math.PI * 62;
+  const gapTotal = 2 * 2; // 两段各留 2px 间隙
+  const covered = dashes.reduce((sum, d) => sum + d, 0);
+  // 允许浮点与间隙误差：覆盖长度 + 间隙 应等于整个周长
+  assertEquals(Math.abs(covered + gapTotal - C) < 1, true, `弧长铺满整圈（实际 ${covered}）`);
+
+  // 中心仍显示真实总请求数，不受归一化影响
+  assertIncludes(html, '>100<', '中心总请求数用 totals.requests');
+});
+
+Deno.test('stats 页面：模型维度无数据时画空环而非碎片', () => {
+  const html = renderStatsPage(snapshot({
+    totals: { ...snapshot().totals, requests: 50 },
+    models: [],
+  }));
+  assertIncludes(html, '暂无数据', '空态');
+});
