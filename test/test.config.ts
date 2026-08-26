@@ -4,7 +4,9 @@
  *
  * 优先级：
  * 1. 运行时环境变量
- * 2. 仓库根目录 .env
+ * 2. dotenv 文件：deno/.env 优先，找不到才回退仓库根 .env（与运行时
+ *    src/utils/env.ts 一致——服务读哪份，测试就得拿哪份，否则测试会拿着
+ *    旧布局里过期的 AUTH_TOKEN 打出一片 401）
  * 3. 测试默认值
  */
 
@@ -34,29 +36,32 @@ function readConfigValue(key: string, defaultValue = ''): string {
 }
 
 function loadDotenv(): Map<string, string> {
-  const values = new Map<string, string>();
-  const envPath = new URL('../.env', import.meta.url);
+  const values = new Map<string>();
+  // 与运行时同语义：按优先级找第一个存在的 dotenv，找到一个就停——
+  // 两份都读会让"改了哪个生效"变成猜谜。
+  for (const envPath of [new URL('../deno/.env', import.meta.url), new URL('../.env', import.meta.url)]) {
+    if (!existsSync(envPath)) {
+      continue;
+    }
 
-  if (!existsSync(envPath)) {
+    const text = readFileSync(envPath, 'utf8');
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) {
+        continue;
+      }
+
+      const separator = line.indexOf('=');
+      if (separator <= 0) {
+        continue;
+      }
+
+      const key = line.slice(0, separator).trim();
+      const rawValue = line.slice(separator + 1).trim();
+      const value = normalizeDotenvValue(rawValue);
+      values.set(key, value);
+    }
     return values;
-  }
-
-  const text = readFileSync(envPath, 'utf8');
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) {
-      continue;
-    }
-
-    const separator = line.indexOf('=');
-    if (separator <= 0) {
-      continue;
-    }
-
-    const key = line.slice(0, separator).trim();
-    const rawValue = line.slice(separator + 1).trim();
-    const value = normalizeDotenvValue(rawValue);
-    values.set(key, value);
   }
 
   return values;
