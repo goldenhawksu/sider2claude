@@ -251,7 +251,10 @@ Deno.test('DeepSeek 适配器：转发工具历史时转录工具上下文以避
     }
     assertEquals(userContent.includes('Previous tool result:'), true);
     assertEquals(userContent.includes('/repo'), true);
-    assertEquals(userContent.includes('Tool protocol:'), true);
+    // 防模仿提示词挂在 system 上（见 prompt-cache.test.ts：挂消息尾部会打断上游缓存前缀）；
+    // tool_choice 是逐轮变化的要求，仍然挂在最后一条 user 消息上。
+    assertEquals(String(calls[0].body.system).includes('Tool protocol:'), true);
+    assertEquals(userContent.includes('Tool protocol:'), false);
     assertEquals(userContent.includes('Tool choice requirement: call the tool named "Bash"'), true);
   } finally {
     globalThis.fetch = originalFetch;
@@ -691,12 +694,16 @@ Deno.test('DeepSeek adapter 的防模仿提示词禁止实际在用的转录格�
       tools: [READ_TOOL],
     } as unknown as AnthropicRequest);
 
+    const systemContent = String(calls[0].body.system);
+    // 提示词必须点名上下文里真实出现的格式，否则等于没禁。
+    assertEquals(systemContent.includes('Previous assistant tool request'), true);
+    // 它必须在 system 上，不能在消息尾部——挂消息尾部会让同一条历史消息在
+    // 下一轮少掉这段后缀，上游 prefix 缓存必然在那里断掉（见 prompt-cache.test.ts）。
     const userContent = calls[0].body.messages[0].content;
     if (typeof userContent !== 'string') {
       throw new Error('断言失败：期望 user content 为文本');
     }
-    // 提示词必须点名上下文里真实出现的格式，否则等于没禁。
-    assertEquals(userContent.includes('Previous assistant tool request'), true);
+    assertEquals(userContent.includes('Tool protocol:'), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

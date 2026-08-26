@@ -40,6 +40,9 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
       cachedReplays: 0,
       inputTokens: 100,
       outputTokens: 200,
+      cacheReadTokens: 900,
+      cacheCreationTokens: 0,
+      cacheHitRate: '90.0%',
       deepseekTools: 1,
       deepseekFallback: 0,
       deepseekRouting: 0,
@@ -316,6 +319,9 @@ Deno.test('stats 页面：后端卡片给出全局 DeepSeek 承接来源', () =>
       cachedReplays: 0,
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      cacheHitRate: '0.0%',
       deepseekTools: 4,
       deepseekFallback: 2,
       deepseekRouting: 1,
@@ -468,4 +474,15 @@ Deno.test('stats 页面：模型维度无数据时画空环而非碎片', () => 
     models: [],
   }));
   assertIncludes(html, '暂无数据', '空态');
+});
+
+/**
+ * 缓存命中率是唯一能反映「fallback 上游花了多少钱」的指标：
+ * DeepSeek 未命中价是命中价的 31 倍，而命中与否没有任何外部现象。
+ * 它必须出现在磁贴区（tiles 已在 REGIONS 里，因此会随页面自动刷新）。
+ */
+Deno.test('stats 页面：磁贴展示上游缓存命中率', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, '90.0%', '命中率数值');
+  assertIncludes(html, '缓存命中', '命中率标签');
 });

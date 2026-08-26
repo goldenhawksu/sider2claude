@@ -214,6 +214,22 @@ RouterEngine
   流式/非流式识别客户端重试的观测语义），因此缓存键必须额外带流式标记，
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
+- **上游 prompt 缓存是 DeepSeek 成本的最大杠杆**（deepseek-v4-flash 命中价 $0.007/M、
+  未命中 $0.22/M，31 倍差）。缓存是自动的、`cache_control` 在该端被忽略，唯一
+  决定命中率的是**发往上游的请求前缀是否逐字节稳定**。三条硬约束
+  （`deno/test/prompt-cache.test.ts` 守着，改动 adapter 前先看它）：
+  1. 固定指令（防模仿提示词等）必须挂 `system`，**绝不能追加到最后一条 user
+     消息尾部**——那条消息下一轮就不再是"最后一条"、后缀消失，同一逻辑位置
+     两轮字节不同，缓存前缀在那里断掉（实测 15 轮 agent 循环命中率 81%→90%）。
+  2. `tools` 数组渲染在最前面，原样透传，不得按轮次增删/重排。
+  3. `tool_choice` 只有 `{type:'tool'}` 会被上游 400（thinking 模式限制，
+     实测见 `deno/tools/probe-deepseek-tool-choice.ts`），仅这一种摘掉改注入
+     文本；auto/any/none 原生透传。注意 `none` 是合法形态，别让它退化进
+     "强制指定工具"分支（曾注入 `named "undefined"`）。
+  上游 usage 的 `cache_read_input_tokens` / `cache_creation_input_tokens` 必须一路
+  透传进统计与 `/stats` 磁贴（`cacheHitRate`）；**`input_tokens` 是未命中的余量**，
+  命中越多它越小，单独看它会误以为输入变少了。迭代工具：`deno/tools/probe-deepseek-cache.ts`
+  （`PROBE_CACHE_MODE=tail-inject` 跑修复前行为的对照组）。
 - DeepSeek 对历史工具轮的 thinking passback 校验很严格；请求侧不要把 Claude Code 压缩后的历史 `thinking` / `tool_use` / `tool_result` 结构原样转发，应转成文本上下文。
 - 历史工具轮被转录成文本后，上游会把转录格式当成调用协议模仿，输出纯文本的
   「工具调用」。这会让响应退化成 `stop_reason: end_turn` 且无 `tool_use` 块，
@@ -470,6 +486,7 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/sider-throttle.test.ts`
 - `deno/test/sider-max-strategy.test.ts`
 - `deno/test/sider-telemetry.test.ts`
+- `deno/test/prompt-cache.test.ts`（上游缓存：usage 缓存字段透传、前缀逐轮稳定、tool_choice 透传边界）
 
 重点覆盖：
 

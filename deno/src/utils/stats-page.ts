@@ -432,7 +432,7 @@ body {
 header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
 h1 { font-size: 18px; margin: 0; font-weight: 600; }
 .sub { color: var(--muted); font-size: 12px; }
-.grid-3 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }
 .row { display: grid; grid-template-columns: 1fr 1.35fr; gap: 16px; margin-bottom: 16px; }
 /* 模型表多一列归因，给它更多宽度，否则模型名会被挤到换行 */
 .row.models { grid-template-columns: 1.3fr 1fr; }
@@ -522,6 +522,9 @@ a { color: var(--s1); }
   <div class="card tile"><div class="v">${
     compact(totals.inputTokens + totals.outputTokens)
   }</div><div class="k">Token 总量</div></div>
+  <div class="card tile"><div class="v">${
+    totals.cacheHitRate
+  }</div><div class="k">缓存命中（${compact(totals.cacheReadTokens)} tok）</div></div>
   <div class="card tile"><div class="v">${totals.fallbacks}</div><div class="k">Fallback 次数</div></div>
   <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>
 </div>

@@ -226,6 +226,8 @@ messagesRouter.post('/', async (c: Context) => {
       ms: elapsedMs,
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
+      cacheReadTokens: response.usage?.cache_read_input_tokens,
+      cacheCreationTokens: response.usage?.cache_creation_input_tokens,
     });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {

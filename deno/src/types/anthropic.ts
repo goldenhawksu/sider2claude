@@ -80,6 +80,14 @@ export interface AnthropicResponse {
   usage: {
     input_tokens: number;
     output_tokens: number;
+    /**
+     * 上游 prompt 缓存计数。DeepSeek 的 Anthropic 兼容端会返回这两个字段，
+     * 且 `input_tokens` 是**未命中的余量**——命中越多它越小。
+     * 因此不透传它们，既看不到命中率，也会让输入 token 统计系统性偏低。
+     * 上游没返回时保持 undefined（不能补 0，否则分不清"没命中"和"没上报"）。
+     */
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
   };
   // Sider 会话信息 (自定义扩展)
   sider_session?: {
@@ -186,6 +194,7 @@ export interface AnthropicTool {
 export type AnthropicToolChoice =
   | { type: 'auto' }
   | { type: 'any' }
+  | { type: 'none' }
   | { type: 'tool'; name: string };
 
 export interface AnthropicToolUse {

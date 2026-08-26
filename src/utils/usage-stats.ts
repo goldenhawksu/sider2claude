@@ -90,6 +90,13 @@ export interface UsageRecord {
   /** 上游返回的 token 用量；流式路径拿不到时按 0 计。 */
   inputTokens: number;
   outputTokens: number;
+  /**
+   * 上游 prompt 缓存计数。**`inputTokens` 是未命中的余量，不含这两项**——
+   * DeepSeek 命中时 input_tokens 会小到只剩新增内容。分开记才算得出成本：
+   * 未命中价是命中价的 31 倍。上游不上报时按 0 计。
+   */
+  cacheReadTokens?: number | undefined;
+  cacheCreationTokens?: number | undefined;
 }
 
 interface RecentEntry {
@@ -136,6 +143,11 @@ export interface UsageSnapshot {
     cachedReplays: number;
     inputTokens: number;
     outputTokens: number;
+    /** 上游 prompt 缓存计数；未命中的余量在 inputTokens 里。 */
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    /** cacheRead / (inputTokens + cacheRead + cacheCreation)，无 prompt token 时为 0.0%。 */
+    cacheHitRate: string;
     /** DeepSeek 承接来源拆分；三者之和恒等于 deepseek。 */
     deepseekTools: number;
     deepseekFallback: number;
@@ -196,6 +208,8 @@ const emptyTotals = () => ({
   cachedReplays: 0,
   inputTokens: 0,
   outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
   deepseekTools: 0,
   deepseekFallback: 0,
   deepseekRouting: 0,
@@ -226,6 +240,8 @@ export function recordUsage(record: UsageRecord): void {
   totals.toolCalls += record.toolUses.length;
   totals.inputTokens += record.inputTokens;
   totals.outputTokens += record.outputTokens;
+  totals.cacheReadTokens += record.cacheReadTokens ?? 0;
+  totals.cacheCreationTokens += record.cacheCreationTokens ?? 0;
   if (record.deepseekReason) totals[REASON_FIELD[record.deepseekReason]] += 1;
   for (const name of record.toolUses) {
     toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
@@ -317,6 +333,20 @@ function buildTrend(now: number): TrendBucket[] {
   return trend;
 }
 
+/**
+ * 命中率 = 命中 / prompt 总量。
+ *
+ * 分母必须是 `inputTokens + cacheRead + cacheCreation`：`inputTokens` 是**未命中的
+ * 余量**，命中越多它越小，拿它单独当分母会算出恒等于 100% 的假命中率。
+ */
+export function formatCacheHitRate(
+  counts: { inputTokens: number; cacheReadTokens: number; cacheCreationTokens: number },
+): string {
+  const prompt = counts.inputTokens + counts.cacheReadTokens + counts.cacheCreationTokens;
+  if (prompt === 0) return '0.0%';
+  return `${((counts.cacheReadTokens / prompt) * 100).toFixed(1)}%`;
+}
+
 export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
   const pct = (part: number) =>
     totals.requests === 0 ? '0%' : `${Math.round((part / totals.requests) * 100)}%`;
@@ -338,7 +368,7 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
 
   return {
     since: new Date(startedAt).toISOString(),
-    totals: { ...totals },
+    totals: { ...totals, cacheHitRate: formatCacheHitRate(totals) },
     backendShare: { sider: pct(totals.sider), deepseek: pct(totals.deepseek) },
     lastHour,
     models,

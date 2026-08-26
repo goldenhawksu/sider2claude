@@ -246,10 +246,12 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       tools: [READ_TOOL],
     } as unknown as AnthropicRequest);
 
-    const userContent = calls[0].body.messages[0].content;
-    expect(typeof userContent).toBe('string');
-    expect(userContent as string).toContain('Tool protocol:');
-    expect(userContent as string).toContain('[tool_use:Name]');
+    // 提示词必须挂在 system 上：挂最后一条 user 消息尾部时，同一条消息在下一轮
+    // 不再带这段后缀，上游 prefix 缓存必然在那里断掉（实测命中率 81%→90%）。
+    const systemContent = String(calls[0].body.system);
+    expect(systemContent).toContain('Tool protocol:');
+    expect(systemContent).toContain('[tool_use:Name]');
+    expect(calls[0].body.messages[0].content as string).not.toContain('Tool protocol:');
   });
 
   test('无工具时不注入提示词', async () => {
@@ -261,8 +263,119 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       max_tokens: 128,
     } as unknown as AnthropicRequest);
 
+    expect(calls[0].body.system).toBeUndefined();
     const userContent = calls[0].body.messages[0].content;
     expect(userContent as string).not.toContain('Tool protocol:');
+  });
+
+  test('多轮之间发往上游的请求前缀逐字节稳定（缓存命中的前提）', async () => {
+    const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
+    const adapter = newAdapter();
+
+    const history = (turn: number) => {
+      const messages: AnthropicRequest['messages'] = [
+        { role: 'user', content: 'start the audit' },
+      ];
+      for (let i = 0; i < turn; i += 1) {
+        messages.push({
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: `toolu_${i}`, name: 'Read', input: { file_path: `f${i}.ts` } },
+          ],
+        });
+        messages.push({
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: `toolu_${i}`, content: `body ${i}` }],
+        });
+      }
+      return messages;
+    };
+
+    for (let turn = 0; turn <= 2; turn += 1) {
+      await adapter.sendRequest({
+        model: 'claude-opus-4.6',
+        system: 'You are Claude Code.',
+        messages: history(turn),
+        max_tokens: 128,
+        tools: [READ_TOOL],
+      } as unknown as AnthropicRequest);
+    }
+
+    for (let i = 1; i < calls.length; i += 1) {
+      const earlier = calls[i - 1].body;
+      const later = calls[i].body;
+      expect(JSON.stringify(later.system)).toBe(JSON.stringify(earlier.system));
+      expect(JSON.stringify(later.tools)).toBe(JSON.stringify(earlier.tools));
+      for (let m = 0; m < earlier.messages.length; m += 1) {
+        expect(JSON.stringify(later.messages[m])).toBe(JSON.stringify(earlier.messages[m]));
+      }
+    }
+  });
+
+  test('上游 usage 的缓存字段透传，不在归一化时被砍掉', async () => {
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as AnthropicRequest;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: 'msg_cache',
+            type: 'message',
+            role: 'assistant',
+            model: body.model,
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              cache_creation_input_tokens: 128,
+              cache_read_input_tokens: 4480,
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+
+    const response = await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 128,
+    } as unknown as AnthropicRequest);
+
+    expect(response.usage.cache_read_input_tokens).toBe(4480);
+    expect(response.usage.cache_creation_input_tokens).toBe(128);
+  });
+
+  test('tool_choice：auto/any/none 原生透传，只有强制指定工具才摘掉改注入文本', async () => {
+    for (const choice of [{ type: 'auto' }, { type: 'any' }, { type: 'none' }] as const) {
+      const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
+      await newAdapter().sendRequest({
+        model: 'claude-opus-4.6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 128,
+        tools: [READ_TOOL],
+        tool_choice: choice,
+      } as unknown as AnthropicRequest);
+
+      expect(JSON.stringify(calls[0].body.tool_choice)).toBe(JSON.stringify(choice));
+      const userContent = calls[0].body.messages[0].content as string;
+      expect(userContent).not.toContain('Tool choice requirement');
+      // 回归：type:'none' 曾经掉进"强制某个工具"分支，注入 `named "undefined"`。
+      expect(userContent).not.toContain('undefined');
+    }
+
+    const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
+    await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 128,
+      tools: [READ_TOOL],
+      tool_choice: { type: 'tool', name: 'Read' },
+    } as unknown as AnthropicRequest);
+
+    expect(calls[0].body.tool_choice).toBeUndefined();
+    expect(calls[0].body.messages[0].content as string)
+      .toContain('Tool choice requirement: call the tool named "Read"');
   });
 
   const BASH_TOOL = {

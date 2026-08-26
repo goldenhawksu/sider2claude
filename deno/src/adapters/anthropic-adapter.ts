@@ -163,10 +163,7 @@ export class AnthropicApiAdapter {
 
   private buildUpstreamRequest(request: AnthropicRequest, stream: boolean): AnthropicRequest {
     const messages = this.applyToolChoiceInstruction(
-      this.applyToolProtocolInstruction(
-        this.sanitizeMessagesForUpstream(request.messages),
-        request.tools,
-      ),
+      this.sanitizeMessagesForUpstream(request.messages),
       request.tool_choice,
     );
 
@@ -175,13 +172,27 @@ export class AnthropicApiAdapter {
       model: this.upstreamModel,
       stream,
       messages,
+      // 防模仿提示词挂在 system 上，不挂在最后一条 user 消息上。
+      // 挂在消息尾部时，同一条消息在下一轮就不再是"最后一条"、也就不再带这段
+      // 后缀——同一个逻辑位置在两轮之间字节不同，上游 prefix 缓存必然在那里断掉。
+      // system 逐轮不变，因此这段文字随稳定前缀一起被缓存。
+      system: this.applyToolProtocolInstruction(request.system, request.tools),
     } as AnthropicRequest & Record<string, unknown>;
+
+    if (upstreamRequest.system === undefined) {
+      delete upstreamRequest.system;
+    }
 
     // DeepSeek 的 Anthropic 兼容端会强制要求完整回传 thinking 块。
     // Claude Code 工具循环里历史 thinking 可能被压缩或重建，历史工具交互因此转成文本转录。
     delete upstreamRequest.thinking;
-    // DeepSeek 当前会拒绝 Anthropic 的强制 tool_choice；用提示保留意图，避免 400。
-    delete upstreamRequest.tool_choice;
+    // 只有 `{type:'tool'}` 会被上游拒绝（"Thinking mode does not support this
+    // tool_choice"，实测见 tools/probe-deepseek-tool-choice.ts）；auto / any / none
+    // 原生透传。原先一律删掉再注入文本，等于给每个带 tool_choice 的请求都在消息
+    // 尾部加一段逐轮变化的文字，白白打断上游缓存前缀。
+    if (request.tool_choice?.type === 'tool') {
+      delete upstreamRequest.tool_choice;
+    }
 
     return upstreamRequest as AnthropicRequest;
   }
@@ -199,21 +210,21 @@ export class AnthropicApiAdapter {
   }
 
   private applyToolProtocolInstruction(
-    messages: AnthropicRequest['messages'],
+    system: AnthropicRequest['system'],
     tools: AnthropicRequest['tools'],
-  ): AnthropicRequest['messages'] {
+  ): AnthropicRequest['system'] {
     if (!tools?.length) {
-      return messages;
+      return system;
     }
 
-    return this.appendInstructionToLastUser(
-      messages,
+    const instruction =
       'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. ' +
-        'Lines like "Previous assistant tool request: name=... id=... input_json=..." and ' +
-        '"Previous tool result: ..." are a read-only transcript of what already happened. ' +
-        'Never reproduce those lines to request a tool, and never write textual tool-call ' +
-        'transcripts such as [tool_use:Name] in normal text.',
-    );
+      'Lines like "Previous assistant tool request: name=... id=... input_json=..." and ' +
+      '"Previous tool result: ..." are a read-only transcript of what already happened. ' +
+      'Never reproduce those lines to request a tool, and never write textual tool-call ' +
+      'transcripts such as [tool_use:Name] in normal text.';
+
+    return system ? `${system}\n\n${instruction}` : instruction;
   }
 
   private appendInstructionToLastUser(
@@ -245,12 +256,9 @@ export class AnthropicApiAdapter {
   private toolChoiceToInstruction(
     toolChoice: AnthropicRequest['tool_choice'],
   ): string | undefined {
-    if (!toolChoice || toolChoice.type === 'auto') {
+    // 只有强制指定某个工具这一种需要文本兜底；其余形态原生透传给上游。
+    if (toolChoice?.type !== 'tool') {
       return undefined;
-    }
-
-    if (toolChoice.type === 'any') {
-      return 'Tool choice requirement: call one of the available tools for this turn.';
     }
 
     return `Tool choice requirement: call the tool named "${toolChoice.name}" for this turn.`;
@@ -460,15 +468,23 @@ export class AnthropicApiAdapter {
     return converted.content;
   }
 
-  private normalizeUsage(usage: unknown): { input_tokens: number; output_tokens: number } {
+  private normalizeUsage(usage: unknown): AnthropicResponse['usage'] {
     if (!usage || typeof usage !== 'object') {
       return { input_tokens: 0, output_tokens: 0 };
     }
 
     const raw = usage as Record<string, unknown>;
+    const optionalCount = (key: string): number | undefined =>
+      typeof raw[key] === 'number' ? raw[key] as number : undefined;
+
+    const cacheCreation = optionalCount('cache_creation_input_tokens');
+    const cacheRead = optionalCount('cache_read_input_tokens');
+
     return {
       input_tokens: typeof raw.input_tokens === 'number' ? raw.input_tokens : 0,
       output_tokens: typeof raw.output_tokens === 'number' ? raw.output_tokens : 0,
+      ...(cacheCreation === undefined ? {} : { cache_creation_input_tokens: cacheCreation }),
+      ...(cacheRead === undefined ? {} : { cache_read_input_tokens: cacheRead }),
     };
   }
 

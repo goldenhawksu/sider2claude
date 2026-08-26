@@ -276,6 +276,8 @@ messagesRouter.post('/', async (c: Context) => {
       ms: elapsedMs,
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
+      cacheReadTokens: response.usage?.cache_read_input_tokens,
+      cacheCreationTokens: response.usage?.cache_creation_input_tokens,
     });
     if (elapsedMs > NON_STREAM_SLOW_MS) {
       logWarn('slow_request', {
@@ -1003,6 +1005,8 @@ function createSiderSynthesizedStreamingResponse(
         ms: elapsedMs,
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
+        cacheReadTokens: response.usage?.cache_read_input_tokens,
+        cacheCreationTokens: response.usage?.cache_creation_input_tokens,
       });
       safeClose();
     },
@@ -1276,6 +1280,8 @@ function createTrueSiderStreamingResponse(
               ms: fallbackMs,
               inputTokens: response.usage?.input_tokens ?? 0,
               outputTokens: response.usage?.output_tokens ?? 0,
+              cacheReadTokens: response.usage?.cache_read_input_tokens,
+              cacheCreationTokens: response.usage?.cache_creation_input_tokens,
             });
             safeClose();
             return;
@@ -1430,6 +1436,8 @@ function createDeepSeekSynthesizedStreamingResponse(
           ms: elapsedMs,
           inputTokens: response.usage?.input_tokens ?? 0,
           outputTokens: response.usage?.output_tokens ?? 0,
+          cacheReadTokens: response.usage?.cache_read_input_tokens,
+          cacheCreationTokens: response.usage?.cache_creation_input_tokens,
         });
         if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
           logWarn('slow_stream_request', {
@@ -1616,17 +1624,28 @@ function createDeepSeekStreamingResponse(
         });
 
         // 透传上游 token 用量：真流式没有汇总响应，只能从事件里捡。
-        // input_tokens 在 message_start，output_tokens 在 message_delta。
+        // input_tokens 与缓存计数都在 message_start，output_tokens 在 message_delta。
         let inputTokens = 0;
         let outputTokens = 0;
+        let cacheReadTokens: number | undefined;
+        let cacheCreationTokens: number | undefined;
         const collectUsage = (chunk: unknown) => {
           const event = chunk as {
             type?: string;
-            message?: { usage?: { input_tokens?: number } };
+            message?: {
+              usage?: {
+                input_tokens?: number;
+                cache_read_input_tokens?: number;
+                cache_creation_input_tokens?: number;
+              };
+            };
             usage?: { output_tokens?: number };
           };
           if (event?.type === 'message_start') {
-            inputTokens = event.message?.usage?.input_tokens ?? inputTokens;
+            const usage = event.message?.usage;
+            inputTokens = usage?.input_tokens ?? inputTokens;
+            cacheReadTokens = usage?.cache_read_input_tokens ?? cacheReadTokens;
+            cacheCreationTokens = usage?.cache_creation_input_tokens ?? cacheCreationTokens;
           } else if (event?.type === 'message_delta') {
             outputTokens = event.usage?.output_tokens ?? outputTokens;
           }
@@ -1661,6 +1680,8 @@ function createDeepSeekStreamingResponse(
               ms: elapsedMs,
               inputTokens,
               outputTokens,
+              cacheReadTokens,
+              cacheCreationTokens,
             });
             if (elapsedMs > STREAM_TOTAL_SLOW_MS) {
               logWarn('slow_stream_request', {

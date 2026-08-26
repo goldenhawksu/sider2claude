@@ -71,6 +71,8 @@ const TREND_FIELDS = new Set([
   'deepseek',
   'inputTokens',
   'outputTokens',
+  'cacheReadTokens',
+  'cacheCreationTokens',
   'fallbacks',
   'streaming',
   'toolCalls',
@@ -161,6 +163,8 @@ export function persistUsage(record: UsageRecord): void {
     sum(['stats', record.backend], 1);
     sum(['stats', 'inputTokens'], record.inputTokens);
     sum(['stats', 'outputTokens'], record.outputTokens);
+    sum(['stats', 'cacheReadTokens'], record.cacheReadTokens ?? 0);
+    sum(['stats', 'cacheCreationTokens'], record.cacheCreationTokens ?? 0);
     if (record.fallback) sum(['stats', 'fallbacks'], 1);
     if (record.stream) sum(['stats', 'streaming'], 1);
     sum(['stats', 'toolCalls'], record.toolUses.length);
@@ -187,6 +191,8 @@ export function persistUsage(record: UsageRecord): void {
     sum([...t, record.backend], 1);
     sum([...t, 'inputTokens'], record.inputTokens);
     sum([...t, 'outputTokens'], record.outputTokens);
+    sum([...t, 'cacheReadTokens'], record.cacheReadTokens ?? 0);
+    sum([...t, 'cacheCreationTokens'], record.cacheCreationTokens ?? 0);
     if (record.fallback) sum([...t, 'fallbacks'], 1);
     if (record.stream) sum([...t, 'streaming'], 1);
     sum([...t, 'toolCalls'], record.toolUses.length);
@@ -350,6 +356,8 @@ export interface PersistentStats {
     cachedReplays: number;
     inputTokens: number;
     outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
     deepseekTools: number;
     deepseekFallback: number;
     deepseekRouting: number;
@@ -439,6 +447,8 @@ async function collect(kv: Deno.Kv, now: number): Promise<PersistentStats | null
     cachedReplays: 0,
     inputTokens: 0,
     outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
     deepseekTools: 0,
     deepseekFallback: 0,
     deepseekRouting: 0,
