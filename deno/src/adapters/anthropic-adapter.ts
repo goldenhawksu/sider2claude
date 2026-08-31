@@ -28,17 +28,17 @@ import {
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
+import {
+  noteThinkingAteBudget,
+  noteThinkingDisabledRejected,
+  shouldDisableThinking,
+  thinkingAteBudget,
+  thinkingDisableRejected,
+  upstreamKey,
+} from '../utils/upstream-capabilities.ts';
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 90_000;
 
-/**
- * 低于这个 `max_tokens` 就主动关掉上游 thinking。
- *
- * 取 1024 来自 probe 实测（tools/probe-upstream-max-tokens.ts）：256 时预算全被
- * 推理吃光、正文 0 字；1024 时才开始有正文（thinking 用掉约 600 tokens）。
- * 阈值取在「刚好够 thinking + 一点正文」的位置，再低就必然拿到空响应。
- */
-const THINKING_MIN_BUDGET_TOKENS = 1024;
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -66,13 +66,71 @@ export class AnthropicApiAdapter {
     this.requestTimeoutMs = parseTimeoutMs();
   }
 
+  /**
+   * 发一轮请求，并在撞上「thinking 吃光预算」时自动重试一次。
+   *
+   * 为什么要重试而不是只记住：那个空响应（`stop_reason=max_tokens` + 只有
+   * thinking + 正文 0 字）对调用方毫无用处，重发一次带 `disabled` 的请求能把
+   * 正常内容交回去——调用方对这次修正完全无感，这正是「换上游不需要改配置」
+   * 要达到的效果。代价只是首次多一次往返，之后就学会了。
+   *
+   * 判据与开关都在 utils/upstream-capabilities.ts：不同 Anthropic 兼容端行为
+   * 并不一致（GLM 有这个缺陷，DeepSeek 官方未必），所以从响应里学，
+   * 不按 provider 名字猜。
+   */
   async sendRequest(
     request: AnthropicRequest,
     logContext?: RequestLogContext,
   ): Promise<AnthropicResponse> {
+    const key = upstreamKey(this.baseUrl, this.upstreamModel);
+    // 调用方显式要了 extended thinking 就别替它做主：预算怎么分是它自己的选择。
+    const callerWantsThinking = request.thinking?.type === 'enabled';
+    const disabledUpFront = !callerWantsThinking &&
+      shouldDisableThinking(key, request.max_tokens);
+
+    const first = await this.sendOnce(request, logContext, disabledUpFront);
+
+    // 已经关过 thinking 还命中，说明不是这个缺陷；调用方自己要的推理也不动；
+    // 上游明确拒绝过 disabled 的，重试只会再吃一个 400。
+    if (
+      disabledUpFront || callerWantsThinking ||
+      thinkingDisableRejected(key) || !thinkingAteBudget(first)
+    ) {
+      return first;
+    }
+
+    noteThinkingAteBudget(key, request.max_tokens ?? 0);
+    logWarn('upstream_thinking_ate_budget', {
+      ...this.contextFields(logContext),
+      provider: this.provider,
+      upstreamModel: this.upstreamModel,
+      maxTokens: request.max_tokens,
+    }, 'Upstream spent the whole token budget on thinking; retrying with thinking disabled');
+
+    try {
+      return await this.sendOnce(request, logContext, true);
+    } catch (error) {
+      // 上游不认这个参数（或重试本身失败）——把原响应交回去，至少不比不重试更糟。
+      if (error instanceof AnthropicBackendError && error.statusCode === 400) {
+        noteThinkingDisabledRejected(key);
+      }
+      logWarn('upstream_thinking_disable_failed', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        error: error instanceof Error ? error.message : String(error),
+      }, 'Retry with thinking disabled failed; returning the original response');
+      return first;
+    }
+  }
+
+  private async sendOnce(
+    request: AnthropicRequest,
+    logContext: RequestLogContext | undefined,
+    disableThinking: boolean,
+  ): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
-    const upstreamRequest = this.buildUpstreamRequest(request, false);
+    const upstreamRequest = this.buildUpstreamRequest(request, false, disableThinking);
 
     logInfo('upstream_request', {
       ...this.contextFields(logContext),
@@ -175,7 +233,11 @@ export class AnthropicApiAdapter {
     };
   }
 
-  private buildUpstreamRequest(request: AnthropicRequest, stream: boolean): AnthropicRequest {
+  private buildUpstreamRequest(
+    request: AnthropicRequest,
+    stream: boolean,
+    disableThinking = false,
+  ): AnthropicRequest {
     const messages = this.applyToolChoiceInstruction(
       this.sanitizeMessagesForUpstream(request.messages),
       request.tool_choice,
@@ -209,23 +271,10 @@ export class AnthropicApiAdapter {
     // Claude Code 工具循环里历史 thinking 可能被压缩或重建，历史工具交互因此转成文本转录。
     delete upstreamRequest.thinking;
 
-    // 小预算下主动关掉 thinking。
-    //
-    // 上游默认开着 thinking，而 thinking 与正文共享 max_tokens。probe 实测
-    // （tools/probe-upstream-max-tokens.ts）max_tokens=16/64/256 时预算全被推理
-    // 吃光，返回 `content=[thinking]`、正文 0 字、`stop_reason=max_tokens`——
-    // 调用方拿到一个「成功但没有内容」的响应。`thinking:{type:'disabled'}` 是
-    // 唯一实测有效的开关（budget_tokens、reasoning.enabled 都被忽略）。
-    //
-    // 只在装不下时才关，不一律关：thinking 是 glm 推理质量的一部分，无差别关掉
-    // 会波及工具调用准确率。调用方显式要了 extended thinking 的更要尊重——
-    // 那时预算怎么分是它自己的选择。
-    if (
-      request.thinking?.type !== 'enabled' &&
-      typeof request.max_tokens === 'number' &&
-      request.max_tokens > 0 &&
-      request.max_tokens < THINKING_MIN_BUDGET_TOKENS
-    ) {
+    // 关掉上游 thinking。**只在实测证明这个上游有「thinking 吃光小预算」的缺陷时**
+    // 才会传 true（见 utils/upstream-capabilities.ts）——不同上游行为不一致，
+    // 无条件关会白白削掉健康上游的推理能力。
+    if (disableThinking) {
       upstreamRequest.thinking = { type: 'disabled' };
     }
 

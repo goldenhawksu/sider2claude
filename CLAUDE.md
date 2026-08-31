@@ -245,9 +245,38 @@ RouterEngine
   3. **thinking 与正文共享 `max_tokens`**：小预算下推理吃光配额，返回
      「HTTP 200 + `stop_reason:max_tokens` + 正文 0 字」。`thinking:{type:'disabled'}`
      是唯一实测有效的开关（`budget_tokens`、`reasoning.enabled` 都被忽略）。
-     故 `max_tokens < 1024` 且调用方没显式要 extended thinking 时，主动注入
-     `disabled`。**不要改成一律关**——thinking 是 glm 推理质量的一部分，
-     无差别关掉会波及工具调用准确率。
+     但这一条**不能硬编码**——见下面「上游能力自适应」。
+
+### 上游能力自适应
+
+`DEEPSEEK_BASE_URL` 可以指向任意 Anthropic 兼容端：今天是 Z.AI 的
+`glm-5.3-flash`，明天可能换回 DeepSeek 官方的 `deepseek-v4-flash`。
+**两家行为并不一致**，且 CLAUDE.md 里的历史记录已经吃过一次亏：早先记着
+「DeepSeek 对 `tool_choice:{type:'tool'}` 会 400」，换成 GLM 后实测不再 400。
+所以上游差异一律**从响应里学**，不按 provider 名字猜、也不要用户配开关。
+
+实现在 `utils/upstream-capabilities.ts`，目前只学一件事：这个上游会不会让
+thinking 吃光小预算。
+
+- **判据**：`stop_reason === 'max_tokens'` 且有 thinking 块且正文为空。三者缺一
+  不可——有正文说明预算够用（那是规范的截断），没 thinking 则是普通输出截断。
+- **首次撞上自动重试**：立刻带 `thinking:{type:'disabled'}` 重发一次，把正常内容
+  交给调用方。那个空响应本来就是废的，重试是净收益，调用方对这次修正无感。
+- **学到之后不再撞**：同一 `baseUrl::model` 的后续小预算请求直接注入，无额外往返。
+  阈值由**实测失败点 × 2** 推出，不写死魔数；失败点只增不减，避免抖动。
+- **上游拒绝 `disabled` 时降级**：记成终态并返回原响应。继续发只会把每个小预算
+  请求都变成 400，比拿到空响应更糟。
+
+对没有这个缺陷的上游（可能包括 DeepSeek 官方），判据永不命中，整套机制零影响。
+
+另两项修复（`none` 摘 tools、`stop_sequences` 服务端截断）**在任何上游下都正确**，
+因此无条件生效，不进能力表：前者「工具不可见」比任何参数都可靠，后者服务端截断
+与上游原生实现结果一致（只是对正确实现的上游略费 token）。
+
+**换上游时要自己确认的一件事**：视觉。DeepSeek 侧支持图片的是
+`deepseek-v4-flash-vision-exp` 这类视觉模型，普通 `deepseek-v4-flash` 未必吃图。
+路由的 `rule_4_vision_input` 只保证图片不被送去 Sider，保证不了上游模型本身认不认
+——配非视觉模型又发图片时，仍会拿到「我没有收到图片」。
 - **视觉输入必须原样透传，且只能走 DeepSeek 通道**。上游（实为 `glm-5.3-flash`）
   是 VLM，原生吃图文混排；Sider 通道走 `multi_content` 协议，实测把图片喂过去
   模型会答「我没有收到图片」——HTTP 200、有回答、只是没看见图。这类**静默失败**
@@ -542,7 +571,8 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/vision-passthrough.test.ts`（图片块原样透传；无图片时仍压平成字符串以保住缓存前缀）
 - `deno/test/tool-choice-none.test.ts`（none 摘 tools 兑现语义、不还原文本工具调用）
 - `deno/test/stop-sequences.test.ts`（正文截断、stop_reason 改判、thinking 不受影响，两通道一致）
-- `deno/test/small-budget-thinking.test.ts`（小 max_tokens 注入 thinking disabled，阈值与尊重显式请求）
+- `deno/test/upstream-capabilities.test.ts`（能力学习：判据、阈值推导、按上游隔离、拒绝降级）
+- `deno/test/upstream-adaptation.test.ts`（adapter 集成：首次自动重试、学后直接注入、无缺陷上游零影响）
 
 重点覆盖：
 
