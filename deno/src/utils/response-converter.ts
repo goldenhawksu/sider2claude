@@ -10,6 +10,7 @@ import type {
 } from '../types/index.ts';
 import type { AnthropicRequest } from '../types/anthropic.ts';
 import { restoreToolUseFromText } from './textual-tool-use.ts';
+import { applyStopSequences } from './stop-sequences.ts';
 
 /**
  * Sider 承接工具请求时没接住的信号。
@@ -35,7 +36,16 @@ export class SiderToolRestoreError extends Error {
 export function convertSiderToAnthropic(
   siderResponse: SiderParsedResponse,
   originalModel: string,
-  options: { includeThinking?: boolean; restoreToolUse?: AnthropicRequest } = {},
+  options: {
+    includeThinking?: boolean;
+    restoreToolUse?: AnthropicRequest;
+    /**
+     * 调用方请求的 stop_sequences。Sider 端完全不支持（实测序列原样输出），
+     * 所以截断在这里做——与 DeepSeek 通道共用 `applyStopSequences`，
+     * 保证同一个 API 不会因为路由到哪个后端而给出不同的 stop_reason。
+     */
+    stopSequences?: string[];
+  } = {},
 ): AnthropicResponse {
   // 合并所有文本内容
   const fullText = combineTextParts(siderResponse);
@@ -74,16 +84,20 @@ export function convertSiderToAnthropic(
 
   const hasToolUse = content.some((block) => block.type === 'tool_use');
 
+  // Sider 不支持 stop_sequences，截断在本层兑现（与 DeepSeek 通道同一份实现）。
+  const stopped = applyStopSequences(content, options.stopSequences);
+
   // 构建 Anthropic 响应
   const anthropicResponse: AnthropicResponse = {
     id: responseId,
     type: 'message',
     role: 'assistant',
-    content,
+    content: stopped.content,
     model: originalModel, // 使用原始请求的模型名
     // 还原出 tool_use 后必须改判：留着 end_turn 会让 Claude Code 认为回合结束，
     // agent 循环就此停住——这正是文本工具调用兜底要解决的问题。
-    stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
+    stop_reason: stopped.matched ? 'stop_sequence' : hasToolUse ? 'tool_use' : 'end_turn',
+    ...(stopped.matched ? { stop_sequence: stopped.matched } : {}),
     usage: usage,
     // 包含 Sider 会话信息（如果有的话）
     ...(siderResponse.conversationId && siderResponse.messageIds

@@ -227,6 +227,26 @@ export class RouterEngine {
       };
     }
 
+    // 视觉输入必须留在看得见图片的后端。
+    //
+    // DeepSeek 端（实为 glm-5.3-flash）是 VLM，原生吃图文混排；Sider 通道走的是另一
+    // 套 multi_content 协议，实测把图片喂过去模型会回答「我没有收到图片」——HTTP 200、
+    // 有回答、只是压根没看见图。这类**静默失败**比报错更糟，调用方无从察觉视觉没生效，
+    // 所以这条规则刻意 `allowFallback: false`：fallback 回 Sider 等于把图再丢一次，
+    // 宁可把错误暴露出来。
+    //
+    // 位置在 Sider 原生工具规则之前：图文请求即便带了 web_search，也要先保住看图能力。
+    // DeepSeek 未配置时不拦截，交给后续规则——那时丢图但仍可用，比直接不可用好。
+    if (analysis.hasImageContent && this.config.deepseek.enabled) {
+      return {
+        backend: 'deepseek',
+        reason: 'Request contains image input; the Sider channel would drop it silently',
+        confidence: 0.95,
+        allowFallback: false,
+        ruleId: 'rule_4_vision_input',
+      };
+    }
+
     if (analysis.hasSiderTools && !analysis.hasClaudeCodeTools && !analysis.hasMcpTools) {
       if (siderReady.ok) {
         return {

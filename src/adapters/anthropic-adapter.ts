@@ -26,6 +26,16 @@ import {
   collectToolInputKeys,
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use';
+import { applyStopSequences } from '../utils/stop-sequences';
+
+/**
+ * 低于这个 `max_tokens` 就主动关掉上游 thinking。
+ *
+ * 取 1024 来自 probe 实测（deno/tools/probe-upstream-max-tokens.ts）：256 时预算全被
+ * 推理吃光、正文 0 字；1024 时才开始有正文（thinking 用掉约 600 tokens）。
+ * 阈值取在「刚好够 thinking + 一点正文」的位置，再低就必然拿到空响应。
+ */
+const THINKING_MIN_BUDGET_TOKENS = 1024;
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -111,6 +121,10 @@ export class AnthropicApiAdapter {
       logContext,
       collectHistoryToolUseIds(request.messages),
       collectToolInputKeys(request.tools),
+      // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
+      // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
+      request.tool_choice?.type !== 'none',
+      request.stop_sequences,
     );
     const elapsed = Date.now() - startTime;
 
@@ -156,6 +170,14 @@ export class AnthropicApiAdapter {
       request.tool_choice,
     );
 
+    // `tool_choice: none` 只能靠隐藏工具兑现：probe 实测上游完全忽略 tool_choice
+    // （no/auto/any/tool/none 五种形态返回一模一样的 tool_use，见
+    // deno/tools/probe-deepseek-tool-choice.ts），透传和注入文本指令都拦不住它。
+    // 代价是这一轮的缓存前缀会变——调用方既然明确说了「这轮别用工具」，
+    // 正确性优先于命中率。
+    const suppressTools = request.tool_choice?.type === 'none';
+    const upstreamTools = suppressTools ? undefined : request.tools;
+
     const upstreamRequest = {
       ...request,
       model: this.upstreamModel,
@@ -165,7 +187,7 @@ export class AnthropicApiAdapter {
       // 挂在消息尾部时，同一条消息在下一轮就不再是"最后一条"、也就不再带这段
       // 后缀——同一个逻辑位置在两轮之间字节不同，上游 prefix 缓存必然在那里断掉。
       // system 逐轮不变，因此这段文字随稳定前缀一起被缓存。
-      system: this.applyToolProtocolInstruction(request.system, request.tools),
+      system: this.applyToolProtocolInstruction(request.system, upstreamTools),
     } as AnthropicRequest & Record<string, unknown>;
 
     if (upstreamRequest.system === undefined) {
@@ -175,6 +197,26 @@ export class AnthropicApiAdapter {
     // DeepSeek 的 Anthropic 兼容端会强制要求完整回传 thinking 块。
     // Claude Code 工具循环里历史 thinking 可能被压缩或重建，历史工具交互因此转成文本转录。
     delete upstreamRequest.thinking;
+
+    // 小预算下主动关掉 thinking。
+    //
+    // 上游默认开着 thinking，而 thinking 与正文共享 max_tokens。probe 实测
+    // （deno/tools/probe-upstream-max-tokens.ts）max_tokens=16/64/256 时预算全被推理
+    // 吃光，返回 `content=[thinking]`、正文 0 字、`stop_reason=max_tokens`——
+    // 调用方拿到一个「成功但没有内容」的响应。`thinking:{type:'disabled'}` 是
+    // 唯一实测有效的开关（budget_tokens、reasoning.enabled 都被忽略）。
+    //
+    // 只在装不下时才关，不一律关：thinking 是 glm 推理质量的一部分，无差别关掉
+    // 会波及工具调用准确率。调用方显式要了 extended thinking 的更要尊重——
+    // 那时预算怎么分是它自己的选择。
+    if (
+      request.thinking?.type !== 'enabled' &&
+      typeof request.max_tokens === 'number' &&
+      request.max_tokens > 0 &&
+      request.max_tokens < THINKING_MIN_BUDGET_TOKENS
+    ) {
+      upstreamRequest.thinking = { type: 'disabled' };
+    }
     // 只有 `{type:'tool'}` 会被上游拒绝（"Thinking mode does not support this
     // tool_choice"，实测见 deno/tools/probe-deepseek-tool-choice.ts）；auto / any / none
     // 原生透传。原先一律删掉再注入文本，等于给每个带 tool_choice 的请求都在消息
@@ -182,6 +224,17 @@ export class AnthropicApiAdapter {
     if (request.tool_choice?.type === 'tool') {
       delete upstreamRequest.tool_choice;
     }
+
+    if (suppressTools) {
+      delete upstreamRequest.tools;
+      // 没有 tools 时 tool_choice 无从谈起，一并摘掉免得上游报参数错。
+      delete upstreamRequest.tool_choice;
+    }
+
+    // stop_sequences 不发给上游：实测它会把截断作用在 thinking 上，推理里撞到序列
+    // 就整个停下，返回 content=[thinking]、正文一个字都没有（常见字符几乎必然出现
+    // 在推理里，等于用了就大概率拿到空响应）。改由 normalizeResponse 在正文上截断。
+    delete upstreamRequest.stop_sequences;
 
     return upstreamRequest as AnthropicRequest;
   }
@@ -254,12 +307,31 @@ ${instruction}` : instruction;
     return `Tool choice requirement: call the tool named "${toolChoice.name}" for this turn.`;
   }
 
+  /**
+   * 把历史消息整理成上游能接受的形态。
+   *
+   * 默认策略是**整条压平成纯文本**：上游在 thinking 模式下会校验
+   * `content[].thinking` 的完整 passback，把 Claude Code 压缩过的历史结构原样
+   * 转发会直接 400（见 deepseek-adapter.test.ts 的转录用例）。
+   *
+   * 唯一的例外是图片。上游是 VLM，原生支持图文混排，压平会让视觉能力静默消失
+   * ——API 收下 200，模型却答「我没有收到图片」。因此含图片的消息改走数组形态：
+   * 图片原样保留，其余块仍按老规矩转成文本块。
+   *
+   * 例外**只对含图片的消息生效**：不含图片的消息必须维持纯字符串，否则发往上游
+   * 的请求前缀会逐轮变形，打断 prompt 缓存（命中与未命中有 31 倍价差，
+   * 见 prompt-cache.test.ts）。
+   */
   private sanitizeMessagesForUpstream(
     messages: AnthropicRequest['messages'],
   ): AnthropicRequest['messages'] {
     return messages.flatMap((message) => {
       if (!Array.isArray(message.content)) {
         return [message];
+      }
+
+      if (message.content.some((block) => block.type === 'image')) {
+        return this.sanitizeMessageWithImages(message);
       }
 
       const textParts = message.content.flatMap((block) => this.contentBlockToText(block));
@@ -278,12 +350,51 @@ ${instruction}` : instruction;
     });
   }
 
+  /**
+   * 含图片的消息：图片原样透传，相邻的非图片块合并成文本块。
+   *
+   * 合并而不是逐块转换，是为了让文本部分的形态与纯文本路径保持一致——
+   * 同一段历史不该因为旁边多了张图就换一种拼法。
+   */
+  private sanitizeMessageWithImages(
+    message: AnthropicMessage,
+  ): AnthropicRequest['messages'] {
+    const blocks: AnthropicContent[] = [];
+    let pendingText: string[] = [];
+
+    const flushText = () => {
+      const text = pendingText.join('\n').trim();
+      if (text) {
+        blocks.push({ type: 'text', text });
+      }
+      pendingText = [];
+    };
+
+    for (const block of message.content as AnthropicContent[]) {
+      if (block.type === 'image') {
+        flushText();
+        blocks.push(block);
+        continue;
+      }
+      pendingText.push(...this.contentBlockToText(block));
+    }
+    flushText();
+
+    if (!blocks.length) {
+      return [];
+    }
+
+    return [{ role: message.role, content: blocks } satisfies AnthropicMessage];
+  }
+
   private contentBlockToText(block: AnthropicContent): string[] {
     if (block.type === 'text') {
       return block.text ? [block.text] : [];
     }
 
     if (block.type === 'image') {
+      // 顶层消息里的图片不会走到这里（由 sanitizeMessageWithImages 原样透传）。
+      // 只有嵌在 tool_result 里的图片会命中——那种位置整体要转文本，留不住结构。
       return ['[image content omitted]'];
     }
 
@@ -325,6 +436,8 @@ ${instruction}` : instruction;
     logContext?: RequestLogContext,
     historyToolUseIds?: Set<string>,
     toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+    allowTextualToolUse = true,
+    stopSequences?: string[],
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -344,22 +457,34 @@ ${instruction}` : instruction;
       logContext,
       historyToolUseIds,
       toolInputKeys,
+      allowTextualToolUse,
     );
     const stopReason = this.normalizeStopReason(raw.stop_reason);
-    const hasToolUse = content.some((block) => block.type === 'tool_use');
+
+    // stop_sequences 在本层兑现：上游要么不支持（Sider），要么把截断作用在
+    // thinking 上并把命中报成 end_turn（glm-5.3-flash，见
+    // deno/tools/probe-upstream-stop-sequences.ts）。两种都不能直接透传给调用方。
+    const stopped = applyStopSequences(content, stopSequences);
+    const hasToolUse = stopped.content.some((block) => block.type === 'tool_use');
 
     return {
       id: typeof raw.id === 'string' ? raw.id : `msg_${Date.now()}`,
       type: 'message',
       role: 'assistant',
-      content,
+      content: stopped.content,
       model: outwardModel,
       // 文本兜底还原出 tool_use 后，stop_reason 必须同步改成 tool_use，
       // 否则 Claude Code 会认为回合结束、停止 agent 循环。
-      stop_reason: hasToolUse && (stopReason === 'end_turn' || stopReason === null)
+      stop_reason: stopped.matched
+        ? 'stop_sequence'
+        : hasToolUse && (stopReason === 'end_turn' || stopReason === null)
         ? 'tool_use'
         : stopReason,
-      ...(typeof raw.stop_sequence === 'string' ? { stop_sequence: raw.stop_sequence } : {}),
+      ...(stopped.matched
+        ? { stop_sequence: stopped.matched }
+        : typeof raw.stop_sequence === 'string'
+        ? { stop_sequence: raw.stop_sequence }
+        : {}),
       usage: this.normalizeUsage(raw.usage),
     };
   }
@@ -369,6 +494,7 @@ ${instruction}` : instruction;
     logContext?: RequestLogContext,
     historyToolUseIds?: Set<string>,
     toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+    allowTextualToolUse = true,
   ): AnthropicResponseContent[] {
     if (!Array.isArray(content) || content.length === 0) {
       throw new Error(`${this.provider} API response missing content array`);
@@ -418,6 +544,11 @@ ${instruction}` : instruction;
 
     const hasStructuredToolUse = normalized.some((block) => block.type === 'tool_use');
     if (hasStructuredToolUse) {
+      return normalized;
+    }
+
+    // `tool_choice: none`：调用方明确禁止工具，转录格式的一行文本就让它保持文本。
+    if (!allowTextualToolUse) {
       return normalized;
     }
 

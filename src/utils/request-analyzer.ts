@@ -24,6 +24,13 @@ export interface RequestAnalysis {
   messageCount: number;
   isMultiTurn: boolean;
   hasToolResult: boolean;
+  /**
+   * 消息里是否出现过图片块。
+   *
+   * 只看「有没有」而不看「在第几轮」：多轮视觉对话里图片往往只出现在首轮，
+   * 但后续追问同样依赖模型看得见那张图，整段会话都必须留在支持视觉的后端。
+   */
+  hasImageContent: boolean;
 }
 
 /**
@@ -92,6 +99,7 @@ export class RequestAnalyzer {
       messageCount: request.messages.length,
       isMultiTurn: request.messages.length > 1,
       hasToolResult: this.hasToolResultInMessages(request),
+      hasImageContent: this.hasImageInMessages(request),
     };
 
     // 分析工具类型
@@ -114,6 +122,29 @@ export class RequestAnalyzer {
     }
 
     return analysis;
+  }
+
+  /**
+   * 消息里有没有图片块（含嵌在 tool_result 里的）。
+   *
+   * 扫描整段历史而不只看最后一轮：多轮视觉对话的图片通常只在首轮出现，
+   * 后续追问依旧要求模型看得见它。
+   */
+  private hasImageInMessages(request: AnthropicRequest): boolean {
+    return request.messages.some((message) => this.contentHasImage(message.content));
+  }
+
+  private contentHasImage(content: unknown): boolean {
+    if (!Array.isArray(content)) {
+      return false;
+    }
+    return content.some((item) => {
+      if (!item || typeof item !== 'object') return false;
+      const block = item as { type?: string; content?: unknown };
+      if (block.type === 'image') return true;
+      if (block.type === 'tool_result') return this.contentHasImage(block.content);
+      return false;
+    });
   }
 
   private extractRequestText(request: AnthropicRequest): string {

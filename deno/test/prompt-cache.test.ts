@@ -257,9 +257,18 @@ Deno.test('tool_choice=auto 原生透传，不注入文本', async () => {
   assertEquals(lastUserText(sent).includes('Tool choice requirement'), false, '不应注入文本');
 });
 
-Deno.test('tool_choice=none 原生透传，绝不能退化成"调用名为 undefined 的工具"', async () => {
+Deno.test('tool_choice=none 摘掉 tools 兑现语义，且绝不退化成"调用名为 undefined 的工具"', async () => {
+  // 原先这里断言 none 原生透传。后来 probe 实测上游**完全忽略 tool_choice**
+  // （no/auto/any/tool/none 五种形态返回一模一样的 tool_use，见
+  // tools/probe-deepseek-tool-choice.ts），透传等于让 none 静默失效——调用方明确
+  // 禁止用工具，却照样拿到 tool_use。所以改为摘掉 tools 来兑现语义，
+  // 见 tool-choice-none.test.ts。
+  //
+  // 本用例保留的是它真正的防线：none 绝不能退化进"强制指定工具"分支，
+  // 那会注入一句 named "undefined" 的鬼话（历史上真的发生过）。
   const sent = await captureWithToolChoice({ type: 'none' });
-  assertEquals(JSON.stringify(sent.tool_choice), JSON.stringify({ type: 'none' }), 'tool_choice');
+  assertEquals(sent.tool_choice, undefined, 'none 时 tool_choice 一并摘掉');
+  assertEquals(sent.tools, undefined, 'none 时 tools 必须摘掉，否则上游照调不误');
   const text = lastUserText(sent);
   assertEquals(text.includes('undefined'), false, '不得出现 undefined 工具名');
   assertEquals(text.includes('Tool choice requirement'), false, '不应注入文本');

@@ -380,3 +380,96 @@ Deno.test('会话后端记忆：重复记录会刷新最近使用顺序', () => 
   assertEquals(router.getSessionBackend('stale'), undefined);
   assertEquals(router.getSessionBackend('refreshed'), 'sider');
 });
+
+// ── 视觉输入路由 ────────────────────────────────────────────────────────────
+//
+// 上游 DeepSeek 端（实为 glm-5.3-flash）是 VLM，原生支持图文混排；Sider 通道走的
+// 是另一套 multi_content 协议，实测把图片喂过去模型会答「我没有收到图片」。
+// 因此带图片的请求必须避开 Sider——否则视觉能力会静默消失：HTTP 200、有回答、
+// 只是模型压根没看见图。这类失败最难被使用方察觉，路由层必须挡住。
+
+function imageRequest(extra: Partial<AnthropicRequest> = {}): AnthropicRequest {
+  return request({
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+        },
+        { type: 'text', text: '这张图是什么颜色？' },
+      ],
+    }],
+    ...extra,
+  } as Partial<AnthropicRequest>);
+}
+
+Deno.test('路由策略：带图片的纯对话走 DeepSeek（Sider 通道会静默丢图）', () => {
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(imageRequest());
+
+  assertEquals(decision.backend, 'deepseek');
+  assertEquals(decision.ruleId, 'rule_4_vision_input');
+});
+
+Deno.test('路由策略：图片请求不允许 fallback 回 Sider', () => {
+  // fallback 到 Sider 等于把图片重新丢掉一次，宁可报错也不要静默降级
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(imageRequest());
+
+  assertEquals(decision.allowFallback, false);
+});
+
+Deno.test('路由策略：多轮对话里只要出现过图片就走 DeepSeek', () => {
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(request({
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+          },
+          { type: 'text', text: '看这张图' },
+        ],
+      },
+      { role: 'assistant', content: '我看到了。' },
+      { role: 'user', content: '它是什么颜色？' },
+    ],
+  } as Partial<AnthropicRequest>));
+
+  assertEquals(decision.backend, 'deepseek');
+  assertEquals(decision.ruleId, 'rule_4_vision_input');
+});
+
+Deno.test('路由策略：纯文本的数组形态 content 不被误判为图片请求', () => {
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(request({
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: '你好，请介绍一下你自己。' }],
+    }],
+  } as Partial<AnthropicRequest>));
+
+  assertEquals(decision.backend, 'sider');
+  assertEquals(decision.ruleId, 'rule_5_simple_chat_prefer_sider');
+});
+
+Deno.test('路由策略：图片 + Claude Code 工具仍走 DeepSeek（两条规则同向）', () => {
+  const router = new RouterEngine(baseConfig());
+
+  const decision = router.decide(imageRequest({
+    tools: [{
+      name: 'Read',
+      description: 'read file',
+      input_schema: { type: 'object', properties: { file_path: { type: 'string' } } },
+    }],
+  } as Partial<AnthropicRequest>));
+
+  assertEquals(decision.backend, 'deepseek');
+});

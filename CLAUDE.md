@@ -230,6 +230,33 @@ RouterEngine
   流式/非流式识别客户端重试的观测语义），因此缓存键必须额外带流式标记，
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
+- **上游三处不符合 Anthropic 规范的行为，一律在本服务层兜住**（probe 脚本见
+  `deno/tools/probe-deepseek-tool-choice.ts`、`probe-upstream-stop-sequences.ts`、
+  `probe-upstream-max-tokens.ts`；改这三处前先重跑对应 probe）：
+  1. **`tool_choice` 被完全忽略**：no/auto/any/tool/none 五种形态返回一模一样的
+     `tool_use`。所以 `none` 只能靠**不发 tools** 兑现（`suppressTools`），
+     透传和注入文本指令都拦不住它；同时响应侧要跳过文本工具调用还原，
+     否则等于替上游把禁令推翻。代价是这一轮缓存前缀会变，属 `none` 语义的必要开销。
+  2. **`stop_sequences` 截断作用在 thinking 上**，推理里撞到序列就整个停下，
+     返回 `content=[thinking]`、正文 0 字；命中还报 `stop_reason:"end_turn"`。
+     因此**不发给上游**，改由 `utils/stop-sequences.ts` 在正文 text 块上截断，
+     Sider 与 DeepSeek 两条通道共用同一份实现（Sider 端压根不支持）。
+     只作用于 text：thinking 是内部推理、`tool_use` 是结构化调用，都不该被切。
+  3. **thinking 与正文共享 `max_tokens`**：小预算下推理吃光配额，返回
+     「HTTP 200 + `stop_reason:max_tokens` + 正文 0 字」。`thinking:{type:'disabled'}`
+     是唯一实测有效的开关（`budget_tokens`、`reasoning.enabled` 都被忽略）。
+     故 `max_tokens < 1024` 且调用方没显式要 extended thinking 时，主动注入
+     `disabled`。**不要改成一律关**——thinking 是 glm 推理质量的一部分，
+     无差别关掉会波及工具调用准确率。
+- **视觉输入必须原样透传，且只能走 DeepSeek 通道**。上游（实为 `glm-5.3-flash`）
+  是 VLM，原生吃图文混排；Sider 通道走 `multi_content` 协议，实测把图片喂过去
+  模型会答「我没有收到图片」——HTTP 200、有回答、只是没看见图。这类**静默失败**
+  最难被使用方察觉，因此：
+  1. `sanitizeMessagesForUpstream` 遇到含图片的消息改走**数组形态** content
+     （图片原样保留、其余块仍转文本）；不含图片的消息**必须维持纯字符串**，
+     否则请求前缀逐轮变形会打断上游 prompt 缓存；
+  2. 路由加 `rule_4_vision_input`，带图片一律走 DeepSeek 且 `allowFallback: false`
+     ——fallback 回 Sider 等于把图再丢一次，宁可把错误暴露出来。
 - **上游 prompt 缓存是 DeepSeek 成本的最大杠杆**（deepseek-v4-flash 命中价 $0.007/M、
   未命中 $0.22/M，31 倍差）。缓存是自动的、`cache_control` 在该端被忽略，唯一
   决定命中率的是**发往上游的请求前缀是否逐字节稳定**。三条硬约束
@@ -512,6 +539,10 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/sider-max-strategy.test.ts`
 - `deno/test/sider-telemetry.test.ts`
 - `deno/test/prompt-cache.test.ts`（上游缓存：usage 缓存字段透传、前缀逐轮稳定、tool_choice 透传边界）
+- `deno/test/vision-passthrough.test.ts`（图片块原样透传；无图片时仍压平成字符串以保住缓存前缀）
+- `deno/test/tool-choice-none.test.ts`（none 摘 tools 兑现语义、不还原文本工具调用）
+- `deno/test/stop-sequences.test.ts`（正文截断、stop_reason 改判、thinking 不受影响，两通道一致）
+- `deno/test/small-budget-thinking.test.ts`（小 max_tokens 注入 thinking disabled，阈值与尊重显式请求）
 
 重点覆盖：
 

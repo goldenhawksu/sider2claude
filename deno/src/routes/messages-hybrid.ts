@@ -698,6 +698,10 @@ async function callSider(
       // 带上原始请求 = 开启文本工具调用还原（需要 tools 的 input_schema 做 schema
       // 制导修复，以及历史 tool_use id 来识别模型在复述而非发起新调用）。
       ...(hasTools ? { restoreToolUse: anthropicRequest } : {}),
+      // Sider 端不支持 stop_sequences，截断在转换层兑现，与 DeepSeek 通道同一实现。
+      ...(anthropicRequest.stop_sequences
+        ? { stopSequences: anthropicRequest.stop_sequences }
+        : {}),
     });
     noteSiderOutcome(
       anthropicRequest.model,

@@ -346,8 +346,8 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     expect(response.usage.cache_creation_input_tokens).toBe(128);
   });
 
-  test('tool_choice：auto/any/none 原生透传，只有强制指定工具才摘掉改注入文本', async () => {
-    for (const choice of [{ type: 'auto' }, { type: 'any' }, { type: 'none' }] as const) {
+  test('tool_choice：auto/any 原生透传；none 摘掉 tools 兑现语义；强制指定工具改注入文本', async () => {
+    for (const choice of [{ type: 'auto' }, { type: 'any' }] as const) {
       const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
       await newAdapter().sendRequest({
         model: 'claude-opus-4.6',
@@ -358,9 +358,29 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       } as unknown as AnthropicRequest);
 
       expect(JSON.stringify(calls[0].body.tool_choice)).toBe(JSON.stringify(choice));
+      expect(calls[0].body.tools).toBeDefined();
       const userContent = calls[0].body.messages[0].content as string;
       expect(userContent).not.toContain('Tool choice requirement');
       // 回归：type:'none' 曾经掉进"强制某个工具"分支，注入 `named "undefined"`。
+      expect(userContent).not.toContain('undefined');
+    }
+
+    // none：probe 实测上游完全忽略 tool_choice（见 deno/tools/probe-deepseek-tool-choice.ts），
+    // 透传等于让它静默失效。改为摘掉 tools——工具不可见才是唯一可靠的做法。
+    {
+      const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
+      await newAdapter().sendRequest({
+        model: 'claude-opus-4.6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 128,
+        tools: [READ_TOOL],
+        tool_choice: { type: 'none' },
+      } as unknown as AnthropicRequest);
+
+      expect(calls[0].body.tools).toBeUndefined();
+      expect(calls[0].body.tool_choice).toBeUndefined();
+      const userContent = calls[0].body.messages[0].content as string;
+      expect(userContent).not.toContain('Tool choice requirement');
       expect(userContent).not.toContain('undefined');
     }
 
