@@ -13,6 +13,7 @@ import {
   canUseSider,
   consumeSiderSlot,
   getSiderThrottleSnapshot,
+  recordSiderConcurrencyLimit,
   recordSiderOversize,
   recordSiderQuotaExhausted,
   recordSiderRejection,
@@ -310,4 +311,89 @@ throttleTest('限流器：1135 与持久性拒绝各自独立计数，不互相�
   recordSiderRejection(MODEL, 707, T0);
 
   assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '两类失败混合后的停投状态');
+});
+
+// ── 并发限流（1101）─────────────────────────────────────────────────────────
+//
+// 线上遥测实测：13 次 1101 全部落在两簇里，中位相邻间隔 6 毫秒，92% 的间隔小于
+// 2 秒，每簇恰好只有一个请求成功——这是「Sider 同一时刻只接一个 active request」，
+// 不是模型坏了。下面第一条是**关键回归**：并发簇绝不能触发停投。
+
+throttleTest('限流器：并发簇（1101）只降速，绝不触发停投（关键回归）', () => {
+  // 模拟一次 10 并发：9 个几乎同时失败，中间没有成功穿插。
+  // 若走持久性拒绝通道，第 3 次就会把一个完全健康的模型停投 5 分钟。
+  for (let i = 0; i < 9; i += 1) {
+    recordSiderConcurrencyLimit(MODEL, T0 + i * 2);
+  }
+
+  const snapshot = getSiderThrottleSnapshot(T0 + 20)[0]!;
+  assertEquals(snapshot.cooldownMs, 0, '并发簇后的停投状态');
+  assertEquals(canUseSider(MODEL, 100, T0 + 60_000).ok, true, '令牌回血后仍可投递');
+});
+
+throttleTest('限流器：一簇并发只降一次速，不把速率打到底', () => {
+  // 实测簇内跨度 267 毫秒、中位间隔 6 毫秒。若逐个降速，9 次会把 12/min 打到
+  // 下限 1（12 × 0.6^9），之后要上百次连续成功才爬得回来——一次并发就长时间
+  // 压制了零边际成本的首选后端。
+  for (let i = 0; i < 9; i += 1) {
+    recordSiderConcurrencyLimit(MODEL, T0 + i * 2);
+  }
+
+  // 只降一次：12 * 0.6 = 7.2
+  assertEquals(getSiderThrottleSnapshot(T0 + 20)[0]?.ratePerMin, 7.2, '一簇并发后的速率');
+});
+
+throttleTest('限流器：超过合并窗口的并发事件会再次降速', () => {
+  recordSiderConcurrencyLimit(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.ratePerMin, 7.2, '首次降速');
+
+  // 1 秒外是另一次独立的并发事件，应当再降一次：7.2 * 0.6 = 4.32
+  recordSiderConcurrencyLimit(MODEL, T0 + 1_500);
+  assertEquals(getSiderThrottleSnapshot(T0 + 1_500)[0]?.ratePerMin, 4.3, '二次降速');
+});
+
+throttleTest('限流器：1101 乘性降速并清空令牌', () => {
+  recordSiderConcurrencyLimit(MODEL, T0);
+
+  // 12 * 0.6 = 7.2，与 1135 同样的降速动作
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.ratePerMin, 7.2, '降速后速率');
+  assertEquals(canUseSider(MODEL, 100, T0).ok, false, '清空令牌后立刻判定');
+});
+
+throttleTest('限流器：1101 不动体量上限', () => {
+  // 并发与载荷大小无关，调体量上限只会在并发结束后留下一个凭空变小的限制
+  recordSiderConcurrencyLimit(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.maxChars, 40_000, '并发限流后的体量上限');
+});
+
+throttleTest('限流器：1101 不累积到持久性停投，与 707 各自独立', () => {
+  // 混着来：2 次 707 + 5 次 1101。若 1101 也累加 rejectStreak，这里会误停投。
+  recordSiderRejection(MODEL, 707, T0);
+  // 拉开间隔越过合并窗口，确保这里测的是「1101 不污染 rejectStreak」本身
+  for (let i = 0; i < 5; i += 1) recordSiderConcurrencyLimit(MODEL, T0 + i * 2_000);
+  recordSiderRejection(MODEL, 707, T0);
+
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '两类失败混合后的停投状态');
+
+  // 第 3 次 707 仍应正常触发停投——1101 既不加速也不阻碍它
+  recordSiderRejection(MODEL, 707, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 5 * 60_000, '第 3 次 707 后停投');
+});
+
+throttleTest('限流器：探测被并发挤掉不算探测失败，退避不翻倍且能再探', () => {
+  for (let i = 0; i < 3; i += 1) recordSiderQuotaExhausted(MODEL, T0);
+
+  const probeTime = T0 + 31_000;
+  consumeSiderSlot(MODEL, probeTime);
+  // 探测撞上并发限流：那是上游容量问题，没有证明"额度还没回来"
+  recordSiderConcurrencyLimit(MODEL, probeTime);
+
+  assertEquals(getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs, 0, '退避不该翻倍');
+  // probeInFlight 必须放掉，否则这个模型再也不会放行下一个探测
+  assertEquals(canUseSider(MODEL, 100, probeTime + 60_000).ok, true, '仍可放行下一个探测');
+});
+
+throttleTest('限流器：快照带出最近一次并发限流时刻', () => {
+  recordSiderConcurrencyLimit(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.lastConcurrencyAt, T0, '最近并发限流时刻');
 });

@@ -374,6 +374,7 @@ Deno.test('stats 页面：健康度卡片展示速率、体量上限与停投剩
         lastOversizeAt: 0,
         lastRejectAt: 0,
         lastRejectCode: 0,
+        lastConcurrencyAt: 0,
       },
       {
         model: 'claude-sonnet-5',
@@ -384,6 +385,7 @@ Deno.test('stats 页面：健康度卡片展示速率、体量上限与停投剩
         lastOversizeAt: 0,
         lastRejectAt: 0,
         lastRejectCode: 0,
+        lastConcurrencyAt: 0,
       },
     ],
     siderHealth: [{
@@ -533,6 +535,7 @@ Deno.test('stats 页面：健康度卡片把错误码翻成人话', () => {
   const codes: Array<[number, string]> = [
     [1135, '额度超限'],
     [603, '体量超限'],
+    [1101, '并发受限'],
     [707, '模型不可用'],
     [999, 'code 999'],
   ];
@@ -564,6 +567,7 @@ Deno.test('stats 页面：健康度卡片合并遥测与进程内限流状态', 
       lastOversizeAt: 0,
       lastRejectAt: 0,
       lastRejectCode: 0,
+      lastConcurrencyAt: 0,
     }],
     siderHealth: [{
       model: 'claude-sonnet-5',
@@ -600,6 +604,7 @@ Deno.test('stats 页面：健康度卡片保留只有进程内状态的模型', 
       lastOversizeAt: 0,
       lastRejectAt: 0,
       lastRejectCode: 0,
+      lastConcurrencyAt: 0,
     }],
     siderHealth: [],
   }));

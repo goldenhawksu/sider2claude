@@ -56,13 +56,13 @@ const BACKOFF_CAP_OPUS_MS = 60 * 60_000;
 const BACKOFF_CAP_DEFAULT_MS = 5 * 60_000;
 
 /**
- * 持久性拒绝：连续这么多次同类业务错误码（非 1135 / 603）才暂停投递。
+ * 持久性拒绝：连续这么多次同类业务错误码（非 1135 / 603 / 1101）才暂停投递。
  *
  * 为什么需要这条通道：1135 是「额度用完了，等会儿再来」，603 是「这次太大了」，
- * 两者都假设**换个时机或换个载荷就能成功**。但实测存在第三类失败——某个模型在
- * Sider 侧根本接不了（`claude-fable-5` 恒返回 707，三次复现无一成功）。这类失败
- * 与时机、载荷都无关，上面两个维度学不到任何东西，于是每个请求都要白撞一次
- * Sider 再 fallback，纯属浪费一次往返。
+ * 1101 是「此刻并发太多」，三者都假设**换个时机或换个载荷就能成功**。但实测存在
+ * 第四类失败——某个模型在 Sider 侧根本接不了（`claude-fable-5` 恒返回 707，三次
+ * 复现无一成功）。这类失败与时机、载荷都无关，上面几个维度学不到任何东西，于是
+ * 每个请求都要白撞一次 Sider 再 fallback，纯属浪费一次往返。
  *
  * 判据保守到三条闸，因为误判的代价是「本来能用的模型被停投」：
  * 1. 只认**明确的上游业务错误码**（siderCode ≠ 0），网络抖动/超时不算；
@@ -74,6 +74,14 @@ const BACKOFF_CAP_DEFAULT_MS = 5 * 60_000;
  */
 const REJECT_STREAK_TO_OPEN = 3;
 const REJECT_BACKOFF_BASE_MS = 5 * 60_000;
+
+/**
+ * 并发限流（1101）的降速合并窗口：这段时间内的多次 1101 只降一次速。
+ *
+ * 取 1 秒是因为实测一簇并发的跨度是 267 毫秒——1 秒足以把一簇合并成一个信号，
+ * 又不至于把两次真正独立的并发事件也吞掉。
+ */
+const CONCURRENCY_DEDUP_MS = 1_000;
 
 interface ModelThrottleState {
   /** 令牌桶当前速率（次/分），桶容量等于速率（允许 1 分钟的突发）。 */
@@ -98,6 +106,8 @@ interface ModelThrottleState {
   /** 最近一次持久性拒绝的时刻与错误码；0 表示从未。 */
   lastRejectAt: number;
   lastRejectCode: number;
+  /** 最近一次并发限流（1101）时刻；0 表示从未。 */
+  lastConcurrencyAt: number;
 }
 
 const states = new Map<string, ModelThrottleState>();
@@ -125,6 +135,7 @@ function stateFor(model: string, now: number): ModelThrottleState {
       lastOversizeAt: 0,
       lastRejectAt: 0,
       lastRejectCode: 0,
+      lastConcurrencyAt: 0,
     };
     states.set(model, state);
   }
@@ -312,9 +323,45 @@ export function recordSiderRejection(
 
   if (state.rejectStreak >= REJECT_STREAK_TO_OPEN) {
     // 起步至少 5 分钟：这类失败不像额度那样持续回血，试探太密没有意义。
-    state.backoffMs = Math.min(backoffCap(model), Math.max(state.backoffMs, REJECT_BACKOFF_BASE_MS));
+    const backoff = Math.max(state.backoffMs, REJECT_BACKOFF_BASE_MS);
+    state.backoffMs = Math.min(backoffCap(model), backoff);
     state.openUntil = now + state.backoffMs;
   }
+}
+
+/**
+ * Sider 返回 1101（并发限流：同一时刻已有请求在途）。
+ *
+ * 实测特征决定了它必须与「持久性拒绝」分开：13 次 1101 全部落在两簇里，中位间隔
+ * **6 毫秒**，92% 的相邻间隔小于 2 秒，每簇恰好只有一个请求成功——这是「同时只
+ * 接一个 active request」，不是模型坏了。
+ *
+ * 因此这里只做**乘性降速**，不累加 `rejectStreak`、不触发停投。一次 10 并发会
+ * 瞬间产生 9 次连续 1101，若走停投通道，第 3 次就会把一个完全健康的模型停投
+ * 5 分钟——并发让「连续 3 次」这个判据变得太容易达成，那是它保护不了的场景。
+ *
+ * 降速是对症的反馈：令牌少了，后续能同时挤进来的请求就少，无效撞击随之减少。
+ */
+export function recordSiderConcurrencyLimit(model: string, now = Date.now()): void {
+  const state = stateFor(model, now);
+
+  // half-open 探测被并发挤掉了，不算探测失败——那是上游容量问题，不是模型没恢复。
+  // 但必须放掉 probeInFlight，否则这个模型再也不会放行下一个探测。
+  // 退避刻意不翻倍：翻倍是给「探测证明了还没恢复」用的，这里没证明任何事。
+  state.probeInFlight = false;
+
+  // 一簇并发是**一个**信号，不是 N 个。实测簇内跨度 267 毫秒、中位间隔 6 毫秒，
+  // 逐个降速会把速率一次打到下限（12 × 0.6⁶ ≈ 0.56，夹到 1），之后要上百次连续
+  // 成功才爬得回来——等于一次并发就长时间压制了零边际成本的首选后端，把 pro
+  // 策略的意义抵消掉。按时间窗口合并：持续并发每秒最多降一次速。
+  if (state.lastConcurrencyAt > 0 && now - state.lastConcurrencyAt < CONCURRENCY_DEDUP_MS) {
+    return;
+  }
+
+  state.lastConcurrencyAt = now;
+  state.successStreak = 0;
+  state.rate = Math.max(RATE_MIN_PER_MIN, state.rate * RATE_DOWN_FACTOR);
+  state.tokens = 0;
 }
 
 /** 看板用的一行状态。 */
@@ -333,6 +380,8 @@ export interface SiderThrottleStat {
   /** 最近一次持久性拒绝的时刻与错误码；0 表示从未。 */
   lastRejectAt: number;
   lastRejectCode: number;
+  /** 最近一次并发限流（1101）时刻；0 表示从未。 */
+  lastConcurrencyAt: number;
 }
 
 /**
@@ -352,6 +401,7 @@ export function getSiderThrottleSnapshot(now = Date.now()): SiderThrottleStat[] 
       lastOversizeAt: state.lastOversizeAt,
       lastRejectAt: state.lastRejectAt,
       lastRejectCode: state.lastRejectCode,
+      lastConcurrencyAt: state.lastConcurrencyAt,
     }))
     .sort((a, b) => b.cooldownMs - a.cooldownMs || a.ratePerMin - b.ratePerMin);
 }

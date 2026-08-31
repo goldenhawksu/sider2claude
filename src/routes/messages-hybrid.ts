@@ -26,6 +26,7 @@ import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-av
 import {
   recordSiderOversize,
   recordSiderQuotaExhausted as recordThrottleQuota,
+  recordSiderConcurrencyLimit,
   recordSiderRejection,
   recordSiderSuccess,
 } from '../utils/sider-throttle';
@@ -387,6 +388,15 @@ function noteSiderOutcome(
       model,
       payloadChars,
     }, `Sider rejected ${payloadChars} chars; lowering the learned size limit for ${model}`);
+  } else if (siderCode === 1101 && adaptive) {
+    // 并发限流：Sider 同一时刻只接一个 active request。实测一簇并发会在几毫秒内
+    // 产生多次连续 1101，**绝不能走停投通道**——那样一次 10 并发就会把一个完全
+    // 健康的模型停投 5 分钟。只降速，让后续能挤进来的请求变少。
+    recordSiderConcurrencyLimit(model);
+    logWarn('sider_concurrency_limited', {
+      requestId: logContext.requestId,
+      model,
+    }, `Sider is busy with another request for ${model}; slowing down`);
   } else if (siderCode !== 0 && adaptive) {
     // 其余**明确的业务错误码**（如 707「该模型不可用」）：既不是时机问题也不是
     // 载荷问题，速率与体量上限调多少都没用。交给持久性拒绝通道——连续 3 次才

@@ -244,6 +244,7 @@ function throttleRows(snapshot: UsageSnapshot): string {
 function siderCodeLabel(code: number): string {
   if (code === 1135) return '额度超限';
   if (code === 603) return '体量超限';
+  if (code === 1101) return '并发受限';
   if (code === 707) return '模型不可用';
   return code > 0 ? `code ${code}` : '失败';
 }
