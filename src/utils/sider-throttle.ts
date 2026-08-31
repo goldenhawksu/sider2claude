@@ -55,6 +55,26 @@ const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CAP_OPUS_MS = 60 * 60_000;
 const BACKOFF_CAP_DEFAULT_MS = 5 * 60_000;
 
+/**
+ * 持久性拒绝：连续这么多次同类业务错误码（非 1135 / 603）才暂停投递。
+ *
+ * 为什么需要这条通道：1135 是「额度用完了，等会儿再来」，603 是「这次太大了」，
+ * 两者都假设**换个时机或换个载荷就能成功**。但实测存在第三类失败——某个模型在
+ * Sider 侧根本接不了（`claude-fable-5` 恒返回 707，三次复现无一成功）。这类失败
+ * 与时机、载荷都无关，上面两个维度学不到任何东西，于是每个请求都要白撞一次
+ * Sider 再 fallback，纯属浪费一次往返。
+ *
+ * 判据保守到三条闸，因为误判的代价是「本来能用的模型被停投」：
+ * 1. 只认**明确的上游业务错误码**（siderCode ≠ 0），网络抖动/超时不算；
+ * 2. 要**连续** 3 次，中间任何一次成功即清零；
+ * 3. 停投可恢复——走与 1135 相同的 half-open 探测，模型恢复了会自己解除。
+ *
+ * 退避起步比 1135 长（5 分钟 vs 30 秒）：额度是持续回血的，值得频繁试探；
+ * 而「模型不支持」通常要等上游改配置，试探太密没有意义。
+ */
+const REJECT_STREAK_TO_OPEN = 3;
+const REJECT_BACKOFF_BASE_MS = 5 * 60_000;
+
 interface ModelThrottleState {
   /** 令牌桶当前速率（次/分），桶容量等于速率（允许 1 分钟的突发）。 */
   rate: number;
@@ -65,6 +85,8 @@ interface ModelThrottleState {
   maxChars: number;
   /** 连续 1135 次数，中间任何一次成功即清零。 */
   quotaStreak: number;
+  /** 连续非 1135/603 业务错误码次数，中间任何一次成功即清零。 */
+  rejectStreak: number;
   /** 熔断到期时刻；0 表示未熔断。 */
   openUntil: number;
   /** 下一次熔断的退避时长。 */
@@ -73,6 +95,9 @@ interface ModelThrottleState {
   probeInFlight: boolean;
   lastQuotaAt: number;
   lastOversizeAt: number;
+  /** 最近一次持久性拒绝的时刻与错误码；0 表示从未。 */
+  lastRejectAt: number;
+  lastRejectCode: number;
 }
 
 const states = new Map<string, ModelThrottleState>();
@@ -92,11 +117,14 @@ function stateFor(model: string, now: number): ModelThrottleState {
       successStreak: 0,
       maxChars: INITIAL_MAX_CHARS,
       quotaStreak: 0,
+      rejectStreak: 0,
       openUntil: 0,
       backoffMs: BACKOFF_BASE_MS,
       probeInFlight: false,
       lastQuotaAt: 0,
       lastOversizeAt: 0,
+      lastRejectAt: 0,
+      lastRejectCode: 0,
     };
     states.set(model, state);
   }
@@ -185,11 +213,13 @@ export function recordSiderSuccess(
 ): void {
   const state = stateFor(model, now);
 
-  // 探测成功 = 额度回来了，解除熔断并把退避重置，下次撞限重新从 30s 起步。
+  // 探测成功 = 上游恢复了（额度回血，或那个模型重新可用），解除熔断并把退避重置，
+  // 下次撞限重新从基础值起步。
   state.openUntil = 0;
   state.probeInFlight = false;
   state.backoffMs = BACKOFF_BASE_MS;
   state.quotaStreak = 0;
+  state.rejectStreak = 0;
 
   state.successStreak += 1;
   if (state.successStreak >= RATE_UP_STREAK) {
@@ -249,6 +279,44 @@ function backoffCap(model: string): number {
   return isOpusTier(model) ? BACKOFF_CAP_OPUS_MS : BACKOFF_CAP_DEFAULT_MS;
 }
 
+/**
+ * Sider 返回 1135 / 603 之外的业务错误码（如 707「该模型不可用」）。
+ *
+ * 与另外两个维度的区别：那两个学的是「什么时候投」和「投多大」，本维度学的是
+ * 「这个模型现在还值不值得投」。因此它不动速率、不动体量上限——那两个参数在
+ * 模型压根接不了的情况下调多少都没用——只在连续失败到阈值时直接暂停投递。
+ *
+ * 复用 1135 的 `openUntil` / `probeInFlight` / `backoffMs`：两者要表达的都是
+ * 「暂停一段时间，到期放一个探测自己摸恢复」，没必要为此再造一套退避状态机。
+ * 只有连续计数是独立的，避免两类失败互相污染对方的阈值。
+ */
+export function recordSiderRejection(
+  model: string,
+  siderCode: number,
+  now = Date.now(),
+): void {
+  const state = stateFor(model, now);
+
+  state.lastRejectAt = now;
+  state.lastRejectCode = siderCode;
+  state.successStreak = 0;
+  state.rejectStreak += 1;
+
+  // 探测又被拒：上游还没恢复，退避翻倍再等。
+  if (state.probeInFlight) {
+    state.probeInFlight = false;
+    state.backoffMs = Math.min(backoffCap(model), state.backoffMs * 2);
+    state.openUntil = now + state.backoffMs;
+    return;
+  }
+
+  if (state.rejectStreak >= REJECT_STREAK_TO_OPEN) {
+    // 起步至少 5 分钟：这类失败不像额度那样持续回血，试探太密没有意义。
+    state.backoffMs = Math.min(backoffCap(model), Math.max(state.backoffMs, REJECT_BACKOFF_BASE_MS));
+    state.openUntil = now + state.backoffMs;
+  }
+}
+
 /** 看板用的一行状态。 */
 export interface SiderThrottleStat {
   model: string;
@@ -262,6 +330,9 @@ export interface SiderThrottleStat {
   lastQuotaAt: number;
   /** 最近一次 603 时刻（毫秒时间戳）；0 表示从未。 */
   lastOversizeAt: number;
+  /** 最近一次持久性拒绝的时刻与错误码；0 表示从未。 */
+  lastRejectAt: number;
+  lastRejectCode: number;
 }
 
 /**
@@ -279,6 +350,8 @@ export function getSiderThrottleSnapshot(now = Date.now()): SiderThrottleStat[] 
       cooldownMs: state.openUntil > now ? state.openUntil - now : 0,
       lastQuotaAt: state.lastQuotaAt,
       lastOversizeAt: state.lastOversizeAt,
+      lastRejectAt: state.lastRejectAt,
+      lastRejectCode: state.lastRejectCode,
     }))
     .sort((a, b) => b.cooldownMs - a.cooldownMs || a.ratePerMin - b.ratePerMin);
 }

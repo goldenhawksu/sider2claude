@@ -33,3 +33,21 @@ export async function readSiderTelemetry(): Promise<SiderTelemetryRecord[]> {
 export function resetSiderTelemetry(): void {
   // no-op
 }
+
+/**
+ * 看板用：某个模型近期在 Sider 侧的表现。结构与 Deno 侧一致。
+ */
+export interface SiderHealthStat {
+  model: string;
+  attempts: number;
+  ok: number;
+  failed: number;
+  lastCode: number;
+  lastFailedAt: number;
+  avgMs: number;
+}
+
+/** Node 侧无 KV，遥测没有存量可聚合，恒返回空——看板会退化为只显示进程内限流状态。 */
+export async function aggregateSiderHealth(): Promise<SiderHealthStat[]> {
+  return [];
+}

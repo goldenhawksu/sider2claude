@@ -26,6 +26,7 @@ import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-av
 import {
   recordSiderOversize,
   recordSiderQuotaExhausted as recordThrottleQuota,
+  recordSiderRejection,
   recordSiderSuccess,
 } from '../utils/sider-throttle';
 import { classifyDeepSeekReason, recordUsage } from '../utils/usage-stats';
@@ -386,6 +387,19 @@ function noteSiderOutcome(
       model,
       payloadChars,
     }, `Sider rejected ${payloadChars} chars; lowering the learned size limit for ${model}`);
+  } else if (siderCode !== 0 && adaptive) {
+    // 其余**明确的业务错误码**（如 707「该模型不可用」）：既不是时机问题也不是
+    // 载荷问题，速率与体量上限调多少都没用。交给持久性拒绝通道——连续 3 次才
+    // 暂停投递，且到期用 half-open 探测自己摸恢复。
+    //
+    // 只认 siderCode ≠ 0：网络抖动/超时拿不到业务码，那才是「偶发上游故障」，
+    // 学它会把一次抖动放大成 5 分钟不可用。
+    recordSiderRejection(model, siderCode);
+    logWarn('sider_upstream_rejected', {
+      requestId: logContext.requestId,
+      model,
+      siderCode,
+    }, `Sider rejected ${model} with code ${siderCode}`);
   }
 
   // Node 侧无 KV，遥测是 no-op；保留调用以保持双侧结构对称。

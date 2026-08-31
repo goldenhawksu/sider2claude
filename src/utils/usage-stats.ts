@@ -12,6 +12,7 @@
 
 import type { Backend, SiderStrategy } from '../config/backends';
 import { getSiderThrottleSnapshot, type SiderThrottleStat } from './sider-throttle';
+import type { SiderHealthStat } from './sider-telemetry';
 import { currentEffectiveSiderStrategy } from '../config/backends';
 
 /** 最近明细的保留上限；内存占用很小（每条约 200 字节）。 */
@@ -175,6 +176,13 @@ export interface UsageSnapshot {
    * 毫无意义，跨实例覆盖写也只会让看板在不同实例的状态之间跳动。
    */
   siderThrottle: SiderThrottleStat[];
+  /**
+   * 近期 Sider 实测表现，按模型聚合（跨实例，来自 KV 遥测）。
+   *
+   * Node/Bun 侧无 Deno KV，恒为空数组；看板会退化为只显示进程内限流状态。
+   * 字段保留是为了让 `stats-page.ts` 两侧保持一致。
+   */
+  siderHealth: SiderHealthStat[];
   /** 最近请求（新在前）。不含任何消息内容或 token。 */
   recent: Array<{
     time: string;
@@ -375,6 +383,8 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
     trend: buildTrend(now),
     tools,
     siderThrottle: getSiderThrottleSnapshot(now),
+    // Node 侧无 KV 遥测可聚合，恒为空。
+    siderHealth: [],
     lifetimeRequests: totals.requests,
     siderStrategy: currentEffectiveSiderStrategy(),
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({

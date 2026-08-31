@@ -14,6 +14,7 @@
 
 import type { Backend, SiderStrategy } from '../config/backends.ts';
 import { getSiderThrottleSnapshot, type SiderThrottleStat } from './sider-throttle.ts';
+import { aggregateSiderHealth, type SiderHealthStat } from './sider-telemetry.ts';
 import {
   currentEffectiveSiderStrategy,
   resolveEffectiveSiderStrategy,
@@ -186,6 +187,13 @@ export interface UsageSnapshot {
    * 毫无意义，跨实例覆盖写也只会让看板在不同实例的状态之间跳动。
    */
   siderThrottle: SiderThrottleStat[];
+  /**
+   * 近期 Sider 实测表现，按模型聚合（跨实例，来自 KV 遥测）。
+   *
+   * 补 `siderThrottle` 的观测缺口：那张表是进程内状态，而 Deploy 多实例 + 空闲
+   * 回收意味着快照几乎必然来自一个没有碰撞记录的实例。Node/Bun 侧无 KV，恒为空。
+   */
+  siderHealth: SiderHealthStat[];
   /** 最近请求（新在前）。不含任何消息内容或 token。 */
   recent: Array<{
     time: string;
@@ -393,6 +401,8 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {  const pct =
     trend: buildTrend(now),
     tools,
     siderThrottle: getSiderThrottleSnapshot(now),
+    // 遥测聚合要读 KV，同步快照给不出；由 buildStatsSnapshot 覆盖。
+    siderHealth: [],
     lifetimeRequests: totals.requests,
     siderStrategy: currentEffectiveSiderStrategy(),
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
@@ -450,9 +460,10 @@ async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
   // 展示路径等 KV 读回来再定策略：getUsageSnapshot 里用的是同步版，冷实例上会先
   // 返回环境变量兜底值，多实例下 /stats 每 5 秒自动刷新就会周期性跳回默认档。
   const siderStrategy = await resolveEffectiveSiderStrategy();
+  const siderHealth = await aggregateSiderHealth(now);
   const persistent = await readPersistentStats(now);
   if (!persistent) {
-    return { ...local, siderStrategy };
+    return { ...local, siderStrategy, siderHealth };
   }
 
   const pct = (part: number) =>
@@ -480,6 +491,7 @@ async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
   return {
     ...local,
     siderStrategy,
+    siderHealth,
     since: new Date(persistent.since).toISOString(),
     totals: { ...persistent.totals, cacheHitRate: formatCacheHitRate(persistent.totals) },
     backendShare: {

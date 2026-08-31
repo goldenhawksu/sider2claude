@@ -127,3 +127,98 @@ export function resetSiderTelemetry(): void {
   currentHour = 0;
   writtenThisHour = 0;
 }
+
+/**
+ * 看板用：某个模型近期在 Sider 侧的表现。
+ *
+ * 与 `SiderThrottleStat` 的分工：那个是**进程内**的限流器实时状态（令牌桶速率、
+ * 学到的体量上限），本结构是**跨实例**的实测结果聚合。生产上 Deploy 会拉起多个
+ * 隔离实例并回收空闲实例，`/stats` 的快照几乎必然来自一个没有碰撞记录的实例，
+ * 限流器那张表因此长期为空——遥测已经在 KV 里，正好补上这个观测缺口。
+ */
+export interface SiderHealthStat {
+  model: string;
+  attempts: number;
+  ok: number;
+  failed: number;
+  /** 最近一次失败的业务错误码；无失败时为 0。 */
+  lastCode: number;
+  /** 最近一次失败时刻；无失败时为 0。 */
+  lastFailedAt: number;
+  /** 成功调用的平均耗时（毫秒，四舍五入）；无成功时为 0。 */
+  avgMs: number;
+}
+
+/**
+ * 只扫最近 `hours` 个小时桶来聚合，**不读满整个保留窗口**。
+ *
+ * `/stats` 每 5 秒刷新一次，而遥测的容量上限是 25 桶 × 40 条 × 实例数——全量扫描
+ * 会让这张卡片的开销随实例数线性增长，正是趋势桶当初要避开的坑。「最近的碰撞
+ * 情况」本来也只关心近期，扫两个桶足够。
+ */
+export async function aggregateSiderHealth(
+  now = Date.now(),
+  hours = 2,
+): Promise<SiderHealthStat[]> {
+  const kv = await getKv();
+  if (!kv) return [];
+
+  const currentBucket = Math.floor(now / BUCKET_MS) * BUCKET_MS;
+  const oldestBucket = currentBucket - (hours - 1) * BUCKET_MS;
+
+  const acc = new Map<string, SiderHealthStat & { okMsTotal: number }>();
+
+  try {
+    await Promise.race([
+      (async () => {
+        for await (
+          const entry of kv.list({
+            // 键是 ['tele', bucket, ts]，按 bucket 升序；限定 start 即可跳过旧桶。
+            start: ['tele', oldestBucket],
+            end: ['tele', currentBucket + BUCKET_MS],
+          })
+        ) {
+          if (entry.key.length !== 3) continue;
+          const r = entry.value as SiderTelemetryRecord;
+          let row = acc.get(r.model);
+          if (!row) {
+            row = {
+              model: r.model,
+              attempts: 0,
+              ok: 0,
+              failed: 0,
+              lastCode: 0,
+              lastFailedAt: 0,
+              avgMs: 0,
+              okMsTotal: 0,
+            };
+            acc.set(r.model, row);
+          }
+          row.attempts += 1;
+          if (r.ok) {
+            row.ok += 1;
+            row.okMsTotal += r.ms;
+          } else {
+            row.failed += 1;
+            // 记最近一次：遥测按 ts 排列不保证，显式比时间戳。
+            if (r.ts >= row.lastFailedAt) {
+              row.lastFailedAt = r.ts;
+              row.lastCode = r.siderCode;
+            }
+          }
+        }
+      })(),
+      new Promise((resolve) => setTimeout(resolve, 2_000)),
+    ]);
+  } catch {
+    return [];
+  }
+
+  return [...acc.values()]
+    .map(({ okMsTotal, ...row }) => ({
+      ...row,
+      avgMs: row.ok > 0 ? Math.round(okMsTotal / row.ok) : 0,
+    }))
+    // 失败多的排前面：这张卡是用来发现问题的，健康的模型不需要抢注意力。
+    .sort((a, b) => b.failed - a.failed || b.attempts - a.attempts);
+}

@@ -12,6 +12,7 @@
  */
 
 import {
+  aggregateSiderHealth,
   persistSiderTelemetry,
   readSiderTelemetry,
   resetSiderTelemetry,
@@ -155,5 +156,117 @@ Deno.test({
       assertEquals(records.length, 1, '旧记录被回收');
       assertEquals(records[0]!.model, 'claude-sonnet-5', '只留窗口内记录');
     });
+  },
+});
+
+// ── 看板聚合 ────────────────────────────────────────────────────────────────
+//
+// 生产上限流器那张表长期为空：它是进程内状态，而 Deploy 多实例 + 空闲回收让
+// `/stats` 的快照几乎必然落在没有碰撞记录的实例上。遥测已经在 KV 里，聚合出来
+// 正好补这个观测缺口。下面锁定聚合口径与扫描范围。
+
+/** 写一条遥测的简写，只暴露聚合关心的字段。 */
+function tele(
+  ts: number,
+  model: string,
+  ok: boolean,
+  siderCode = 0,
+  ms = 100,
+): void {
+  persistSiderTelemetry({
+    ts,
+    model,
+    strategy: 'pro',
+    payloadChars: 100,
+    ok,
+    siderCode,
+    ms,
+    hasTools: false,
+    restoredToolUse: false,
+  });
+}
+
+Deno.test({
+  name: '遥测聚合：按模型汇总成功/失败与最近错误码',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: async () => {
+    await withMemoryKv(async () => {
+      resetSiderTelemetry();
+      tele(BASE, 'claude-sonnet-5', true, 0, 200);
+      tele(BASE + 1, 'claude-sonnet-5', true, 0, 400);
+      tele(BASE + 2, 'claude-sonnet-5', false, 1135);
+      // fable-5 恒失败，正是线上实测的 707 形态
+      tele(BASE + 3, 'claude-fable-5', false, 707);
+      tele(BASE + 4, 'claude-fable-5', false, 707);
+
+      let rows: Awaited<ReturnType<typeof aggregateSiderHealth>> = [];
+      await waitFor(async () => {
+        rows = await aggregateSiderHealth(BASE + 10);
+        return rows.length === 2;
+      });
+
+      // 失败多的排前面：这张卡是用来发现问题的
+      const fable = rows[0]!;
+      assertEquals(fable.model, 'claude-fable-5', '排序首行');
+      assertEquals(fable.attempts, 2, 'fable 尝试数');
+      assertEquals(fable.ok, 0, 'fable 成功数');
+      assertEquals(fable.failed, 2, 'fable 失败数');
+      assertEquals(fable.lastCode, 707, 'fable 最近错误码');
+      assertEquals(fable.lastFailedAt, BASE + 4, 'fable 最近失败时刻');
+      assertEquals(fable.avgMs, 0, '无成功时平均耗时为 0');
+
+      const sonnet = rows[1]!;
+      assertEquals(sonnet.attempts, 3, 'sonnet 尝试数');
+      assertEquals(sonnet.ok, 2, 'sonnet 成功数');
+      assertEquals(sonnet.failed, 1, 'sonnet 失败数');
+      assertEquals(sonnet.lastCode, 1135, 'sonnet 最近错误码');
+      // 平均耗时只算成功的那些：(200 + 400) / 2
+      assertEquals(sonnet.avgMs, 300, 'sonnet 成功平均耗时');
+    });
+  },
+});
+
+Deno.test({
+  name: '遥测聚合：只扫最近若干小时桶，不读满整个保留窗口',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: async () => {
+    await withMemoryKv(async () => {
+      resetSiderTelemetry();
+      const hour = 60 * 60_000;
+      // 5 小时前的记录落在扫描范围外——/stats 每 5 秒刷新一次，
+      // 全量扫描会让这张卡的开销随实例数线性增长。
+      tele(BASE - 5 * hour, 'old-model', true);
+      tele(BASE, 'fresh-model', true);
+
+      let rows: Awaited<ReturnType<typeof aggregateSiderHealth>> = [];
+      await waitFor(async () => {
+        rows = await aggregateSiderHealth(BASE + 10, 2);
+        return rows.length > 0;
+      });
+
+      assertEquals(rows.length, 1, '仅窗口内模型');
+      assertEquals(rows[0]!.model, 'fresh-model', '窗口内模型');
+    });
+  },
+});
+
+Deno.test({
+  name: '遥测聚合：KV 未启用时返回空数组而非抛错',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: async () => {
+    // 未设 STATS_KV = 完全跳过 KV。看板永远不能因为遥测不可用而崩掉。
+    const prev = Deno.env.get('STATS_KV');
+    Deno.env.delete('STATS_KV');
+    await closeStatsKv();
+    try {
+      const rows = await aggregateSiderHealth(BASE);
+      assertEquals(rows.length, 0, 'KV 未启用时的行数');
+    } finally {
+      await closeStatsKv();
+      if (prev !== undefined) Deno.env.set('STATS_KV', prev);
+    }
   },
 });

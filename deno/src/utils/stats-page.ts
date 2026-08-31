@@ -173,41 +173,79 @@ function trendChart(trend: TrendBucket[]): string {
 }
 
 /**
- * Sider 自适应限流状态。
+ * Sider 投递健康度。
  *
- * 激进策略下这张表是唯一的观测窗口：速率和体量上限碰撞收敛到了哪里、
- * 某个模型为什么突然不走 Sider 了——没有它全都只能靠猜。
+ * 两个数据源合成一张表，因为单独任何一个在生产上都不够用：
  *
- * 熔断与低速用 warn 色标出，因为它们是唯一需要用户判断"要不要管"的状态。
+ * - `siderThrottle` 是限流器的**进程内**实时状态（速率、学到的体量上限）。信息最
+ *   直接，但 Deploy 会拉起多个隔离实例并回收空闲实例，`/stats` 的快照几乎必然
+ *   落在一个没有碰撞记录的实例上——线上实测这张表长期为空。
+ * - `siderHealth` 是 KV 遥测的**跨实例**聚合（近 2 小时的成功/失败/错误码）。
+ *   一定有数据，但它是事后统计，看不到限流器当前收敛到了哪里。
+ *
+ * 所以以遥测为主表（保证有内容），限流器状态作为补充列（有就显示）。
+ * 失败与熔断用 warn 色标出，它们是唯一需要用户判断"要不要管"的状态。
  */
 function throttleRows(snapshot: UsageSnapshot): string {
-  if (snapshot.siderThrottle.length === 0) {
+  const throttleByModel = new Map(snapshot.siderThrottle.map((s) => [s.model, s]));
+  const healthByModel = new Map(snapshot.siderHealth.map((h) => [h.model, h]));
+  // 遥测在前（生产上有内容），仅有进程内状态的模型补在后面
+  const models = [
+    ...snapshot.siderHealth.map((h) => h.model),
+    ...snapshot.siderThrottle.map((s) => s.model).filter((m) => !healthByModel.has(m)),
+  ];
+
+  if (models.length === 0) {
     return `<p class="muted small">暂无数据（仅 <code>Pro</code> / <code>Max</code> 策略下记录）</p>`;
   }
 
-  const rows = snapshot.siderThrottle.map((s) => {
-    const status = s.cooldownMs > 0
-      ? `<b class="warn-num">熔断 ${Math.ceil(s.cooldownMs / 1000)}s</b>`
+  const dash = '<span class="muted">—</span>';
+
+  const rows = models.map((model) => {
+    const h = healthByModel.get(model);
+    const t = throttleByModel.get(model);
+
+    const attempts = h ? `${h.ok}<span class="muted">/${h.attempts}</span>` : dash;
+
+    // 全失败的模型最值得注意（如 707「该模型不可用」），单独着色。
+    let failed = dash;
+    if (h && h.failed > 0) {
+      const when = h.lastFailedAt > 0
+        ? ` <span class="muted">${hhmm(new Date(h.lastFailedAt).toISOString())}</span>`
+        : '';
+      failed = `<b class="warn-num">${h.failed} 次 ${siderCodeLabel(h.lastCode)}</b>${when}`;
+    }
+
+    const status = t && t.cooldownMs > 0
+      ? `<b class="warn-num">停投 ${Math.ceil(t.cooldownMs / 1000)}s</b>`
       : '<span class="muted">正常</span>';
-    const limited = [
-      s.lastQuotaAt > 0 ? `1135 ${hhmm(new Date(s.lastQuotaAt).toISOString())}` : '',
-      s.lastOversizeAt > 0 ? `603 ${hhmm(new Date(s.lastOversizeAt).toISOString())}` : '',
-    ].filter(Boolean).join(' · ');
+
+    const rate = t ? `${t.ratePerMin}/min` : dash;
+    const maxChars = t ? t.maxChars.toLocaleString('en-US') : dash;
 
     return `<tr>
-      <td>${esc(s.model)}</td>
-      <td class="num">${s.ratePerMin}/min</td>
-      <td class="num">${s.maxChars.toLocaleString('en-US')}</td>
+      <td>${esc(model)}</td>
+      <td class="num">${attempts}</td>
+      <td>${failed}</td>
+      <td class="num">${rate}</td>
+      <td class="num">${maxChars}</td>
       <td>${status}</td>
-      <td class="muted">${limited || '—'}</td>
     </tr>`;
   }).join('');
 
   return `<table>
-    <thead><tr><th>模型</th><th class="num">投递速率</th><th class="num">体量上限</th>
-      <th>状态</th><th>最近受限</th></tr></thead>
+    <thead><tr><th>模型</th><th class="num">成功/尝试</th><th>近期失败</th>
+      <th class="num">投递速率</th><th class="num">体量上限</th><th>状态</th></tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+/** 把 Sider 业务错误码翻成人话——裸数字对着看板的人毫无意义。 */
+function siderCodeLabel(code: number): string {
+  if (code === 1135) return '额度超限';
+  if (code === 603) return '体量超限';
+  if (code === 707) return '模型不可用';
+  return code > 0 ? `code ${code}` : '失败';
 }
 
 /** 后端占比：一条堆叠条 + 直接标签。 */
@@ -578,8 +616,8 @@ a { color: var(--s1); }
 </div>
 
 <div class="card" id="throttle-card">
-  <h2>Sider 自适应限流<span class="muted small" style="font-weight:400;margin-left:8px">
-    速率与体量上限由运行中的 1135 / 603 反馈碰撞学习，仅当前实例</span></h2>
+  <h2>Sider 投递健康度<span class="muted small" style="font-weight:400;margin-left:8px">
+    成功/失败为近 2 小时跨实例遥测；速率与体量上限由 1135 / 603 反馈碰撞学习，仅当前实例</span></h2>
   ${throttleRows(snapshot)}
 </div>
 

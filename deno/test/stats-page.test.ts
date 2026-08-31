@@ -51,6 +51,7 @@ function snapshot(overrides: Partial<UsageSnapshot> = {}): UsageSnapshot {
     lastHour: { requests: 1, sider: 1, deepseek: 0, fallbacks: 0 },
     tools: [{ name: 'Read', count: 1 }],
     siderThrottle: [],
+    siderHealth: [],
     lifetimeRequests: 1200,
     siderStrategy: 'conservative',
     recent: [{
@@ -352,16 +353,16 @@ Deno.test('stats 页面：最近明细标出该条走 DeepSeek 的原因', () =>
 });
 
 /**
- * 激进策略下限流卡片是唯一的观测窗口：速率与体量上限碰撞收敛到了哪里、
+ * 投递健康度卡片是激进策略下的观测窗口：速率与体量上限碰撞收敛到了哪里、
  * 某个模型为什么突然不走 Sider 了，没有这张表全都只能靠猜。
  */
-Deno.test('stats 页面：限流卡片在保守策略下给出空态提示而非空白', () => {
-  const html = renderStatsPage(snapshot({ siderThrottle: [] }));
-  assertIncludes(html, 'id="throttle-card"', '限流卡片');
+Deno.test('stats 页面：健康度卡片在保守策略下给出空态提示而非空白', () => {
+  const html = renderStatsPage(snapshot({ siderThrottle: [], siderHealth: [] }));
+  assertIncludes(html, 'id="throttle-card"', '健康度卡片');
   assertIncludes(html, 'Pro', '空态提示指明启用方式');
 });
 
-Deno.test('stats 页面：限流卡片展示速率、体量上限与熔断剩余', () => {
+Deno.test('stats 页面：健康度卡片展示速率、体量上限与停投剩余', () => {
   const html = renderStatsPage(snapshot({
     siderThrottle: [
       {
@@ -371,6 +372,8 @@ Deno.test('stats 页面：限流卡片展示速率、体量上限与熔断剩余
         cooldownMs: 42_000,
         lastQuotaAt: Date.parse('2026-08-22T01:05:00.000Z'),
         lastOversizeAt: 0,
+        lastRejectAt: 0,
+        lastRejectCode: 0,
       },
       {
         model: 'claude-sonnet-5',
@@ -379,16 +382,28 @@ Deno.test('stats 页面：限流卡片展示速率、体量上限与熔断剩余
         cooldownMs: 0,
         lastQuotaAt: 0,
         lastOversizeAt: 0,
+        lastRejectAt: 0,
+        lastRejectCode: 0,
       },
     ],
+    siderHealth: [{
+      model: 'claude-opus-4.8',
+      attempts: 5,
+      ok: 2,
+      failed: 3,
+      lastCode: 1135,
+      // 受限时刻同样按 UTC+8 渲染（01:05Z -> 09:05）
+      lastFailedAt: Date.parse('2026-08-22T01:05:00.000Z'),
+      avgMs: 800,
+    }],
   }));
 
   assertIncludes(html, '4.3/min', 'opus 的收敛速率');
   assertIncludes(html, '37,400', 'opus 学到的体量上限');
-  assertIncludes(html, '熔断 42s', '熔断剩余');
+  assertIncludes(html, '停投 42s', '停投剩余');
   assertIncludes(html, '14.4/min', 'sonnet 的收敛速率');
-  // 最近一次受限时刻同样按 UTC+8 渲染（01:05Z -> 09:05）
-  assertIncludes(html, '1135 09:05', '最近受限时刻');
+  assertIncludes(html, '额度超限', '最近失败的错误码标签');
+  assertIncludes(html, '09:05', '最近受限时刻');
 });
 
 /**
@@ -485,4 +500,134 @@ Deno.test('stats 页面：磁贴展示上游缓存命中率', () => {
   const html = renderStatsPage(snapshot());
   assertIncludes(html, '90.0%', '命中率数值');
   assertIncludes(html, '缓存命中', '命中率标签');
+});
+
+// ── Sider 投递健康度卡片 ────────────────────────────────────────────────────
+//
+// 这张卡曾经只读 `siderThrottle`（进程内状态），线上实测长期为空：Deploy 多实例 +
+// 空闲回收让快照几乎必然落在没有碰撞记录的实例上。改为以 KV 遥测聚合为主表后，
+// 下面这组用例守住「生产上有内容」与「两个数据源正确合并」。
+
+Deno.test('stats 页面：健康度卡片在只有遥测、无进程内限流状态时也有内容', () => {
+  const html = renderStatsPage(snapshot({
+    siderThrottle: [],
+    siderHealth: [{
+      model: 'claude-fable-5',
+      attempts: 3,
+      ok: 0,
+      failed: 3,
+      lastCode: 707,
+      lastFailedAt: Date.parse('2026-08-22T01:20:00.000Z'),
+      avgMs: 0,
+    }],
+  }));
+
+  assertIncludes(html, 'claude-fable-5', '遥测模型名');
+  assertIncludes(html, '模型不可用', '707 的人类可读标签');
+  if (html.includes('暂无数据（仅')) {
+    throw new Error('有遥测数据时不该显示空态');
+  }
+});
+
+Deno.test('stats 页面：健康度卡片把错误码翻成人话', () => {
+  const codes: Array<[number, string]> = [
+    [1135, '额度超限'],
+    [603, '体量超限'],
+    [707, '模型不可用'],
+    [999, 'code 999'],
+  ];
+
+  for (const [code, label] of codes) {
+    const html = renderStatsPage(snapshot({
+      siderHealth: [{
+        model: 'm',
+        attempts: 1,
+        ok: 0,
+        failed: 1,
+        lastCode: code,
+        lastFailedAt: Date.parse('2026-08-22T01:20:00.000Z'),
+        avgMs: 0,
+      }],
+    }));
+    assertIncludes(html, label, `错误码 ${code} 的标签`);
+  }
+});
+
+Deno.test('stats 页面：健康度卡片合并遥测与进程内限流状态', () => {
+  const html = renderStatsPage(snapshot({
+    siderThrottle: [{
+      model: 'claude-sonnet-5',
+      ratePerMin: 7.2,
+      maxChars: 37_400,
+      cooldownMs: 42_000,
+      lastQuotaAt: Date.parse('2026-08-22T01:00:00.000Z'),
+      lastOversizeAt: 0,
+      lastRejectAt: 0,
+      lastRejectCode: 0,
+    }],
+    siderHealth: [{
+      model: 'claude-sonnet-5',
+      attempts: 10,
+      ok: 8,
+      failed: 2,
+      lastCode: 1135,
+      lastFailedAt: Date.parse('2026-08-22T01:00:00.000Z'),
+      avgMs: 350,
+    }],
+  }));
+
+  // 同一模型只出一行，两个数据源的字段都在
+  assertIncludes(html, '7.2/min', '进程内速率');
+  assertIncludes(html, '37,400', '进程内体量上限');
+  assertIncludes(html, '停投 42s', '进程内停投状态');
+  assertIncludes(html, '额度超限', '遥测错误码');
+  const rowCount = (html.match(/claude-sonnet-5/g) ?? []).length;
+  if (rowCount !== 1) {
+    throw new Error(`同一模型应合并为一行，实际出现 ${rowCount} 次`);
+  }
+});
+
+Deno.test('stats 页面：健康度卡片保留只有进程内状态的模型', () => {
+  // Node/Bun 侧无 KV，siderHealth 恒为空——那时这张卡要退化为只显示限流状态，
+  // 而不是变成空态。
+  const html = renderStatsPage(snapshot({
+    siderThrottle: [{
+      model: 'claude-haiku-4.5',
+      ratePerMin: 12,
+      maxChars: 40_000,
+      cooldownMs: 0,
+      lastQuotaAt: 0,
+      lastOversizeAt: 0,
+      lastRejectAt: 0,
+      lastRejectCode: 0,
+    }],
+    siderHealth: [],
+  }));
+
+  assertIncludes(html, 'claude-haiku-4.5', '仅进程内状态的模型');
+  assertIncludes(html, '12/min', '其速率');
+});
+
+Deno.test('stats 页面：健康度卡片两个数据源都空时显示空态', () => {
+  const html = renderStatsPage(snapshot({ siderThrottle: [], siderHealth: [] }));
+  assertIncludes(html, '暂无数据（仅', '空态提示');
+});
+
+Deno.test('stats 页面：健康度卡片转义模型名，不注入 HTML', () => {
+  const html = renderStatsPage(snapshot({
+    siderHealth: [{
+      model: '<img src=x onerror=alert(1)>',
+      attempts: 1,
+      ok: 1,
+      failed: 0,
+      lastCode: 0,
+      lastFailedAt: 0,
+      avgMs: 10,
+    }],
+  }));
+
+  if (html.includes('<img src=x')) {
+    throw new Error('模型名未转义，存在注入风险');
+  }
+  assertIncludes(html, '&lt;img', '转义后的模型名');
 });

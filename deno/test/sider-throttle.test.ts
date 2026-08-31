@@ -15,6 +15,7 @@ import {
   getSiderThrottleSnapshot,
   recordSiderOversize,
   recordSiderQuotaExhausted,
+  recordSiderRejection,
   recordSiderSuccess,
   resetSiderThrottle,
 } from '../src/utils/sider-throttle.ts';
@@ -208,4 +209,105 @@ throttleTest('限流器：快照把需要关注的排在前面（先熔断、再
   assertEquals(snapshot[1]?.model, 'slow', '第二行');
   assertEquals(snapshot[2]?.model, 'healthy', '第三行');
   assert(snapshot[0]!.lastQuotaAt === T0, '熔断行应记录最近一次 1135 时刻');
+});
+
+// ── 持久性拒绝（非 1135/603 的业务错误码，如 707「该模型不可用」）────────────
+//
+// 线上实测的缺口：`claude-fable-5` 恒返回 707，三次复现无一成功。频次与体量两个
+// 维度都假设「换个时机或换个载荷就能成功」，对这类失败学不到任何东西，于是每个
+// 请求都要白撞一次 Sider 再 fallback。下面这组用例锁定新通道的收敛与恢复行为。
+
+throttleTest('限流器：连续 3 次持久性拒绝才停投，不足则继续投递', () => {
+  recordSiderRejection(MODEL, 707, T0);
+  recordSiderRejection(MODEL, 707, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '2 次拒绝后不该停投');
+  assertEquals(canUseSider(MODEL, 100, T0).ok, true, '2 次拒绝后仍可投递');
+
+  recordSiderRejection(MODEL, 707, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 5 * 60_000, '3 次拒绝后的停投时长');
+  assertEquals(canUseSider(MODEL, 100, T0).ok, false, '3 次拒绝后停投');
+});
+
+throttleTest('限流器：持久性拒绝不动速率与体量上限', () => {
+  // 这类失败与时机、载荷都无关，调那两个参数没有意义——调了反而会在模型恢复后
+  // 留下一个凭空变慢的限流器。
+  for (let i = 0; i < 3; i += 1) recordSiderRejection(MODEL, 707, T0);
+
+  const snapshot = getSiderThrottleSnapshot(T0)[0]!;
+  assertEquals(snapshot.ratePerMin, 12, '拒绝后的速率');
+  assertEquals(snapshot.maxChars, 40_000, '拒绝后的体量上限');
+});
+
+throttleTest('限流器：一次成功即清零拒绝计数，不累积到停投', () => {
+  recordSiderRejection(MODEL, 707, T0);
+  recordSiderRejection(MODEL, 707, T0);
+  recordSiderSuccess(MODEL, 100, T0);
+  recordSiderRejection(MODEL, 707, T0);
+  recordSiderRejection(MODEL, 707, T0);
+
+  // 中间那次成功把计数清零了，此刻只累积了 2 次，不该停投。
+  // 没有这条，偶发抖动会跨很长时间攒够 3 次，把一次次孤立故障放大成停投。
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '成功打断后的停投状态');
+});
+
+throttleTest('限流器：拒绝停投到期后 half-open 探测，成功即恢复', () => {
+  for (let i = 0; i < 3; i += 1) recordSiderRejection(MODEL, 707, T0);
+
+  const probeTime = T0 + 5 * 60_000 + 1_000;
+  assertEquals(canUseSider(MODEL, 100, probeTime).ok, true, '停投到期后放行探测');
+  consumeSiderSlot(MODEL, probeTime);
+  assertEquals(canUseSider(MODEL, 100, probeTime).ok, false, '探测在途时不再放行第二个');
+
+  recordSiderSuccess(MODEL, 100, probeTime);
+  assertEquals(getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs, 0, '探测成功后的停投状态');
+  assertEquals(canUseSider(MODEL, 100, probeTime).ok, true, '探测成功后恢复投递');
+});
+
+throttleTest('限流器：拒绝探测再失败则退避翻倍并按档位封顶', () => {
+  for (let i = 0; i < 3; i += 1) recordSiderRejection(MODEL, 707, T0);
+
+  const probeTime = T0 + 5 * 60_000 + 1_000;
+  consumeSiderSlot(MODEL, probeTime);
+  recordSiderRejection(MODEL, 707, probeTime);
+  // 5 分钟已是非 opus 档的封顶值，翻倍后仍被夹回 5 分钟
+  assertEquals(getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs, 5 * 60_000, '非 opus 档封顶');
+
+  resetSiderThrottle();
+
+  const opus = 'claude-opus-4.8';
+  for (let i = 0; i < 3; i += 1) recordSiderRejection(opus, 707, T0);
+  const opusProbe = T0 + 5 * 60_000 + 1_000;
+  consumeSiderSlot(opus, opusProbe);
+  recordSiderRejection(opus, 707, opusProbe);
+  assertEquals(
+    getSiderThrottleSnapshot(opusProbe)[0]?.cooldownMs,
+    10 * 60_000,
+    'opus 档可继续翻倍',
+  );
+});
+
+throttleTest('限流器：拒绝状态按模型隔离', () => {
+  const other = 'claude-sonnet-4.6';
+  for (let i = 0; i < 3; i += 1) recordSiderRejection('claude-fable-5', 707, T0);
+
+  assertEquals(canUseSider('claude-fable-5', 100, T0).ok, false, 'fable 已停投');
+  assertEquals(canUseSider(other, 100, T0).ok, true, '其余模型不受影响');
+});
+
+throttleTest('限流器：快照带出最近一次拒绝的时刻与错误码', () => {
+  recordSiderRejection(MODEL, 707, T0);
+  const snapshot = getSiderThrottleSnapshot(T0)[0]!;
+  assertEquals(snapshot.lastRejectAt, T0, '最近拒绝时刻');
+  assertEquals(snapshot.lastRejectCode, 707, '最近拒绝错误码');
+});
+
+throttleTest('限流器：1135 与持久性拒绝各自独立计数，不互相污染', () => {
+  // 混着来：2 次 1135 + 2 次 707，两边都没到 3，不该停投。
+  // 若共用一个计数器，这里会误判成"连续 4 次失败"。
+  recordSiderQuotaExhausted(MODEL, T0);
+  recordSiderRejection(MODEL, 707, T0);
+  recordSiderQuotaExhausted(MODEL, T0);
+  recordSiderRejection(MODEL, 707, T0);
+
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '两类失败混合后的停投状态');
 });
