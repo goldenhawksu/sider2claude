@@ -167,7 +167,9 @@ export class AnthropicApiAdapter {
         elapsedMs: elapsed,
       }, 'Anthropic-compatible backend error:');
       throw new AnthropicBackendError(
-        `${this.provider} API error: ${response.status} ${response.statusText}`,
+        `${this.provider} API error: ${response.status} ${response.statusText}${
+          formatUpstreamErrorDetail(errorText)
+        }`,
         response.status,
         this.provider,
       );
@@ -847,4 +849,47 @@ function isAbortError(error: unknown): boolean {
     error instanceof DOMException && error.name === 'AbortError' ||
     error instanceof Error && error.name === 'AbortError' ||
     error instanceof Error && error.name === 'TimeoutError';
+}
+
+/** 上游错误详情在错误消息里的长度上限。够看清原因，又不至于把整页 HTML 灌出去。 */
+const UPSTREAM_ERROR_DETAIL_MAX = 400;
+
+/**
+ * 从上游错误体里提取可读原因，拼成 `: <detail>` 追加到错误消息后面。
+ *
+ * 为什么必须带上：A/B 对比发现同一张图 GLM 接受、DeepSeek 以 400 拒绝并明确说明
+ * 「unsupported image ... formats: webp, png, jpeg, and gif」，但调用方原先只收到
+ * 一句 `deepseek API error: 400 Bad Request`——完全不知道该改什么。
+ *
+ * 这与「换上游前端无感」是一件事的两面：能抹平的差异抹平（见
+ * utils/upstream-capabilities.ts），**抹不平的差异必须说清楚**。上游的图片校验
+ * 策略我们不该代劳（替用户转码是越界），那就把它拒绝的理由原样带出去。
+ */
+function formatUpstreamErrorDetail(errorText: string): string {
+  const raw = errorText.trim();
+  if (!raw) {
+    return '';
+  }
+
+  // 优先取结构化的 message；取不到就退回原始片段——总比什么都不说强。
+  let detail = raw;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const error = parsed.error as Record<string, unknown> | undefined;
+    const nested = error?.error as Record<string, unknown> | undefined;
+    const message = (typeof error?.message === 'string' && error.message) ||
+      (typeof nested?.message === 'string' && nested.message) ||
+      (typeof parsed.message === 'string' && parsed.message);
+    if (message) {
+      detail = message;
+    }
+  } catch {
+    // 非 JSON（网关 HTML 之类）：用原文片段
+  }
+
+  const collapsed = detail.replace(/\s+/g, ' ').trim();
+  const clipped = collapsed.length > UPSTREAM_ERROR_DETAIL_MAX
+    ? `${collapsed.slice(0, UPSTREAM_ERROR_DETAIL_MAX)}…`
+    : collapsed;
+  return clipped ? `: ${clipped}` : '';
 }

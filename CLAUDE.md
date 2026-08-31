@@ -267,7 +267,31 @@ thinking 吃光小预算。
 - **上游拒绝 `disabled` 时降级**：记成终态并返回原响应。继续发只会把每个小预算
   请求都变成 400，比拿到空响应更糟。
 
-对没有这个缺陷的上游（可能包括 DeepSeek 官方），判据永不命中，整套机制零影响。
+**实测差异对照**（2026-08，本地 DeepSeek 官方 vs 线上 Z.AI，同一套代码只差上游）：
+
+| 能力 | `glm-5.3-flash` | `deepseek-v4-flash-vision-exp` |
+|---|---|---|
+| `tool_choice: {type:'tool'}` | HTTP 200 | **HTTP 400**「Thinking mode does not support this tool_choice」 |
+| `tool_choice: none` | 忽略，仍调工具 | 原生生效 |
+| `stop_sequences` | 截 thinking、报 `end_turn` | **完全符合规范** |
+| thinking 吃预算的阈值 | 256 仍失败，1024 才正常 | 64 失败，**256 已正常** |
+| `thinking:{type:'disabled'}` | 有效 | 有效 |
+| `budget_tokens` / `reasoning.enabled` | 忽略 | 忽略 |
+| 图片校验 | 宽容 | 严格（边缘 PNG 会 400） |
+
+这张表是「不能硬编码」最直接的证据：**没有任何一家的行为可以代表另一家**。
+注意第 4 行——若沿用早先硬编码的 1024 阈值，DeepSeek 在 256~1024 区间会被无谓
+关掉 thinking；而能力学习让两家各自收敛到自己的水位。
+
+`deno/tools/ab-compare-upstreams.ts` 是这张表的可执行版本：换上游或改动兼容层
+之后跑一遍，确认两侧不仅各自正确、而且**彼此一致**。
+
+抹不平的差异必须说清楚：上游 4xx/5xx 的原因说明由 `formatUpstreamErrorDetail`
+带进错误消息。原先只给一句 `400 Bad Request`，用户面对图片被拒时无从下手；
+现在能看到「unsupported image ... formats: webp, png, jpeg, and gif」。
+上游的图片校验策略不该由本服务代劳（替用户转码是越界）。
+
+对没有这个缺陷的上游，判据永不命中，整套机制零影响。
 
 另两项修复（`none` 摘 tools、`stop_sequences` 服务端截断）**在任何上游下都正确**，
 因此无条件生效，不进能力表：前者「工具不可见」比任何参数都可靠，后者服务端截断
@@ -573,6 +597,7 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/stop-sequences.test.ts`（正文截断、stop_reason 改判、thinking 不受影响，两通道一致）
 - `deno/test/upstream-capabilities.test.ts`（能力学习：判据、阈值推导、按上游隔离、拒绝降级）
 - `deno/test/upstream-adaptation.test.ts`（adapter 集成：首次自动重试、学后直接注入、无缺陷上游零影响）
+- `deno/test/upstream-error-detail.test.ts`（上游 4xx/5xx 的原因说明必须带到调用方）
 
 重点覆盖：
 
