@@ -161,6 +161,7 @@ export interface AnthropicError {
       | 'authentication_error'
       | 'permission_error'
       | 'not_found_error'
+      | 'request_too_large'
       | 'rate_limit_error'
       | 'api_error'
       | 'overloaded_error';

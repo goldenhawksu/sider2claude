@@ -28,6 +28,7 @@ import {
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
+import { cancelUpstreamReader } from '../utils/stream-cancel.ts';
 import {
   noteThinkingAteBudget,
   noteThinkingDisabledRejected,
@@ -749,7 +750,7 @@ export class AnthropicApiAdapter {
           this.forwardSSELine(buffer.trim(), outwardModel, onChunk);
         }
       } finally {
-        reader.releaseLock();
+        await cancelUpstreamReader(reader);
       }
 
       onComplete();

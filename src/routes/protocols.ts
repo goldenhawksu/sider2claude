@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AnthropicRequest, AnthropicResponse } from '../types';
 import { hybridMessagesRouter } from './messages-hybrid';
+import { cancelUpstreamReader } from '../utils/stream-cancel.js';
 import {
   anthropicToGemini,
   anthropicToOpenAIChat,
@@ -415,6 +416,10 @@ function mapAnthropicSse(response: Response, mapper: SseMapper): Response {
         controller.close();
       } catch (error) {
         controller.error(error);
+      } finally {
+        // `controller.error()` 之后 reader 会一直 locked、上游 body 挂死；
+        // 客户端断连导致 enqueue 抛错也走这条路。收口在 finally 里一次覆盖两种出口。
+        await cancelUpstreamReader(reader);
       }
     },
   });

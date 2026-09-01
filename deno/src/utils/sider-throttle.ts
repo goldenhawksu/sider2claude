@@ -56,6 +56,16 @@ const BACKOFF_CAP_OPUS_MS = 60 * 60_000;
 const BACKOFF_CAP_DEFAULT_MS = 5 * 60_000;
 
 /**
+ * 上游在 1135 消息里给的恢复时长要 clamp 的两个理由：
+ * - 下界 30 秒：与 `BACKOFF_BASE_MS` 对齐，解析出极小值时不至于退化成高频撞墙；
+ * - 上界 2 小时：实测上游说过 272 分钟。额度是**持续回血**的，且我们有 DeepSeek
+ *   兜底，盲信一个 4.5 小时的口径等于把整段窗口的额度白扔。clamp 后交给 half-open
+ *   探测摸真正的恢复点——探测的代价是一次请求，比空等几小时便宜得多。
+ */
+const HINTED_BACKOFF_MIN_MS = 30_000;
+const HINTED_BACKOFF_MAX_MS = 2 * 60 * 60_000;
+
+/**
  * 持久性拒绝：连续这么多次同类业务错误码（非 1135 / 603 / 1101）才暂停投递。
  *
  * 为什么需要这条通道：1135 是「额度用完了，等会儿再来」，603 是「这次太大了」，
@@ -71,9 +81,18 @@ const BACKOFF_CAP_DEFAULT_MS = 5 * 60_000;
  *
  * 退避起步比 1135 长（5 分钟 vs 30 秒）：额度是持续回血的，值得频繁试探；
  * 而「模型不支持」通常要等上游改配置，试探太密没有意义。
+ *
+ * 退避阶梯与 1135 的**完全分开**（独立的 `rejectBackoffMs` 与独立的封顶）。两点原因：
+ * 1. 共用一个 `backoffMs` 会串扰——707 把它抬到 5 分钟后，紧接着的一次 1135 熔断
+ *    首次退避也会变成 5 分钟而不是 30 秒，反之亦然；
+ * 2. 封顶必须大于起步值，否则指数退避形同虚设：起步 5 分钟、封顶也 5 分钟时，
+ *    `min(cap, backoff * 2)` 恒等于 5 分钟，`claude-fable-5` 这种恒 707 的模型
+ *    会永远每 5 分钟白撞一次，退不上去。
  */
 const REJECT_STREAK_TO_OPEN = 3;
 const REJECT_BACKOFF_BASE_MS = 5 * 60_000;
+const REJECT_BACKOFF_CAP_OPUS_MS = 60 * 60_000;
+const REJECT_BACKOFF_CAP_DEFAULT_MS = 30 * 60_000;
 
 /**
  * 并发限流（1101）的降速合并窗口：这段时间内的多次 1101 只降一次速。
@@ -95,10 +114,12 @@ interface ModelThrottleState {
   quotaStreak: number;
   /** 连续非 1135/603 业务错误码次数，中间任何一次成功即清零。 */
   rejectStreak: number;
-  /** 熔断到期时刻；0 表示未熔断。 */
+  /** 熔断到期时刻；0 表示未熔断。1135 与持久性拒绝共用一个窗口。 */
   openUntil: number;
-  /** 下一次熔断的退避时长。 */
+  /** 下一次 1135 熔断的退避时长。 */
   backoffMs: number;
+  /** 下一次持久性拒绝停投的退避时长。与 `backoffMs` 分开，避免两类失败互相污染。 */
+  rejectBackoffMs: number;
   /** half-open 已放行探测请求，结果未回来前不再放行第二个。 */
   probeInFlight: boolean;
   lastQuotaAt: number;
@@ -130,6 +151,7 @@ function stateFor(model: string, now: number): ModelThrottleState {
       rejectStreak: 0,
       openUntil: 0,
       backoffMs: BACKOFF_BASE_MS,
+      rejectBackoffMs: REJECT_BACKOFF_BASE_MS,
       probeInFlight: false,
       lastQuotaAt: 0,
       lastOversizeAt: 0,
@@ -177,14 +199,18 @@ export function canUseSider(
     if (state.probeInFlight) {
       return { ok: false, why: `Sider quota probe already in flight for ${model}` };
     }
+    // 探测也要过体量门：拿一个必然被 603 拒的载荷去探测，证明不了额度有没有恢复，
+    // 只是白撞一次。等下一个正常体量的请求来做探测。
+    const oversize = oversizeVerdict(state, estimatedChars);
+    if (oversize) {
+      return oversize;
+    }
     return { ok: true };
   }
 
-  if (estimatedChars > state.maxChars) {
-    return {
-      ok: false,
-      why: `Input ${estimatedChars} chars exceeds learned Sider limit ${state.maxChars}`,
-    };
+  const oversize = oversizeVerdict(state, estimatedChars);
+  if (oversize) {
+    return oversize;
   }
 
   refill(state, now);
@@ -196,6 +222,19 @@ export function canUseSider(
   }
 
   return { ok: true };
+}
+
+function oversizeVerdict(
+  state: ModelThrottleState,
+  estimatedChars: number,
+): { ok: false; why: string } | undefined {
+  if (estimatedChars <= state.maxChars) {
+    return undefined;
+  }
+  return {
+    ok: false,
+    why: `Input ${estimatedChars} chars exceeds learned Sider limit ${state.maxChars}`,
+  };
 }
 
 /**
@@ -229,6 +268,7 @@ export function recordSiderSuccess(
   state.openUntil = 0;
   state.probeInFlight = false;
   state.backoffMs = BACKOFF_BASE_MS;
+  state.rejectBackoffMs = REJECT_BACKOFF_BASE_MS;
   state.quotaStreak = 0;
   state.rejectStreak = 0;
 
@@ -246,9 +286,19 @@ export function recordSiderSuccess(
 
 /**
  * Sider 返回 1135（用量超限）。乘性降速；只有连续多次才升级为熔断。
+ *
+ * `retryAfterMs` 是上游在消息里写的恢复时长（"Please try again after N minutes"）。
+ * 拿到它就**直接按它熔断，跳过连续 3 次的门**——那道门是在没有信息时靠反复碰撞
+ * 去区分「偶发」与「真耗尽」的，上游已经明说的时候再撞两次纯属浪费。
+ * 上游没说才回到原来的猜测阶梯（连续 3 次 + 指数退避 + half-open 探测）。
  */
-export function recordSiderQuotaExhausted(model: string, now = Date.now()): void {
+export function recordSiderQuotaExhausted(
+  model: string,
+  now = Date.now(),
+  retryAfterMs?: number,
+): void {
   const state = stateFor(model, now);
+  const hinted = clampHintedBackoff(retryAfterMs);
 
   state.lastQuotaAt = now;
   state.successStreak = 0;
@@ -256,17 +306,33 @@ export function recordSiderQuotaExhausted(model: string, now = Date.now()): void
   state.rate = Math.max(RATE_MIN_PER_MIN, state.rate * RATE_DOWN_FACTOR);
   state.tokens = 0;
 
-  // 探测又撞限：额度还没回来，退避翻倍再等。
+  // 探测又撞限：额度还没回来。上游给了新时长就按它等，没给才把退避翻倍继续猜。
   if (state.probeInFlight) {
     state.probeInFlight = false;
+    if (hinted !== undefined) {
+      state.openUntil = now + hinted;
+      return;
+    }
     state.backoffMs = Math.min(backoffCap(model), state.backoffMs * 2);
     state.openUntil = now + state.backoffMs;
+    return;
+  }
+
+  if (hinted !== undefined) {
+    state.openUntil = now + hinted;
     return;
   }
 
   if (state.quotaStreak >= QUOTA_STREAK_TO_OPEN) {
     state.openUntil = now + state.backoffMs;
   }
+}
+
+function clampHintedBackoff(retryAfterMs?: number): number | undefined {
+  if (retryAfterMs === undefined || !(retryAfterMs > 0)) {
+    return undefined;
+  }
+  return Math.min(HINTED_BACKOFF_MAX_MS, Math.max(HINTED_BACKOFF_MIN_MS, retryAfterMs));
 }
 
 /**
@@ -290,6 +356,10 @@ function backoffCap(model: string): number {
   return isOpusTier(model) ? BACKOFF_CAP_OPUS_MS : BACKOFF_CAP_DEFAULT_MS;
 }
 
+function rejectBackoffCap(model: string): number {
+  return isOpusTier(model) ? REJECT_BACKOFF_CAP_OPUS_MS : REJECT_BACKOFF_CAP_DEFAULT_MS;
+}
+
 /**
  * Sider 返回 1135 / 603 之外的业务错误码（如 707「该模型不可用」）。
  *
@@ -297,9 +367,9 @@ function backoffCap(model: string): number {
  * 「这个模型现在还值不值得投」。因此它不动速率、不动体量上限——那两个参数在
  * 模型压根接不了的情况下调多少都没用——只在连续失败到阈值时直接暂停投递。
  *
- * 复用 1135 的 `openUntil` / `probeInFlight` / `backoffMs`：两者要表达的都是
- * 「暂停一段时间，到期放一个探测自己摸恢复」，没必要为此再造一套退避状态机。
- * 只有连续计数是独立的，避免两类失败互相污染对方的阈值。
+ * 复用 1135 的 `openUntil` / `probeInFlight`：两者要表达的都是「暂停一段时间，
+ * 到期放一个探测自己摸恢复」，没必要为此再造一套窗口。但**退避阶梯是独立的**
+ * （`rejectBackoffMs`），避免两类失败互相污染对方的起步值。
  */
 export function recordSiderRejection(
   model: string,
@@ -316,16 +386,13 @@ export function recordSiderRejection(
   // 探测又被拒：上游还没恢复，退避翻倍再等。
   if (state.probeInFlight) {
     state.probeInFlight = false;
-    state.backoffMs = Math.min(backoffCap(model), state.backoffMs * 2);
-    state.openUntil = now + state.backoffMs;
+    state.rejectBackoffMs = Math.min(rejectBackoffCap(model), state.rejectBackoffMs * 2);
+    state.openUntil = now + state.rejectBackoffMs;
     return;
   }
 
   if (state.rejectStreak >= REJECT_STREAK_TO_OPEN) {
-    // 起步至少 5 分钟：这类失败不像额度那样持续回血，试探太密没有意义。
-    const backoff = Math.max(state.backoffMs, REJECT_BACKOFF_BASE_MS);
-    state.backoffMs = Math.min(backoffCap(model), backoff);
-    state.openUntil = now + state.backoffMs;
+    state.openUntil = now + state.rejectBackoffMs;
   }
 }
 

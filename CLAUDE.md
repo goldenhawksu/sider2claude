@@ -147,6 +147,7 @@ RouterEngine
     实现在 `utils/sider-availability.ts`。冷却依据实测额度窗口：**opus 档 1 小时**
     （单窗口仅 2~3 次，等 200 秒仍未恢复，属小时/天级），**其余 60 秒**
     （约 6 次/分钟，与上游提示 "try again after 1 minutes" 一致）。
+    但这两档只是**兜底**——见下面「1135 的时长由上游给」。
   - `pro`：三道门全部交给 `utils/sider-throttle.ts` 的自适应限流器，阈值由运行中的
     603 / 1135 反馈碰撞学习。纯对话优先 Sider，工具请求仍全部给 DeepSeek。
   - `max`：在 `pro` 基础上，**工具调用也先投 Sider**（靠往 prompt 注入文本工具契约，
@@ -163,12 +164,42 @@ RouterEngine
     707，三次复现无一成功），与时机、载荷都无关，上面几个维度学不到任何东西，
     于是每个请求都白撞一次 Sider 再 fallback。这类由 `recordSiderRejection` 兜住，
     判据保守到三条闸：只认明确的业务错误码（`siderCode ≠ 0`，网络抖动/超时不算）、
-    要连续 3 次（任一次成功即清零）、停投可恢复（复用 1135 的 half-open 探测，
-    退避从 5 分钟起）。改这里时不要把「一次成功即清零」去掉——没有它，跨越很长
-    时间的孤立故障会攒够 3 次，把偶发放大成停投，正是这条通道要避免的事。
+    要连续 3 次（任一次成功即清零）、停投可恢复（复用 1135 的 half-open 探测窗口，
+    退避从 5 分钟起、翻倍、opus 封顶 1 小时其余 30 分钟）。改这里时不要把
+    「一次成功即清零」去掉——没有它，跨越很长时间的孤立故障会攒够 3 次，把偶发
+    放大成停投，正是这条通道要避免的事。
+    **退避阶梯与 1135 的必须各记各的**（`rejectBackoffMs` vs `backoffMs`），两个理由：
+    共用会串扰（707 把它抬到 5 分钟后，紧接着一次 1135 的首次退避也变成 5 分钟而非
+    30 秒）；且封顶必须严格大于起步值，否则 `min(cap, backoff × 2)` 恒等于起步值，
+    指数退避形同虚设——曾经 base 与 cap 都是 5 分钟，`claude-fable-5` 这种恒 707 的
+    模型永远每 5 分钟白撞一次，退不上去。
 
   一句话区分：**1135/603/1101 都假设「换个时机或换个载荷就能成功」，只有 707
   这类是「这个模型现在压根接不了」**。把 1101 错分进后者是真实发生过的回归。
+- **1135 的冷却时长优先用上游自己给的，不要硬编码**。上游在消息里明说：
+  `You've reached the current usage limit. ... Please try again after 117 minutes.`
+  实测跨度 **1 / 117 / 261 / 272 分钟**，任何固定值都会在两个方向同时出错：
+  上游说 1 分钟而 opus 罚 1 小时，白白闲置 59 分钟的可用额度；上游说 272 分钟而
+  非 opus 只罚 60 秒，之后每分钟去撞一次墙。
+  - 解析在 `parseSiderRetryAfterMs`（`sse-line-reader.ts` / Node 侧 `sider-client.ts`），
+    结果连同上游原文一起挂在 `SiderUpstreamError` 上（`retryAfterMs` / `upstreamMessage`）。
+    **`noteSiderOutcome` 必须把它一路传给限流层**——这个值历史上就在 `error.message`
+    里，只是在那一层被丢掉了。
+  - **拿到时长就跳过「连续 3 次」那道门**：那道门是在没有信息时靠反复碰撞去区分
+    「偶发」与「真耗尽」的，上游已经明说的时候再撞两次纯属浪费。上游没给才回到
+    原来的猜测阶梯（连续 3 次 + 指数退避 + half-open 探测）。
+  - **clamp 到 [30 秒, 2 小时]**：额度持续回血且有 DeepSeek 兜底，盲信 272 分钟等于
+    把整段窗口的额度白扔；夹住之后交给 half-open 探测去摸真正的恢复点。
+  - 解析不出返回 `undefined`，整套行为退回改动前的固定两档——上游随时可能改文案，
+    这个函数失效时不能连冷却一起失去。
+- **`603` 映射成 413 而不是 502**：它是**调用方的输入过长**，不是上游故障。报 502
+  会让客户端以为是服务端抖动而去重试，而重试同一个超长载荷必然再失败。
+  对应 `AnthropicError` 的 `request_too_large`。
+- **所有 429 都要带 `Retry-After`，包括上游透传的那些**。Anthropic / OpenAI 官方 SDK
+  都靠这个头退避；缺了它 SDK 会退化成固定间隔盲重试，反而加重本就额度稀缺的上游。
+  取值优先用上游给的时长，没有才用 60 秒默认值。
+  **只覆盖非流式路径**——流式一旦开始 HTTP 头早已发出，那时的失败只能在 SSE body 里
+  用 `error` 事件表达，这是协议决定的，不是漏了。
 - **策略是运行时可变的**：`utils/runtime-strategy.ts`（Deno 侧存 KV 跨实例收敛、
   Node 侧存进程内存）。`config.routing.siderStrategy` 被包成 getter，优先读运行时
   覆盖、其次读环境变量。读点（路由、契约注入、统计）无需感知这个差异。
@@ -199,9 +230,12 @@ RouterEngine
      采样；只有载荷已达上限 90% 却仍成功，才敢上探（×1.1）。喂进去的必须是
      **实际发给 Sider 的载荷长度**（`multi_content[0].text.length`），不是
      `inputCharCount` —— 后者含 system 与全历史，与真正投出去的东西不是一回事。
-  3. **配额耗尽**：只有速率已降到底仍连续 3 次 1135 才短暂停投，退避从 30 秒起
-     指数翻倍（opus 封顶 1 小时、其余 5 分钟），到期用 **half-open 放行一个探测**
-     自己摸出恢复时刻。探测成功即解除并重置退避。
+  3. **配额耗尽**：上游给了时长就直接按它熔断；没给才走猜测阶梯——速率已降到底
+     仍连续 3 次 1135 才短暂停投，退避从 30 秒起指数翻倍（opus 封顶 1 小时、
+     其余 5 分钟），到期用 **half-open 放行一个探测**自己摸出恢复时刻。
+     探测成功即解除并重置退避。
+     **half-open 探测也要过体量门**：拿一个必然被 603 拒的载荷去探测，证明不了
+     额度有没有恢复，只是白撞一次——等下一个正常体量的请求来做探测。
 - 限流器的**检查与消耗必须分开**（`canUseSider` 只读 / `consumeSiderSlot` 扣费）。
   `applyRoutingRules` 在规则匹配的最开始就要判定 Sider 可用性，但那一刻还不知道
   工具规则会不会把决策覆盖成 DeepSeek。若检查即扣费，每个走 DeepSeek 的工具请求
@@ -224,6 +258,20 @@ RouterEngine
   这层兜底是激进投递的**前置安全网**：主动碰撞额度上限意味着失败变多，没有它，
   「优先投 Sider」等于「让用户天天看到失败」。受全局 `AUTO_FALLBACK` 控制，
   不受规则级 `allowFallback` 影响（那个标志是为非流式的「重发一次」设计的）。
+  **但客户端断连不算 Sider 失败**：断连后 `controller.enqueue` 会抛，放任它冒泡会被
+  当成上游故障，进而对一个**已经离开的客户端**发起一次完整的（要付费的）DeepSeek
+  兜底请求，还会把断连算进 Sider 的失败率。`send()` 里捕获后置 `closed = true`，
+  让后续 send 静默返回、流自然收尾。
+- **读上游流的地方，提前退出必须 `cancel()` 上游 reader，不能只 `releaseLock()`**。
+  收口统一在 `utils/stream-cancel.ts` 的 `cancelUpstreamReader`，调用点一律放在读
+  循环的 `finally` 里——一处覆盖全部出口，逐个 `return` 前补 cancel 的写法漏一个
+  就是一次泄漏。四条路径都要有：Sider SSE 行读取（`sse-line-reader.ts`）、
+  DeepSeek 透传（`anthropic-adapter.ts`）、协议映射（`protocols.ts`，这条原先连
+  `finally` 都没有，`controller.error()` 之后 reader 永久 locked）、Node 侧
+  `sider-client.ts`。
+  最高频的泄漏路径是 1135：`onWarning` 回调同步 throw 穿出读循环，每次撞额度都会
+  留下一条挂到 30 秒超时才断的上游连接。而 Sider 是**单并发**的，一条泄漏的流很
+  可能正让下一个请求撞 1101。
 - 协议层（OpenAI / Gemini）的流式映射必须透传 Anthropic `error` 事件，
   否则上游失败时客户端只会收到空流 + `[DONE]`。
 - 重复响应缓存只服务非流式路径。请求指纹刻意忽略 `stream` 字段（用于跨
@@ -589,6 +637,7 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 - `deno/test/usage-attribution.test.ts`
 - `deno/test/sider-first-routing.test.ts`
 - `deno/test/sider-throttle.test.ts`
+- `deno/test/sider-error-codes.test.ts`（1135 时长解析与 clamp、603 映射 413、保守档冷却取值）
 - `deno/test/sider-max-strategy.test.ts`
 - `deno/test/sider-telemetry.test.ts`
 - `deno/test/prompt-cache.test.ts`（上游缓存：usage 缓存字段透传、前缀逐轮稳定、tool_choice 透传边界）
@@ -615,6 +664,9 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
   注意 `sider-availability` 是**模块级全局状态**：任何会真的触发 1135 的测试
   （如 `sider-upstream-error.test.ts`）都必须在 finally 里 `resetSiderAvailability()`，
   否则会顺着文件执行顺序泄漏给后续测试，制造顺序相关的偶发失败。
+- 上游给的 1135 时长：四种实测文案都能解析（1 / 117 / 272 分钟、小时、秒），解析
+  不出时行为退回固定两档；有时长则跳过「连续 3 次」的门，且上下界被 clamp 住。
+  707 的退避阶梯要能真正翻倍（5→10→20→30 分钟）且不污染 1135 的 30 秒起步。
 - DeepSeek 归因：带工具的请求记 `tools` 而非 `fallback`；Sider 受限兜底记
   `fallback`；DeepSeek 无工具真流式必须被计入统计（历史上漏埋）。
 

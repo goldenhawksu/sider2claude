@@ -118,18 +118,24 @@ app.post('/', async (c: Context) => {
     console.error('❌ Complete API error:', error);
 
     // Sider 的 SSE 内业务错误码（如 1135 用量超限）自带 statusCode，
-    // 按它返回才能让客户端区分「限流可重试」和「服务端故障」。
+    // 按它返回才能让客户端区分「限流可重试」「输入过长」和「服务端故障」。
     if (error instanceof SiderUpstreamError) {
       const rateLimited = error.statusCode === 429;
+      const tooLarge = error.statusCode === 413;
       const errorResp: CompleteError = {
         type: 'error',
         error: {
-          type: rateLimited ? 'rate_limit_error' : 'api_error',
+          type: rateLimited ? 'rate_limit_error' : tooLarge ? 'invalid_request_error' : 'api_error',
           message: error.message,
         },
       };
 
-      return c.json(errorResp, rateLimited ? 429 : 502);
+      if (rateLimited) {
+        // 官方 SDK 靠 Retry-After 退避；优先用上游自己给的时长。
+        const seconds = Math.max(1, Math.ceil((error.retryAfterMs ?? 60_000) / 1000));
+        return c.json(errorResp, 429, { 'Retry-After': String(seconds) });
+      }
+      return c.json(errorResp, tooLarge ? 413 : 502);
     }
 
     const errorResp: CompleteError = {

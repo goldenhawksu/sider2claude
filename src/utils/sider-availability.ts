@@ -5,7 +5,8 @@
  * 各有一份独立额度**。同一时刻实测到 sonnet-5 可用、opus-4.8 已耗尽的并存状态，
  * 因此熔断必须按模型分开，不能一刀切。
  *
- * 两档冷却时长，来源也是实测：
+ * 冷却时长优先用**上游自己给的**：1135 的消息里写着 "Please try again after N minutes"，
+ * 那是事实，不是猜测。解析不出才回退到下面两档实测经验值：
  * - opus 档：单窗口只有 2~3 次，等 200 秒仍未恢复，属小时/天级窗口。取 1 小时——
  *   若实际是天级，一天也只白撞 24 次，可忽略；若是小时级则能及时恢复。
  * - 其余（sonnet / haiku 等）：约 6 次/分钟，约 1 分钟回血，与上游提示
@@ -24,6 +25,17 @@ const OPUS_COOLDOWN_MS = 60 * 60_000;
 /** 其余模型按上游自己的提示：约 1 分钟。 */
 const DEFAULT_COOLDOWN_MS = 60_000;
 
+/**
+ * 上游给的时长要 clamp 的两个理由：
+ * - 下界 30 秒：上游偶尔说 "after 1 minutes"，但解析出 0 或极小值时（文案变体、
+ *   小数）不能退化成「几乎不冷却」，那会变成一个高频撞墙的循环；
+ * - 上界 2 小时：实测上游说过 272 分钟。我们有 DeepSeek 兜底且额度**持续回血**，
+ *   盲信一个 4.5 小时的口径等于把整段窗口的额度白扔。clamp 后交给 half-open
+ *   探测去摸真正的恢复点——探测的代价是一次请求，比空等几小时便宜得多。
+ */
+const HINTED_COOLDOWN_MIN_MS = 30_000;
+const HINTED_COOLDOWN_MAX_MS = 2 * 60 * 60_000;
+
 /** 模型名 -> 冷却截止时刻。条目数等于用过的模型数，天然有界。 */
 const cooldownUntil = new Map<string, number>();
 
@@ -37,11 +49,31 @@ export function siderCooldownMsFor(model: string): number {
 }
 
 /**
+ * 本次该冷却多久。上游在 1135 的消息里写了恢复时长就按它来，没写才用上面两档。
+ *
+ * 硬编码在两个方向同时错，实测都踩过：上游说 1 分钟而 opus 罚 1 小时，白白闲置
+ * 59 分钟的可用额度；上游说 272 分钟而非 opus 只罚 60 秒，之后每分钟去撞一次墙。
+ */
+export function resolveSiderCooldownMs(model: string, retryAfterMs?: number): number {
+  if (retryAfterMs !== undefined && retryAfterMs > 0) {
+    return Math.min(HINTED_COOLDOWN_MAX_MS, Math.max(HINTED_COOLDOWN_MIN_MS, retryAfterMs));
+  }
+  return siderCooldownMsFor(model);
+}
+
+/**
  * 记录一次 Sider 用量超限。只有 1135 该调用本函数——其余错误码是上游故障，
  * 不代表额度耗尽，熔断它们会把偶发抖动放大成长时间不可用。
+ *
+ * `retryAfterMs` 来自上游消息里解析出的恢复时长（`parseSiderRetryAfterMs`），
+ * 解析不出时传 undefined，退回固定两档。
  */
-export function recordSiderQuotaExhausted(model: string, now = Date.now()): void {
-  cooldownUntil.set(model, now + siderCooldownMsFor(model));
+export function recordSiderQuotaExhausted(
+  model: string,
+  now = Date.now(),
+  retryAfterMs?: number,
+): void {
+  cooldownUntil.set(model, now + resolveSiderCooldownMs(model, retryAfterMs));
 }
 
 /** 该模型当前是否处于熔断期。 */

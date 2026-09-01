@@ -8,6 +8,7 @@
 import type { SiderRequest, SiderSSEResponse, SiderParsedResponse } from '../types';
 import { consola } from 'consola';
 import { saveSiderSession, getOrCreateContinuousSession } from './sider-session-manager.js';
+import { cancelUpstreamReader } from './stream-cancel.js';
 import { getEnv } from './env';
 
 // Sider API 配置
@@ -22,6 +23,13 @@ export class SiderUpstreamError extends Error {
     message: string,
     public siderCode: number,
     public statusCode: number,
+    /**
+     * 上游原始 msg（不含本地拼的前缀）。1135 的恢复时长就写在这里面，
+     * 单独留一份是为了让下游解析时不必先剥前缀。
+     */
+    public upstreamMessage = '',
+    /** 从 `upstreamMessage` 解析出的上游建议重试间隔（毫秒）；解析不出为 undefined。 */
+    public retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'SiderUpstreamError';
@@ -29,14 +37,46 @@ export class SiderUpstreamError extends Error {
 }
 
 /**
+ * 从上游消息里解析「还要等多久」。
+ *
+ * 1135 的消息实测长这样，恢复时刻是上游**主动告诉我们的事实**：
+ *   You've reached the current usage limit. ... Please try again after 117 minutes.
+ * 实测跨度极大（1 / 117 / 261 / 272 分钟），任何硬编码的冷却值都会在两个方向同时
+ * 出错：说 1 分钟时白闲置一小时的额度，说 272 分钟时每分钟去撞一次墙。
+ *
+ * 解析不出返回 undefined，由调用方回退到自己的保守默认值——上游随时可能改文案，
+ * 这个函数失效时整套熔断要能退回原来的行为，而不是失去冷却。
+ */
+const RETRY_AFTER_PATTERN = /after\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)/i;
+
+export function parseSiderRetryAfterMs(msg: string): number | undefined {
+  const match = RETRY_AFTER_PATTERN.exec(msg);
+  if (!match) {
+    return undefined;
+  }
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  const unit = (match[2] ?? '').toLowerCase();
+  const factor = unit.startsWith('h') ? 3_600_000 : unit.startsWith('m') ? 60_000 : 1_000;
+  return Math.round(value * factor);
+}
+
+/**
  * 由 Sider 业务错误码构造错误。消息格式与状态码映射只在这里定义一次：
- * 1135 为用量超限（429），其余按上游故障（502）处理。
+ * - 1135 用量超限 -> 429（可重试，且带上游给的时长）；
+ * - 603 单请求体量超限 -> 413。这是**调用方的输入问题**，不是上游故障；
+ *   报 502 会让客户端以为是服务端抖动而去重试，而重试同一个超长载荷必然再失败；
+ * - 其余按上游故障 -> 502。
  */
 export function siderUpstreamError(code: number, msg: string): SiderUpstreamError {
   return new SiderUpstreamError(
     `Sider upstream error ${code}: ${msg}`,
     code,
-    code === 1135 ? 429 : 502,
+    code === 1135 ? 429 : code === 603 ? 413 : 502,
+    msg,
+    code === 1135 ? parseSiderRetryAfterMs(msg) : undefined,
   );
 }
 
@@ -147,7 +187,8 @@ export class SiderClient {
       }
 
     } finally {
-      reader.releaseLock();
+      // 业务错误码等提前退出路径必须 cancel 上游，否则连接会挂到超时才断。
+      await cancelUpstreamReader(reader);
     }
 
     // Sider 用 SSE 内的 code 表达业务失败。只在同时没拿到任何文本时才判定为失败，

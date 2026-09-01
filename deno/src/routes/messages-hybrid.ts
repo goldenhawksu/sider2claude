@@ -19,7 +19,7 @@ import {
 } from '../utils/request-converter.ts';
 import { siderClient } from '../utils/sider-client.ts';
 import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
-import { recordSiderQuotaExhausted, siderCooldownMsFor } from '../utils/sider-availability.ts';
+import { recordSiderQuotaExhausted, resolveSiderCooldownMs } from '../utils/sider-availability.ts';
 import {
   recordSiderOversize,
   recordSiderQuotaExhausted as recordThrottleQuota,
@@ -359,6 +359,7 @@ messagesRouter.post('/', async (c: Context) => {
           },
         } satisfies AnthropicError,
         status,
+        retryAfterHeaders(error, status),
       );
     }
 
@@ -412,6 +413,8 @@ function noteSiderOutcome(
 ): void {
   const adaptive = usesAdaptiveThrottle(config.routing.siderStrategy);
   const siderCode = error instanceof SiderUpstreamError ? error.siderCode : 0;
+  // 上游在 1135 的消息里写了恢复时长就带上，两条冷却通道都优先按它退避。
+  const retryAfterMs = error instanceof SiderUpstreamError ? error.retryAfterMs : undefined;
 
   if (!error) {
     if (adaptive) {
@@ -419,15 +422,16 @@ function noteSiderOutcome(
     }
   } else if (siderCode === 1135) {
     if (adaptive) {
-      recordThrottleQuota(model);
+      recordThrottleQuota(model, undefined, retryAfterMs);
     } else {
-      recordSiderQuotaExhausted(model);
+      recordSiderQuotaExhausted(model, undefined, retryAfterMs);
     }
     logWarn('sider_quota_cooldown', {
       requestId: logContext.requestId,
       model,
       strategy: config.routing.siderStrategy,
-      cooldownMs: adaptive ? undefined : siderCooldownMsFor(model),
+      cooldownMs: adaptive ? undefined : resolveSiderCooldownMs(model, retryAfterMs),
+      upstreamRetryAfterMs: retryAfterMs,
     }, `Sider quota exhausted for ${model}`);
   } else if (siderCode === 603 && adaptive) {
     recordSiderOversize(model, payloadChars);
@@ -479,11 +483,14 @@ function siderPayloadChars(request: SiderRequest): number {
   return request.multi_content?.[0]?.text?.length ?? 0;
 }
 
-function normalizeErrorStatus(statusCode: number): 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503 {
+function normalizeErrorStatus(
+  statusCode: number,
+): 400 | 401 | 403 | 404 | 413 | 429 | 500 | 502 | 503 {
   if (statusCode === 400) return 400;
   if (statusCode === 401) return 401;
   if (statusCode === 403) return 403;
   if (statusCode === 404) return 404;
+  if (statusCode === 413) return 413;
   if (statusCode === 429) return 429;
   if (statusCode === 502) return 502;
   if (statusCode === 503) return 503;
@@ -495,9 +502,33 @@ function mapErrorStatusToType(statusCode: number): AnthropicError['error']['type
   if (statusCode === 401) return 'authentication_error';
   if (statusCode === 403) return 'permission_error';
   if (statusCode === 404) return 'not_found_error';
+  if (statusCode === 413) return 'request_too_large';
   if (statusCode === 429) return 'rate_limit_error';
   if (statusCode === 503) return 'overloaded_error';
   return 'api_error';
+}
+
+/**
+ * 所有 429 都要带 `Retry-After`，**包括上游透传的那些**。
+ *
+ * Anthropic / OpenAI 官方 SDK 都靠这个头做退避重试；缺了它，SDK 会退化成固定间隔
+ * 盲重试，反而加重本就额度稀缺的上游。
+ *
+ * 取值优先用上游自己写的时长（1135 的消息里有），没有才用保守默认值。向上取整到
+ * 整秒：宁可让客户端多等一秒，也不要早于上游给的时刻去重试。
+ *
+ * 只覆盖非流式路径。流式一旦开始，HTTP 头早已发出，那时的失败只能在 SSE body 里
+ * 用 `error` 事件表达——这是协议决定的，不是这里漏了。
+ */
+const DEFAULT_RETRY_AFTER_MS = 60_000;
+
+function retryAfterHeaders(error: unknown, status: number): Record<string, string> | undefined {
+  if (status !== 429) {
+    return undefined;
+  }
+  const hinted = error instanceof SiderUpstreamError ? error.retryAfterMs : undefined;
+  const seconds = Math.max(1, Math.ceil((hinted ?? DEFAULT_RETRY_AFTER_MS) / 1000));
+  return { 'Retry-After': String(seconds) };
 }
 
 messagesRouter.post('/count_tokens', async (c: Context) => {
@@ -1099,12 +1130,24 @@ function createTrueSiderStreamingResponse(
             });
           }
         }
-        controller.enqueue(encodeSSEEvent(encoder, event));
+        try {
+          controller.enqueue(encodeSSEEvent(encoder, event));
+        } catch {
+          // 客户端断连后 enqueue 会抛。这不是 Sider 失败——放任它冒泡会被下面的
+          // catch 当成上游故障，进而对一个**已经离开的客户端**发起一次完整的
+          // DeepSeek 兜底请求（要付费），还会把这次断连算进 Sider 的失败率。
+          // 标记成已关闭，让后续 send 直接静默返回，流自然收尾。
+          closed = true;
+        }
       };
       const safeClose = () => {
         if (!closed) {
           closed = true;
-          controller.close();
+          try {
+            controller.close();
+          } catch {
+            // 客户端已断连时 close 会抛；流本来就没了，无需处理。
+          }
         }
       };
 

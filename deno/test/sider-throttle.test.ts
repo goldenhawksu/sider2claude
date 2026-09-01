@@ -270,8 +270,28 @@ throttleTest('限流器：拒绝探测再失败则退避翻倍并按档位封顶
   const probeTime = T0 + 5 * 60_000 + 1_000;
   consumeSiderSlot(MODEL, probeTime);
   recordSiderRejection(MODEL, 707, probeTime);
-  // 5 分钟已是非 opus 档的封顶值，翻倍后仍被夹回 5 分钟
-  assertEquals(getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs, 5 * 60_000, '非 opus 档封顶');
+  // 拒绝通道的封顶（30 分钟）必须大于起步值（5 分钟），否则 `min(cap, backoff*2)`
+  // 恒等于起步值，指数退避形同虚设——`claude-fable-5` 这种恒 707 的模型会永远
+  // 每 5 分钟白撞一次，退不上去。
+  assertEquals(getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs, 10 * 60_000, '非 opus 档翻倍');
+
+  const secondProbe = probeTime + 10 * 60_000 + 1_000;
+  consumeSiderSlot(MODEL, secondProbe);
+  recordSiderRejection(MODEL, 707, secondProbe);
+  assertEquals(
+    getSiderThrottleSnapshot(secondProbe)[0]?.cooldownMs,
+    20 * 60_000,
+    '非 opus 档继续翻倍',
+  );
+
+  const thirdProbe = secondProbe + 20 * 60_000 + 1_000;
+  consumeSiderSlot(MODEL, thirdProbe);
+  recordSiderRejection(MODEL, 707, thirdProbe);
+  assertEquals(
+    getSiderThrottleSnapshot(thirdProbe)[0]?.cooldownMs,
+    30 * 60_000,
+    '非 opus 档封顶 30 分钟',
+  );
 
   resetSiderThrottle();
 
@@ -284,6 +304,22 @@ throttleTest('限流器：拒绝探测再失败则退避翻倍并按档位封顶
     getSiderThrottleSnapshot(opusProbe)[0]?.cooldownMs,
     10 * 60_000,
     'opus 档可继续翻倍',
+  );
+});
+
+throttleTest('限流器：707 的退避阶梯不污染 1135 的起步值', () => {
+  // 共用一个 backoffMs 时，707 把它抬到 5 分钟后，紧接着的一次 1135 熔断首次退避
+  // 也会变成 5 分钟而不是 30 秒。两条阶梯必须各记各的。
+  for (let i = 0; i < 3; i += 1) recordSiderRejection(MODEL, 707, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 5 * 60_000, '707 停投 5 分钟');
+
+  const after = T0 + 5 * 60_000 + 1_000;
+  recordSiderSuccess(MODEL, 100, after); // 探测成功，两条阶梯都重置
+  for (let i = 0; i < 3; i += 1) recordSiderQuotaExhausted(MODEL, after);
+  assertEquals(
+    getSiderThrottleSnapshot(after)[0]?.cooldownMs,
+    30_000,
+    '1135 仍从 30 秒起步',
   );
 });
 
@@ -396,4 +432,75 @@ throttleTest('限流器：探测被并发挤掉不算探测失败，退避不翻
 throttleTest('限流器：快照带出最近一次并发限流时刻', () => {
   recordSiderConcurrencyLimit(MODEL, T0);
   assertEquals(getSiderThrottleSnapshot(T0)[0]?.lastConcurrencyAt, T0, '最近并发限流时刻');
+});
+
+// ---------------------------------------------------------------------------
+// 上游给的恢复时长（规则 2.1）
+//
+// 1135 的消息里写着 "Please try again after N minutes"，那是上游主动告诉我们的
+// 事实。硬编码在两个方向同时错：说 1 分钟时白闲置一小时额度，说 272 分钟时每
+// 分钟去撞一次墙。实测跨度 1 / 117 / 261 / 272 分钟。
+// ---------------------------------------------------------------------------
+
+throttleTest('限流器：上游给了时长就按它熔断，跳过连续 3 次的门', () => {
+  // 连续 3 次那道门是在没有信息时靠反复碰撞去区分「偶发」与「真耗尽」的。
+  // 上游已经明说的时候再撞两次纯属浪费。
+  recordSiderQuotaExhausted(MODEL, T0, 117 * 60_000);
+  assertEquals(
+    getSiderThrottleSnapshot(T0)[0]?.cooldownMs,
+    117 * 60_000,
+    '一次 1135 + 上游时长即熔断',
+  );
+  assertEquals(canUseSider(MODEL, 100, T0).ok, false, '熔断期内不投 Sider');
+});
+
+throttleTest('限流器：上游没给时长时仍走原来的猜测阶梯', () => {
+  recordSiderQuotaExhausted(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '第 1 次不熔断');
+  recordSiderQuotaExhausted(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 0, '第 2 次不熔断');
+  recordSiderQuotaExhausted(MODEL, T0);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 30_000, '第 3 次按 30 秒起步');
+});
+
+throttleTest('限流器：上游时长上界夹到 2 小时，下界夹到 30 秒', () => {
+  // 实测上游说过 272 分钟。额度持续回血且有 DeepSeek 兜底，盲信这个口径等于
+  // 把整段窗口的额度白扔——夹住之后交给 half-open 探测去摸真正的恢复点。
+  recordSiderQuotaExhausted(MODEL, T0, 272 * 60_000);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 2 * 60 * 60_000, '上界');
+
+  resetSiderThrottle();
+  recordSiderQuotaExhausted(MODEL, T0, 1_000);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 30_000, '下界');
+});
+
+throttleTest('限流器：opus 的上游时长优先于 1 小时的经验封顶', () => {
+  // 硬编码「opus 就是一小时」在上游说 1 分钟时会白白闲置 59 分钟的可用额度。
+  const opus = 'claude-opus-4.8';
+  recordSiderQuotaExhausted(opus, T0, 60_000);
+  assertEquals(getSiderThrottleSnapshot(T0)[0]?.cooldownMs, 60_000, 'opus 按上游给的 1 分钟');
+});
+
+throttleTest('限流器：探测再撞限时也优先用上游给的新时长', () => {
+  recordSiderQuotaExhausted(MODEL, T0, 60_000);
+
+  const probeTime = T0 + 60_000 + 1_000;
+  assertEquals(canUseSider(MODEL, 100, probeTime).ok, true, '熔断到期后放行探测');
+  consumeSiderSlot(MODEL, probeTime);
+  recordSiderQuotaExhausted(MODEL, probeTime, 10 * 60_000);
+  assertEquals(
+    getSiderThrottleSnapshot(probeTime)[0]?.cooldownMs,
+    10 * 60_000,
+    '探测失败按上游的新时长，而不是把本地退避翻倍',
+  );
+});
+
+throttleTest('限流器：half-open 探测也要过体量门', () => {
+  // 拿一个必然被 603 拒的载荷去探测，证明不了额度有没有恢复，只是白撞一次。
+  recordSiderOversize(MODEL, 10_000, T0); // 上限降到 8500
+  recordSiderQuotaExhausted(MODEL, T0, 60_000);
+
+  const probeTime = T0 + 60_000 + 1_000;
+  assertEquals(canUseSider(MODEL, 20_000, probeTime).ok, false, '超体量的请求不做探测');
+  assertEquals(canUseSider(MODEL, 100, probeTime).ok, true, '正常体量的请求可以探测');
 });
