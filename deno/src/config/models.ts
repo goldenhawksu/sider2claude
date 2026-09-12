@@ -47,8 +47,8 @@ const CLAUDE_MODELS: ModelInfo[] = [
   model('claude-opus-4.8-think'),
   model('claude-opus-5'),
   model('claude-opus-5-think'),
-  model('claude-fable-5'),
-  model('claude-fable-5-think'),
+  model('claude-fable-5.1'),
+  model('claude-fable-5.1-think'),
 
   // Sonnet 系列
   model('claude-4.5-sonnet'),
@@ -88,6 +88,8 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'gpt-5.6-terra-think',
   'gpt-5.6-luna',
   'gpt-5.6-luna-think',
+  'gpt-6-astra',
+  'gpt-6-astra-think',
 
   // Claude 系列（对齐 sider2api 的命名风格）
   'claude-opus-4.5',
@@ -98,8 +100,8 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'claude-opus-4.8-think',
   'claude-opus-5',
   'claude-opus-5-think',
-  'claude-fable-5',
-  'claude-fable-5-think',
+  'claude-fable-5.1',
+  'claude-fable-5.1-think',
   'claude-4.5-sonnet',
   'claude-4.5-sonnet-think',
   'claude-sonnet-4.6',
@@ -120,10 +122,11 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'gemini-3.5-flash-think',
   'gemini-3.6-flash',
   'gemini-3.6-flash-think',
-  'gemini-3.7-flash',
-  'gemini-3.7-flash-think',
+  'gemini-3.8-flash',
+  'gemini-3.8-flash-think',
 
   // DeepSeek 系列
+  'deepseek-flash',
   'deepseek-v4-flash',
   'deepseek-v4-flash-think',
   'deepseek-v4-pro',
