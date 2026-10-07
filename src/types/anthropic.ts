@@ -109,6 +109,7 @@ export type AnthropicResponseContent =
   | AnthropicThinkingResponseContent
   | AnthropicRedactedThinkingResponseContent
   | AnthropicToolUse
+  | AnthropicToolResult
   | AnthropicServerToolUse
   | AnthropicServerToolResult;
 

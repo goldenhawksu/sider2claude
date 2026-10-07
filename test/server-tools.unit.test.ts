@@ -3,8 +3,9 @@ import { Hono } from 'hono';
 import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
 import type { AnthropicRequest } from '../src/types/anthropic';
 
-for (const clientTool of [false, true]) {
-  test(`兼容上游服务端工具：Bun 合成流与历史回传，客户端工具=${clientTool}`, async () => {
+for (const variant of ['server', 'mixed', 'generic', 'generic-mixed']) {
+  const clientTool = variant.includes('mixed');
+  test(`兼容上游服务端工具：Bun 合成流与历史回传，结果变体=${variant}`, async () => {
     const vars = {
       AUTH_TOKEN: 'test-token-12345',
       DEEPSEEK_API_KEY: 'upstream-token',
@@ -23,16 +24,20 @@ for (const clientTool of [false, true]) {
       input: { url: 'https://example.com/weather' },
     };
     const serverResult = {
-      type: 'web_fetch_tool_result',
+      type: variant.startsWith('generic') ? 'tool_result' : 'web_fetch_tool_result',
       tool_use_id: serverUse.id,
-      content: {
-        type: 'web_fetch_result',
-        url: serverUse.input.url,
-        content: {
-          type: 'document',
-          source: { type: 'text', media_type: 'text/plain', data: '北京晴天。' },
+      content: variant === 'generic'
+        ? '北京晴天。'
+        : variant === 'generic-mixed'
+        ? [{ type: 'text', text: '北京晴天。' }]
+        : {
+          type: 'web_fetch_result',
+          url: serverUse.input.url,
+          content: {
+            type: 'document',
+            source: { type: 'text', media_type: 'text/plain', data: '北京晴天。' },
+          },
         },
-      },
     };
     const content = [
       serverUse,

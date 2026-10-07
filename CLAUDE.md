@@ -285,6 +285,8 @@ RouterEngine
   它们是上游服务端工具：适配器保留原始结构，合成流保留原类型与关联 ID，
   历史回传转录为服务端工具记录。不能把它们编码成客户端 `tool_use`，
   也不能仅因存在服务端工具就把 `stop_reason` 改成 `tool_use`。
+  生产 GLM 兼容端还会在助手响应中用通用 `tool_result` 编码结果，必须一并保留，
+  不能因它不是专用的 `web_search_tool_result` 等类型而中断响应。
   `deno/test/messages-hybrid-stream.test.ts` 与 `test/server-tools.unit.test.ts` 覆盖
   `claude-opus-5.5`、3 条消息、17 个工具的合成流和后续历史回传。
 - **上游三处不符合 Anthropic 规范的行为，一律在本服务层兜住**（probe 脚本见

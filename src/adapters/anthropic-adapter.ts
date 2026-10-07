@@ -574,7 +574,8 @@ ${instruction}` : instruction;
       const item = block as Record<string, unknown>;
       // 服务端工具调用及结果保留原始结构，客户端无需再次执行。
       if (
-        item.type === 'server_tool_use' || item.type === 'web_search_tool_result' ||
+        item.type === 'server_tool_use' || item.type === 'tool_result' ||
+        item.type === 'web_search_tool_result' ||
         item.type === 'web_fetch_tool_result' || item.type === 'code_execution_tool_result' ||
         item.type === 'bash_code_execution_tool_result' ||
         item.type === 'text_editor_code_execution_tool_result'
