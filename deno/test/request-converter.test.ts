@@ -1,5 +1,6 @@
 import { convertAnthropicToSiderSync } from '../src/utils/request-converter.ts';
 import type { AnthropicRequest } from '../src/types/anthropic.ts';
+import { saveSiderSession } from '../src/utils/sider-session-manager.ts';
 
 const LEGACY_OPENAI_MESSAGE_FORMAT_ENV = 'SIDER_USE_OPENAI_MESSAGE_FORMAT';
 const LEGACY_GEMINI_NATIVE_MESSAGE_FORMAT_ENV = 'SIDER_USE_GEMINI_NATIVE_MESSAGE_FORMAT';
@@ -84,6 +85,22 @@ Deno.test('Sider 转换：真实 cid 仍只发送当前输入，避免重复历�
     siderRequest.multi_content[0].text,
     'What exact code word did I give you? Reply with only the code word.',
   );
+});
+
+Deno.test('Sider 转换：单消息续轮使用已保存的助手消息作为父消息', () => {
+  const cid = `session-${crypto.randomUUID()}`;
+  const request: AnthropicRequest = {
+    model: 'claude-sonnet-4.6',
+    messages: [{ role: 'user', content: '刚才的数字是多少？' }],
+    max_tokens: 64,
+  };
+  saveSiderSession(cid, 'user-1', 'assistant-1', request.model);
+
+  const converted = convertAnthropicToSiderSync(request, cid);
+
+  assertEquals(converted.cid, cid);
+  assertEquals(converted.parent_message_id, 'assistant-1');
+  assertEquals(converted.multi_content[0].text, '刚才的数字是多少？');
 });
 
 Deno.test('Sider 转换：旧 OpenAI/Gemini 环境变量不再改变内部 transcript 格式', () => {

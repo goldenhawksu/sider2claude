@@ -196,7 +196,7 @@ export function convertAnthropicToSiderSync(
   // 获取真实的父消息ID（如果有会话ID）
   let parentMessageId = '';
   const realConversationId = getRealSiderConversationId(conversationId);
-  if (realConversationId && anthropicRequest.messages.length > 1) {
+  if (realConversationId) {
     parentMessageId = getNextParentMessageId(realConversationId);
     consola.debug('Using real parent message ID:', {
       cid: realConversationId.substring(0, 12) + '...',

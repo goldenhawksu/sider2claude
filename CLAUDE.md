@@ -134,6 +134,9 @@ RouterEngine
   改动 `rule_1_tool_result_continuity` 时不要把这个守卫去掉。
 - 会话后端记忆有 TTL（1 小时）与容量上限（500 条，超出按最近使用淘汰），
   并随 `/v1/messages/conversations/cleanup` 一起回收。
+- Sider 续轮通过真实 `cid + parent_message_id` 关联历史；即使客户端只发送
+  一条新的 user 消息，也必须使用会话中已保存的助手消息 ID 作为父消息。
+  不要用 `messages.length > 1` 限制本地父消息的读取，Node/Bun 与 Deno 均须覆盖此场景。
 - 普通对话允许 fallback；工具请求不应 fallback 到 Sider，因为 Sider probe 未证明其支持 Anthropic `tool_use`。
 - **Sider 有两道硬约束，路由必须提前避让**（数字均来自实测，见「Sider Probe」一节）：
   1. 单请求体量：约 32,000 字符通过、44,000 字符被 `code 603: Too many words in
@@ -411,8 +414,9 @@ thinking 吃光小预算。
 - `src/config/models.ts`
 - `deno/src/config/models.ts`
 
-当前对外暴露 67 个模型/别名，其中 Claude 家族 26 个，其余为 Sider 支持的
-GPT / Gemini / DeepSeek / Grok / GLM / Qwen / Kimi / Llama 上游模型。
+模型清单严格同步参考仓库
+[`goldenhawksu/sider2api` 的 `deno_pro.ts`](https://github.com/goldenhawksu/sider2api/blob/main/deno_pro.ts)
+中的 `MODEL_MAPPING`。2026-10-07 同步结果为 105 个模型，后续数量以当次参考映射为准。
 新增、删除或改映射时，必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`
 与 `deno/test/model-exposure.test.ts` 里的计数与 id 断言。
 
@@ -422,9 +426,51 @@ GPT / Gemini / DeepSeek / Grok / GLM / Qwen / Kimi / Llama 上游模型。
 
 未知 Claude 模型按家族保守映射：
 
-- Opus -> `claude-opus-4.6`
+- Opus -> `claude-opus-4.8`
 - Haiku -> `claude-haiku-4.5`
 - Sonnet -> `claude-sonnet-4.6`
+
+### 更新模型映射：标准操作流程
+
+用户在 2026-10-07 明确选择了**严格同步、删除参考未列出的上游模型**。
+以后执行“更新模型映射”时默认沿用此规则，包括删除参考未列出的旧别名，
+无需重复询问是否保留；用户提出新的同步要求时以新要求为准。
+
+1. **检查本地基线**：检查 Git 工作区，完整读取两份模型配置及相关测试，
+   比较双运行时的差异；运行相关测试和类型检查，区分已有失败与本次引入的问题。
+2. **获取参考映射**：只读获取
+   `https://raw.githubusercontent.com/goldenhawksu/sider2api/main/deno_pro.ts`，
+   提取 `MODEL_MAPPING` 并记录抓取日期或参考版本；可缓存到临时目录用于离线比对。
+   获取失败时说明阻塞原因，不凭记忆猜测最新模型，也不把临时参考文件提交到仓库。
+3. **比较并同步**：列出新增、删除和映射值变化，严格同步模型键与目标值，
+   两份 `models.ts` 内容必须逐字一致；保持现有数据结构和代码风格，
+   只改相关配置、测试与过时的模型记忆。参考值不同于键时须保留真实映射关系。
+4. **检查兜底目标**：删除模型时检查 `mapModelName` 的家族兜底是否仍指向已删除条目，
+   必要时改为参考中同家族的有效模型，普通与 `-think` 分别核对。
+   模型清单删除与未知名称的家族兜底是不同语义，不因清单同步擅自删除兜底机制。
+5. **更新并运行验证**：更新 `deno/test/model-exposure.test.ts` 和
+   `deno/test/hybrid-routing.test.ts` 的数量、模型 id 与映射断言；
+   同步 `deno/test/integration/config.ts` 的默认模型及集成套件中的模型常量，
+   避免已删除的模型仍被用作正常作答或详情查询的测试样例。
+   验证新增模型可发现并正确映射、删除模型不再出现在列表且详情接口返回 404。
+   将两个运行时导出的完整映射与参考逐项比较，确认无缺失、无额外键、目标值相同，
+   并验证大小写兼容及兜底目标存在。再运行下列确定性回归与类型检查。
+6. **检查并报告**：运行 `git diff --check`，审查修改范围；报告参考来源、
+   同步后模型数量、主要增删、兜底变化和实际验证结果，明确未执行或失败的检查。
+   映射一致性验证不能宣称已证明所有模型在真实 Sider 上游可用；能力 probe 按需另行执行。
+
+```bash
+# 模型相关测试：先验证本次改动
+deno test --allow-env --allow-read=deno deno/test/model-exposure.test.ts deno/test/hybrid-routing.test.ts
+
+# 完整确定性回归：Deno 单元测试、主入口/探针类型检查、Node/Bun 类型检查及适配器测试
+npm run test:regression
+
+# Deno 集成测试入口的类型检查，不调用真实上游
+deno check deno/test/integration/run.ts
+
+git diff --check
+```
 
 ## Sider Probe
 
@@ -675,6 +721,8 @@ Node/Bun 侧适配器单元测试（mock fetch，不需要起服务）：
 - `test/deepseek-adapter.unit.test.ts`，由 `npm run test:unit:node` 单跑，
   已并入 `npm run test:regression`。与 `deno/test/deepseek-adapter.test.ts`
   对应，保证双运行时的适配器行为同步。
+- `test/request-converter.unit.test.ts`，同样并入 `npm run test:unit:node`，
+  验证只传真实 cid 和单条 user 消息时仍附带父消息 ID，与 Deno 转换器测试对应。
 
 Deno 集成回归测试库（打真实实例，`deno task test:e2e`）：
 

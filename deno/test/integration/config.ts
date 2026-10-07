@@ -79,7 +79,7 @@ export function getConfig(): IntegrationConfig {
     timeoutMs: Number(read('E2E_TIMEOUT_MS', '120000')),
     liveModel: read('E2E_LIVE_MODEL', 'claude-haiku-4.5'),
     claudeCodeSonnet: read('E2E_CC_SONNET_MODEL', 'claude-sonnet-4.6'),
-    claudeCodeOpus: read('E2E_CC_OPUS_MODEL', 'claude-opus-4.6'),
+    claudeCodeOpus: read('E2E_CC_OPUS_MODEL', 'claude-opus-4.8'),
     reportDir: read('E2E_REPORT_DIR', 'deno/test/integration/reports'),
   };
 }

@@ -14,7 +14,7 @@ import {
   UpstreamLimited,
 } from '../harness.ts';
 
-const MODEL = 'gemini-3.7-flash';
+const MODEL = 'gemini-3.8-flash';
 
 export const suite: Suite = {
   id: '08',

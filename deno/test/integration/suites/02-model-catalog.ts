@@ -74,7 +74,7 @@ export const suite: Suite = {
     {
       name: 'GET /v1beta/models/:model 明细',
       async run({ api }) {
-        const res = await api.get('/v1beta/models/gemini-3.7-flash');
+        const res = await api.get('/v1beta/models/gemini-3.8-flash');
         assertStatus(res, 200);
         assertTrue(!!(res.json?.name ?? res.json?.id), 'name/id 非空');
         return `name=${res.json.name ?? res.json.id}`;

@@ -19,7 +19,7 @@ import {
   UpstreamLimited,
 } from '../harness.ts';
 
-const STREAM_MODELS = ['claude-haiku-4.5', 'gemini-3.7-flash', 'deepseek-v4-flash'];
+const STREAM_MODELS = ['claude-haiku-4.5', 'gemini-3.8-flash', 'deepseek-v4-flash'];
 
 export const suite: Suite = {
   id: '04',
