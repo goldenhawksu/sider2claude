@@ -24,6 +24,7 @@ import {
 import {
   collectHistoryToolUseIds,
   collectToolInputKeys,
+  isValidWriteInput,
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use';
 import { applyStopSequences } from '../utils/stop-sequences';
@@ -349,10 +350,15 @@ export class AnthropicApiAdapter {
       'Lines like "[tool_use:Name] id=... input=..." and "[tool_result] tool_use_id=..." are a ' +
       'read-only transcript of what already happened. Never reproduce those lines to request a tool, ' +
       'and never write textual tool-call transcripts in normal text.';
+    const writeInstruction = tools.some((tool) => tool.name === 'Write')
+      ? ' For Write, emit a structured tool_use with file_path and content as JSON strings. ' +
+        'Preserve the exact path and full content; escape nested quotes, backslashes and newlines. ' +
+        'Never put explanations or apologies into the content argument unless explicitly requested.'
+      : '';
 
     return system ? `${system}
 
-${instruction}` : instruction;
+${instruction}${writeInstruction}` : instruction + writeInstruction;
   }
 
   private appendInstructionToLastUser(
@@ -651,6 +657,15 @@ ${instruction}` : instruction;
       }
 
       if (item.type === 'tool_use') {
+        if (
+          typeof item.name === 'string' && item.name.toLowerCase() === 'write' &&
+          !isValidWriteInput(item.input)
+        ) {
+          throw new AnthropicBackendError(
+            '上游 Write 参数无效，已阻止写入；file_path 和 content 必须为完整字符串。',
+            502, this.provider,
+          );
+        }
         return {
           type: 'tool_use',
           id: typeof item.id === 'string' ? item.id : `toolu_${crypto.randomUUID()}`,
@@ -679,6 +694,16 @@ ${instruction}` : instruction;
       historyToolUseIds,
       toolInputKeys,
     );
+    if (converted.unparsedWriteCount > 0) {
+      logError('invalid_write_tool_input', {
+        ...this.contextFields(logContext), provider: this.provider,
+        count: converted.unparsedWriteCount,
+      });
+      throw new AnthropicBackendError(
+        '上游文本 Write 参数不是严格 JSON 或不完整，已阻止本轮工具执行；请重新生成结构化 Write 调用。',
+        502, this.provider,
+      );
+    }
     if (converted.toolUseCount > 0) {
       logWarn('textual_tool_use_normalized', {
         ...this.contextFields(logContext),

@@ -281,6 +281,10 @@ RouterEngine
   流式/非流式识别客户端重试的观测语义），因此缓存键必须额外带流式标记，
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
+- Write 文本调用只接受严格 JSON 和完整字符串参数；禁止修补其引号或路径转义。
+  长正文可能含 `file_path`／`content` 同名字段，宽松修补会把它们识别成外层参数，
+  导致路径覆盖或正文截断。无效 Write 应阻止下发并明确报错，不猜测目标文件或正文。
+  合法结构化 Write 的内容按原样保留；正文里的 JSON／业务格式仍由应用验证。
 - 上游工具响应也使用 `stream:true` 获取生成进度，完整拼接后再按既有逻辑校验和合成客户端流。
   `DEEPSEEK_REQUEST_TIMEOUT_MS` 现表示连续无上游数据的空闲超时，默认 300000 毫秒；
   每轮独立总时长上限 600000 毫秒。客户端 `message_start`／ping 不能刷新上游空闲计时。

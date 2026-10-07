@@ -454,11 +454,12 @@ export function collectHistoryToolUseIds(messages: AnthropicRequest['messages'])
 /**
  * 把响应内容块里被模型模仿出来的文本工具调用还原成结构化 `tool_use`。
  *
- * 返回三个计数，调用方据此告警：
+ * 返回四个计数，调用方据此告警：
  * - `toolUseCount`：成功还原的条数；
  * - `replayedCount`：模型在复述历史而非发起新调用，刻意不还原；
  * - `unparsedCount`：形状像调用却解析不出来 —— 兜底网漏了一次，回合会退化成
  *   `end_turn`。这是「助手莫名停下」的直接证据，没有它只能靠翻聊天记录复原现场。
+ * - `unparsedWriteCount`：不可安全还原的写文件调用，适配器必须阻止下发。
  */
 export function normalizeTextualToolUseBlocks(
   blocks: AnthropicResponseContent[],
@@ -469,11 +470,13 @@ export function normalizeTextualToolUseBlocks(
   toolUseCount: number;
   replayedCount: number;
   unparsedCount: number;
+  unparsedWriteCount: number;
 } {
   const next: AnthropicResponseContent[] = [];
   let toolUseCount = 0;
   let replayedCount = 0;
   let unparsedCount = 0;
+  let unparsedWriteCount = 0;
 
   for (const block of blocks) {
     if (block.type !== 'text') {
@@ -500,6 +503,11 @@ export function normalizeTextualToolUseBlocks(
         // 单独计数并告警，否则用户只会看到"助手莫名停下"，无从诊断。
         if (TEXTUAL_TOOL_LINE_SHAPE.test(line.trim())) {
           unparsedCount += 1;
+          if (
+            /^(Previous assistant tool request:\s*name=Write\s|\[tool_use:Write\])/i.test(line.trim())
+          ) {
+            unparsedWriteCount += 1;
+          }
         }
         pendingText.push(line);
         continue;
@@ -527,7 +535,7 @@ export function normalizeTextualToolUseBlocks(
     next.push(...convertedParts);
   }
 
-  return { content: next, toolUseCount, replayedCount, unparsedCount };
+  return { content: next, toolUseCount, replayedCount, unparsedCount, unparsedWriteCount };
 }
 
 /**
@@ -558,7 +566,11 @@ export function parseTextualToolUseLine(
   }
 
   try {
-    const input = parseLooseToolInputJson(inputText, toolInputKeys?.get(name));
+    // Write 的正文可能包含同名字段，猜测引号边界会覆盖路径或截断正文。
+    const input = name.toLowerCase() === 'write'
+      ? JSON.parse(inputText)
+      : parseLooseToolInputJson(inputText, toolInputKeys?.get(name));
+    if (name.toLowerCase() === 'write' && !isValidWriteInput(input)) return undefined;
     if (!input) {
       return undefined;
     }
@@ -579,6 +591,15 @@ export function asRecord(value: unknown): Record<string, unknown> {
   }
 
   return value as Record<string, unknown>;
+}
+
+/** 只校验工具参数，不猜测业务正文或改写目标路径。 */
+export function isValidWriteInput(input: unknown): boolean {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
+  const args = input as Record<string, unknown>;
+  return typeof args.file_path === 'string' && args.file_path.trim().length > 0 &&
+    typeof args.content === 'string' &&
+    !(/^[A-Za-z]:/.test(args.file_path) && /[\x00-\x1f]/.test(args.file_path));
 }
 
 /**

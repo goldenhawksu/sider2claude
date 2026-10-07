@@ -25,6 +25,7 @@ import { suite as legacyComplete } from './suites/09-legacy-complete.ts';
 import { suite as authErrors } from './suites/10-auth-errors.ts';
 import { suite as clientTools } from './suites/11-client-tools.ts';
 import { suite as longToolRequest } from './suites/12-long-tool-request.ts';
+import { suite as writeIntegrity } from './suites/13-write-integrity.ts';
 
 const ALL_SUITES: Suite[] = [
   infrastructure,
@@ -39,6 +40,7 @@ const ALL_SUITES: Suite[] = [
   authErrors,
   clientTools,
   longToolRequest,
+  writeIntegrity,
 ];
 
 const selected = Deno.args.filter((arg) => !arg.startsWith('-'));
