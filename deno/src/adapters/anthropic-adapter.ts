@@ -28,6 +28,7 @@ import {
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
+import { toClientContent } from '../utils/client-content.ts';
 import { cancelUpstreamReader } from '../utils/stream-cancel.ts';
 import {
   noteThinkingAteBudget,
@@ -550,17 +551,27 @@ export class AnthropicApiAdapter {
     // tools/probe-upstream-stop-sequences.ts）。两种都不能直接透传给调用方。
     const stopped = applyStopSequences(content, stopSequences);
     const hasToolUse = stopped.content.some((block) => block.type === 'tool_use');
+    const clientContent = stopped.content.map(toClientContent);
+    const convertedTypes = stopped.content
+      .filter((block, index) => block !== clientContent[index]).map((block) => block.type);
+    if (convertedTypes.length) {
+      logInfo('server_tool_content_normalized', {
+        ...this.contextFields(logContext), provider: this.provider, blockTypes: convertedTypes,
+      });
+    }
 
     return {
       id: typeof raw.id === 'string' ? raw.id : `msg_${Date.now()}`,
       type: 'message',
       role: 'assistant',
-      content: stopped.content,
+      content: clientContent,
       model: outwardModel,
       stop_reason: stopped.matched
         ? 'stop_sequence'
         : hasToolUse && (stopReason === 'end_turn' || stopReason === null)
         ? 'tool_use'
+        : stopReason === 'tool_use' && !hasToolUse && content.some((block) => 'tool_use_id' in block)
+        ? 'end_turn'
         : stopReason,
       ...(stopped.matched
         ? { stop_sequence: stopped.matched }
@@ -758,6 +769,69 @@ export class AnthropicApiAdapter {
 
       const decoder = new TextDecoder();
       let buffer = '';
+      // 每次请求独立维护服务端工具输入，不让 input_json_delta 泄漏给客户端。
+      const serverInputs = new Map<number, { block: AnthropicResponseContent; input: string }>();
+      let hasClientToolUse = false;
+      let hasServerResult = false;
+      const forward = (chunk: unknown) => {
+        const event = chunk as Record<string, unknown>;
+        const index = event.index as number;
+        if (event.type === 'content_block_start') {
+          const block = event.content_block as AnthropicResponseContent;
+          if (block.type === 'tool_use') hasClientToolUse = true;
+          if (block.type === 'server_tool_use') {
+            serverInputs.set(index, { block, input: '' });
+            onChunk({ ...event, content_block: { type: 'text', text: '' } });
+            return;
+          }
+          const converted = toClientContent(block);
+          if (converted !== block && converted.type === 'text') {
+            hasServerResult = true;
+            onChunk({ ...event, content_block: { type: 'text', text: '' } });
+            onChunk({
+              type: 'content_block_delta',
+              index,
+              delta: { type: 'text_delta', text: converted.text },
+            });
+            return;
+          }
+          if (!['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)) {
+            throw new Error(
+              `${this.provider} API returned unsupported content block type: ${block.type}`,
+            );
+          }
+        }
+        const pending = serverInputs.get(index);
+        if (pending && event.type === 'content_block_delta') {
+          const delta = event.delta as { type?: string; partial_json?: string };
+          if (delta.type !== 'input_json_delta') {
+            throw new Error('服务端工具输入包含不支持的增量类型');
+          }
+          pending.input += delta.partial_json ?? '';
+          return;
+        }
+        if (pending && event.type === 'content_block_stop') {
+          const block = pending.input
+            ? { ...pending.block, input: JSON.parse(pending.input) }
+            : pending.block;
+          const converted = toClientContent(block);
+          if (converted.type === 'text') {
+            onChunk({
+              type: 'content_block_delta',
+              index,
+              delta: { type: 'text_delta', text: converted.text },
+            });
+          }
+          serverInputs.delete(index);
+        }
+        if (event.type === 'message_delta') {
+          const delta = event.delta as { stop_reason?: string };
+          if (delta?.stop_reason === 'tool_use' && hasServerResult && !hasClientToolUse) {
+            event.delta = { ...delta, stop_reason: 'end_turn' };
+          }
+        }
+        onChunk(event);
+      };
 
       try {
         while (true) {
@@ -769,13 +843,14 @@ export class AnthropicApiAdapter {
           buffer = lines.pop() || '';
 
           for (const line of lines) {
-            this.forwardSSELine(line.trim(), outwardModel, onChunk);
+            this.forwardSSELine(line.trim(), outwardModel, forward);
           }
         }
 
         if (buffer.trim()) {
-          this.forwardSSELine(buffer.trim(), outwardModel, onChunk);
+          this.forwardSSELine(buffer.trim(), outwardModel, forward);
         }
+        if (serverInputs.size) throw new Error('上游服务端工具输入流未完整结束');
       } finally {
         await cancelUpstreamReader(reader);
       }
@@ -787,8 +862,7 @@ export class AnthropicApiAdapter {
   }
 
   /**
-   * 透传一行上游 SSE 事件。DeepSeek 输出已是 Anthropic SSE 格式，仅在 message_start
-   * 把上游模型名改回对外 Claude 模型名，其余（thinking_delta / input_json_delta 等）原样透传。
+   * 读取一行上游 SSE 事件并恢复对外模型名；调用方随后规范化服务端工具块。
    */
   private forwardSSELine(
     line: string,

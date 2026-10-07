@@ -184,6 +184,12 @@ export function parseSSE(raw: string) {
     .filter((e) => e.delta?.type === 'text_delta')
     .map((e) => e.delta.text)
     .join('');
+  for (const event of events) {
+    if (event.type === 'content_block_start') {
+      assertTrue(['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(event.content_block?.type),
+        `Claude Code 可识别内容块（实际 ${event.content_block?.type}）`);
+    }
+  }
   return { eventNames, events, paired: eventNames.length === dataLines.length, text };
 }
 
@@ -204,6 +210,8 @@ export function assertAnthropicMessage(json: any, expectedModel?: string): void 
   assertEquals(json.type, 'message', 'type');
   assertEquals(json.role, 'assistant', 'role');
   assertTrue(Array.isArray(json.content) && json.content.length > 0, 'content 是非空数组');
+  assertTrue(json.content.every((block: any) => ['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)),
+    '所有内容块均可由 Claude Code 处理');
   assertTrue(typeof json.id === 'string' && json.id.length > 0, 'id 非空');
   assertTrue(
     typeof json.usage?.input_tokens === 'number' &&

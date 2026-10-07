@@ -1,0 +1,73 @@
+# GLM、DeepSeek 与 Claude Code 客户端兼容
+
+## 结论与范围
+
+采用统一客户端输出规范，加上既有的上游响应自适应机制。不要按模型名称决定
+是否透传服务端工具，也不要将服务端工具改成 MCP／本地工具调用。
+
+2026-10-07 当前实时验证入口是 `api.z.ai` 的 `glm-5.3-flash`。
+DeepSeek 对照来自项目此前官方入口的 `deepseek-v4-flash`／`deepseek-v4-flash-vision-exp`
+实测记录和确定性重放；这些记录不能证明其他名为 `deepseek-flash` 的入口行为完全相同。
+
+## 行为依据
+
+| 项目 | GLM 当前探测／既有实测 | DeepSeek 官方入口既有实测 | 代理处理 |
+|---|---|---|---|
+| MCP 工具 | 当前 auto、强制指定均返回标准 `tool_use` | 支持标准工具调用；thinking 下强制指定曾返回 400 | 保留工具名、ID、参数；强制指定继续沿用已有文本意图兼容 |
+| 服务端搜索 | 当前实际出现 `server_tool_use`、通用 `tool_result`，同轮可有多个调用 | 当前未重新验证原生搜索能力 | 输出转换按内容类型处理，不按厂商猜测 |
+| thinking 预算 | 当前 64 token 只产出 thinking；历史 256 仍可能无正文 | 历史 64 失败、256 已有正文 | 按 `baseUrl::model` 学习失败预算，仅在符合判据时关闭 thinking 重试一次 |
+| 历史工具块 | 工具循环可用，历史参数兼容程度较宽 | thinking passback 校验更严格 | 保留既有历史文本转录与图片透传策略 |
+| `tool_choice: none` | 历史观察到忽略参数 | 历史观察到原生生效 | 隐藏客户端工具，避免仅靠参数导致意外调用 |
+| stop 序列 | 历史观察到截 thinking、结束原因不准确 | 历史观察到符合规范 | 保留既有正文层截断，不能截断工具结果记录 |
+
+## 输出契约
+
+对外内容块限定为 `text`、`thinking`、`redacted_thinking`、`tool_use`：
+
+- `server_tool_use` 转为文本调用记录，保留原始调用字段。
+- 搜索、抓取、代码执行专用结果和通用 `tool_result` 转为文本结果记录，
+  保留关联 ID、结果内容、来源网址和错误，不任意截断或丢弃。
+- 真正的客户端 `tool_use` 原样保留，不执行、不重命名，不重复生成调用。
+- 服务端结果里的工具转录文本不送进工具调用还原器，避免把网页内容变成可执行调用。
+- `tool_use` 结束原因仅在存在实际客户端调用时要求客户端继续；
+  只有已完成服务端工具结果时，错误的 `tool_use` 结束原因转为 `end_turn`。
+  `max_tokens` 与 stop 序列等结束原因保持既有语义。
+
+统一转换在 `utils/client-content.ts`，两套运行时保持相同实现。
+JSON 响应在原始块校验、工具还原和 stop 序列处理之后转换。
+Deno 真流式只缓冲服务端工具的输入 JSON 片段，在块闭合时转换为文本；
+其余正文、thinking 和客户端工具仍按增量发送。每个请求单独维护状态。
+畸形或不完整的服务端输入明确报错，并通过 finally 取消上游 reader。
+
+可观察日志 `server_tool_content_normalized` 只记录转换类型、provider 和请求标识，
+不记录工具输入、结果正文或凭证。完整结果转文本会增加客户端可见正文长度，
+但不会增加一次上游请求；这比静默丢失来源或重复执行工具更符合用户任务语义。
+
+## 验证方法
+
+1. 确定性测试模拟 GLM 的服务端工具块和 DeepSeek 的标准工具响应，
+   检查 JSON、合成流、真流式、通用／专用结果、错误、来源、结束原因、
+   缓存 token 计数、工具结果中的伪调用文本以及并发请求隔离。
+2. 所有集成测试的消息和 SSE 内容块都执行客户端类型检查，
+   不再仅以 HTTP 200 或 `message_stop` 判断兼容。
+3. 新套件 11 使用真实上游验证搜索来源保留，以及 17 工具请求中的
+   README 抓取失败 → webReader → Write 文档循环。工具执行结果由测试模拟，
+   不宣称运行了完整 ppt-master 或 VS Code 界面。
+4. 本机真实 Claude Code 2.1.195 验证了：捕获的 GLM 原生搜索响应经代理转换后
+   正常显示来源并结束；真实 GLM 经代理执行 Read → Write，实际生成文档，
+   文件中保留了指定版本、安装与启动信息。
+   CLI 测试使用隔离目录、独立 `CLAUDE_CONFIG_DIR`、`--setting-sources ""` 和
+   safe-mode，排除个人 provider 与工具权限设置对测试地址的覆盖。
+   本地转发日志确认客户端发送了 Read、Write 并实际访问本次代理；
+   先移除旧的测试输出，再以新文件内容为验收依据，不能把退出码 0 当成任务完成。
+
+```bash
+npm run test:regression
+deno check deno/test/integration/run.ts
+deno task test:e2e
+npm run test:integration
+git diff --check
+```
+
+推送条件是全部集成用例通过，失败和上游受限均为 0。实际 VS Code 插件版本
+未在此环境直接操作；Claude Code CLI 消费验证补充协议测试，不能代替全部 UI 行为测试。

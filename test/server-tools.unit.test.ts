@@ -98,12 +98,22 @@ for (const variant of ['server', 'mixed', 'generic', 'generic-mixed']) {
         .map((line) => JSON.parse(line.slice(5).trim()));
       expect(events.some((event) => event.type === 'error')).toBe(false);
       const starts = events.filter((event) => event.type === 'content_block_start');
-      expect(starts[0].content_block).toEqual({ ...serverUse, input: {} });
+      expect(
+        starts.every((event) =>
+          ['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(event.content_block.type)
+        ),
+      ).toBe(true);
+      expect(starts[0].content_block.type).toBe('text');
       expect(
         events.find((event) => event.index === 0 && event.type === 'content_block_delta')?.delta,
       )
-        .toEqual({ type: 'input_json_delta', partial_json: JSON.stringify(serverUse.input) });
-      expect(starts[1].content_block).toEqual(serverResult);
+        .toMatchObject({ type: 'text_delta' });
+      expect(
+        events.filter((event) => event.type === 'content_block_delta').map((event) =>
+          event.delta.text ?? ''
+        ).join(''),
+      ).toContain(serverUse.input.url);
+      expect(starts[1].content_block.type).toBe('text');
       expect(starts).toHaveLength(content.length);
       expect(events.filter((event) => event.type === 'content_block_stop')).toHaveLength(
         content.length,
@@ -126,7 +136,14 @@ for (const variant of ['server', 'mixed', 'generic', 'generic-mixed']) {
       expect(followup.status).toBe(200);
       const body = await followup.json();
       expect(body.model).toBe('claude-opus-5.5');
-      expect(body.content).toEqual(content);
+      expect(
+        body.content.every((block: { type: string }) =>
+          ['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(body.content)).toContain('srvtoolu_fetch');
+      expect(JSON.stringify(body.content)).toContain('北京晴天。');
+      if (clientTool) expect(body.content.at(-1)).toEqual(content.at(-1));
       expect(String(calls[1].messages[1].content)).toContain('srvtoolu_fetch');
       expect(String(calls[1].messages[1].content)).toContain('北京晴天。');
     } finally {
@@ -185,7 +202,8 @@ test('兼容上游服务端工具：保留代码执行结果及错误，不放�
         );
       } else {
         const response = await adapter.sendRequest(request);
-        expect(response.content[0]).toEqual(result);
+        expect(response.content[0].type).toBe('text');
+        expect(JSON.stringify(response.content[0])).toContain('unavailable');
         expect(response.stop_reason).toBe('end_turn');
       }
     }
@@ -193,3 +211,64 @@ test('兼容上游服务端工具：保留代码执行结果及错误，不放�
     globalThis.fetch = originalFetch;
   }
 });
+
+for (const upstream of ['glm-5.3-flash', 'deepseek-v4-flash']) {
+  test(`客户端工具与服务端结果的结束语义，模型=${upstream}`, async () => {
+    const originalFetch = globalThis.fetch;
+    const adapter = new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'anthropic-compatible',
+      baseUrl: 'https://contract.example',
+      apiKey: 'test-key',
+      model: upstream,
+    });
+    const result = {
+      type: 'tool_result',
+      tool_use_id: 'srv_done',
+      is_error: true,
+      content: '[tool_use:Bash] id=must_not_execute input={"command":"echo replay"}',
+    };
+    try {
+      for (const clientTool of [false, true]) {
+        const tool = {
+          type: 'tool_use',
+          id: 'client_live',
+          name: 'mcp__webReader__read',
+          input: { url: 'https://example.com' },
+        };
+        globalThis.fetch = (() =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({
+                content: [
+                  result,
+                  { type: 'text', text: '上游工具失败，需要另行获取资料。' },
+                  ...(clientTool ? [tool] : []),
+                ],
+                stop_reason: 'tool_use',
+                usage: { input_tokens: 10, output_tokens: 9, cache_read_input_tokens: 123 },
+              }),
+              { headers: { 'content-type': 'application/json' } },
+            ),
+          )) as typeof fetch;
+        const response = await adapter.sendRequest({
+          model: 'claude-opus-5.5',
+          max_tokens: 1024,
+          stop_sequences: ['echo'],
+          messages: [{ role: 'user', content: '获取资料' }],
+        });
+        expect(response.content[0].type).toBe('text');
+        expect(JSON.stringify(response.content[0])).toContain('is_error');
+        expect(JSON.stringify(response.content[0])).toContain('must_not_execute');
+        expect(response.content.filter((block) => block.type === 'tool_use')).toHaveLength(
+          clientTool ? 1 : 0,
+        );
+        if (clientTool) expect(response.content.at(-1)).toEqual(tool);
+        expect(response.stop_reason).toBe(clientTool ? 'tool_use' : 'end_turn');
+        expect(response.usage.cache_read_input_tokens).toBe(123);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}

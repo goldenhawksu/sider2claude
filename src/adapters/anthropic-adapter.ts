@@ -27,6 +27,7 @@ import {
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use';
 import { applyStopSequences } from '../utils/stop-sequences';
+import { toClientContent } from '../utils/client-content';
 import {
   noteThinkingAteBudget,
   noteThinkingDisabledRejected,
@@ -532,12 +533,20 @@ ${instruction}` : instruction;
     // deno/tools/probe-upstream-stop-sequences.ts）。两种都不能直接透传给调用方。
     const stopped = applyStopSequences(content, stopSequences);
     const hasToolUse = stopped.content.some((block) => block.type === 'tool_use');
+    const clientContent = stopped.content.map(toClientContent);
+    const convertedTypes = stopped.content
+      .filter((block, index) => block !== clientContent[index]).map((block) => block.type);
+    if (convertedTypes.length) {
+      logInfo('server_tool_content_normalized', {
+        ...this.contextFields(logContext), provider: this.provider, blockTypes: convertedTypes,
+      });
+    }
 
     return {
       id: typeof raw.id === 'string' ? raw.id : `msg_${Date.now()}`,
       type: 'message',
       role: 'assistant',
-      content: stopped.content,
+      content: clientContent,
       model: outwardModel,
       // 文本兜底还原出 tool_use 后，stop_reason 必须同步改成 tool_use，
       // 否则 Claude Code 会认为回合结束、停止 agent 循环。
@@ -545,6 +554,8 @@ ${instruction}` : instruction;
         ? 'stop_sequence'
         : hasToolUse && (stopReason === 'end_turn' || stopReason === null)
         ? 'tool_use'
+        : stopReason === 'tool_use' && !hasToolUse && content.some((block) => 'tool_use_id' in block)
+        ? 'end_turn'
         : stopReason,
       ...(stopped.matched
         ? { stop_sequence: stopped.matched }

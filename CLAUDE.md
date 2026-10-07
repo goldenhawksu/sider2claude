@@ -282,13 +282,17 @@ RouterEngine
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
 - Anthropic 兼容端还可能返回 `server_tool_use` 与搜索、网页抓取、代码执行结果块。
-  它们是上游服务端工具：适配器保留原始结构，合成流保留原类型与关联 ID，
-  历史回传转录为服务端工具记录。不能把它们编码成客户端 `tool_use`，
+  它们是上游服务端工具：适配器内部保留原始结构，客户端出口统一转成文本记录，
+  保留调用 ID、输入、结果、来源和错误，非流式、合成流与真流式均需转换。
+  VS Code Claude Code 插件实测不接受这些扩展块，不能直接透传；也不能把它们编码成客户端 `tool_use`，
   也不能仅因存在服务端工具就把 `stop_reason` 改成 `tool_use`。
   生产 GLM 兼容端还会在助手响应中用通用 `tool_result` 编码结果，必须一并保留，
   不能因它不是专用的 `web_search_tool_result` 等类型而中断响应。
   `deno/test/messages-hybrid-stream.test.ts` 与 `test/server-tools.unit.test.ts` 覆盖
   `claude-opus-5.5`、3 条消息、17 个工具的合成流和后续历史回传。
+  `deno/test/server-tool-stream.test.ts` 覆盖真流式分段输入、并发隔离与异常 reader 清理，
+  `deno/test/integration/suites/11-client-tools.ts` 覆盖真实搜索和 README 失败后换 MCP 工具、
+  写入文档的循环。差异依据与真实客户端验证见 [上游兼容与 Claude Code 验证](docs/上游兼容与ClaudeCode验证.md)。
 - **上游三处不符合 Anthropic 规范的行为，一律在本服务层兜住**（probe 脚本见
   `deno/tools/probe-deepseek-tool-choice.ts`、`probe-upstream-stop-sequences.ts`、
   `probe-upstream-max-tokens.ts`；改这三处前先重跑对应 probe）：

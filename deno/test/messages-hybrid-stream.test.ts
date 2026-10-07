@@ -165,20 +165,23 @@ for (const variant of ['server', 'mixed', 'generic', 'generic-mixed']) {
         assertEquals(events.some((event) => event.type === 'error'), false);
         const starts = events.filter((event) => event.type === 'content_block_start');
         const serverStart = starts[0].content_block as Record<string, unknown>;
-        assertEquals(serverStart.type, 'server_tool_use');
-        assertEquals(serverStart.id, serverUse.id);
-        assertEquals(serverStart.name, 'web_search');
+        assertEquals(serverStart.type, 'text');
+        assertEquals(starts.every((event) => ['text', 'thinking', 'redacted_thinking', 'tool_use'].includes((event.content_block as {type:string}).type)), true);
         const inputDelta = events.find((event) =>
           event.index === 0 && event.type === 'content_block_delta'
         );
         assertEquals(
-          (inputDelta?.delta as { partial_json?: string })?.partial_json,
-          JSON.stringify(serverUse.input),
+          (inputDelta?.delta as { type?: string })?.type,
+          'text_delta',
         );
         assertEquals(
-          JSON.stringify(starts[1].content_block),
-          JSON.stringify(serverResult),
+          (starts[1].content_block as {type:string}).type,
+          'text',
         );
+        const streamedText = events.filter((event) => event.type === 'content_block_delta').map((event) => (event.delta as {text?:string}).text ?? '').join('');
+        assertEquals(streamedText.includes('srvtoolu_search'), true);
+        assertEquals(streamedText.includes('search-result-data'), true);
+        assertEquals(streamedText.includes('北京晴天。'), true);
         assertEquals(starts.length, content.length);
         assertEquals(
           events.filter((event) => event.type === 'content_block_stop').length,
@@ -206,7 +209,9 @@ for (const variant of ['server', 'mixed', 'generic', 'generic-mixed']) {
         assertEquals(followup.status, 200);
         const body = await followup.json();
         assertEquals(body.model, 'claude-opus-5.5');
-        assertEquals(JSON.stringify(body.content), JSON.stringify(content));
+        assertEquals(body.content.every((block: {type:string}) => ['text', 'thinking', 'redacted_thinking', 'tool_use'].includes(block.type)), true);
+        assertEquals(JSON.stringify(body.content).includes('search-result-data'), true);
+        if (clientTool) assertEquals(JSON.stringify(body.content.at(-1)), JSON.stringify(content.at(-1)));
         assertEquals(
           String(calls[1].messages[1].content).includes('search-result-data'),
           true,
