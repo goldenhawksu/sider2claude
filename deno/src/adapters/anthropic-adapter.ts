@@ -451,6 +451,14 @@ export class AnthropicApiAdapter {
   }
 
   private contentBlockToText(block: AnthropicContent): string[] {
+    if (block.type === 'server_tool_use') {
+      return [
+        `Previous server tool request: name=${block.name} id=${block.id} input_json=${
+          JSON.stringify(block.input ?? {})
+        }`,
+      ];
+    }
+
     if (block.type === 'text') {
       return block.text ? [block.text] : [];
     }
@@ -476,6 +484,14 @@ export class AnthropicApiAdapter {
           block.is_error ? ' is_error=true' : ''
         }` +
         (content ? `\n${content}` : ''),
+      ];
+    }
+
+    if ('tool_use_id' in block) {
+      return [
+        `Previous server tool result: type=${block.type} tool_use_id=${block.tool_use_id} content=${
+          JSON.stringify(block.content)
+        }`,
       ];
     }
 
@@ -572,6 +588,16 @@ export class AnthropicApiAdapter {
       }
 
       const item = block as Record<string, unknown>;
+      // 服务端工具调用及结果保留原始结构，客户端无需再次执行。
+      if (
+        item.type === 'server_tool_use' || item.type === 'web_search_tool_result' ||
+        item.type === 'web_fetch_tool_result' || item.type === 'code_execution_tool_result' ||
+        item.type === 'bash_code_execution_tool_result' ||
+        item.type === 'text_editor_code_execution_tool_result'
+      ) {
+        return item as unknown as AnthropicResponseContent;
+      }
+
       if (item.type === 'text') {
         return {
           type: 'text',

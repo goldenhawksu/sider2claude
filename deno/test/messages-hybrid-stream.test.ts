@@ -67,6 +67,159 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+for (const clientTool of [false, true]) {
+  Deno.test(`兼容上游服务端工具：合成流与历史回传，客户端工具=${clientTool}`, async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: AnthropicRequest[] = [];
+    const serverUse = {
+      type: "server_tool_use",
+      id: "srvtoolu_search",
+      name: "web_search",
+      input: { query: "北京天气" },
+    };
+    const serverResult = {
+      type: "web_search_tool_result",
+      tool_use_id: serverUse.id,
+      content: [{
+        type: "web_search_result",
+        title: "天气",
+        url: "https://example.com/weather",
+        encrypted_content: "search-result-data",
+      }],
+    };
+    const content = [
+      serverUse,
+      serverResult,
+      { type: "text", text: "北京晴天。" },
+      ...(clientTool
+        ? [{
+          type: "tool_use",
+          id: "toolu_read",
+          name: "Read",
+          input: { file_path: "a.ts" },
+        }]
+        : []),
+    ];
+
+    try {
+      await withEnv({
+        AUTH_TOKEN: "test-token-12345",
+        DEEPSEEK_API_KEY: "upstream-token",
+        DEEPSEEK_BASE_URL: "https://server-tools.example/anthropic",
+        DEEPSEEK_MODEL: "glm-5.3-flash",
+        DEFAULT_BACKEND: "deepseek",
+        SIDER_AUTH_TOKEN: undefined,
+      }, async () => {
+        globalThis.fetch =
+          ((_input: string | URL | Request, init?: RequestInit) => {
+            calls.push(JSON.parse(init?.body as string));
+            return Promise.resolve(
+              new Response(
+                JSON.stringify({
+                  id: "msg_server_tools",
+                  type: "message",
+                  role: "assistant",
+                  model: "glm-5.3-flash",
+                  content,
+                  stop_reason: "end_turn",
+                  usage: { input_tokens: 12, output_tokens: 9 },
+                }),
+                { headers: { "content-type": "application/json" } },
+              ),
+            );
+          }) as typeof fetch;
+        const routeModule = await import(
+          `../src/routes/messages-hybrid.ts?test=${crypto.randomUUID()}`
+        );
+        const app = new Hono();
+        app.route("/v1/messages", routeModule.hybridMessagesRouter);
+        const request = {
+          model: "claude-opus-5.5",
+          max_tokens: 1024,
+          stream: true,
+          messages: [{ role: "user", content: "你好" }, {
+            role: "assistant",
+            content: "你好",
+          }, { role: "user", content: `查询北京天气 ${crypto.randomUUID()}` }],
+          tools: Array.from({ length: 17 }, (_, index) => ({
+            name: index === 0 ? "Read" : `Tool_${index}`,
+            input_schema: { type: "object", properties: {} },
+          })),
+        };
+        const post = (body: unknown) =>
+          app.request("/v1/messages?beta=true", {
+            method: "POST",
+            headers: {
+              authorization: "Bearer test-token-12345",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify(body),
+          });
+        const response = await post(request);
+        assertEquals(response.status, 200);
+        const events = parseSseEvents(await response.text());
+        assertEquals(events.some((event) => event.type === "error"), false);
+        const starts = events.filter((event) =>
+          event.type === "content_block_start"
+        );
+        const serverStart = starts[0].content_block as Record<string, unknown>;
+        assertEquals(serverStart.type, "server_tool_use");
+        assertEquals(serverStart.id, serverUse.id);
+        assertEquals(serverStart.name, "web_search");
+        const inputDelta = events.find((event) =>
+          event.index === 0 && event.type === "content_block_delta"
+        );
+        assertEquals(
+          (inputDelta?.delta as { partial_json?: string })?.partial_json,
+          JSON.stringify(serverUse.input),
+        );
+        assertEquals(
+          JSON.stringify(starts[1].content_block),
+          JSON.stringify(serverResult),
+        );
+        assertEquals(starts.length, content.length);
+        assertEquals(
+          events.filter((event) => event.type === "content_block_stop").length,
+          content.length,
+        );
+        assertEquals(events.at(-1)?.type, "message_stop");
+        assertEquals(
+          (events.find((event) => event.type === "message_delta")?.delta as {
+            stop_reason?: string;
+          })?.stop_reason,
+          clientTool ? "tool_use" : "end_turn",
+        );
+        assertEquals(calls[0].model, "glm-5.3-flash");
+        assertEquals(calls[0].messages.length, 3);
+        assertEquals(calls[0].tools?.length, 17);
+
+        const followup = await post({
+          ...request,
+          stream: false,
+          messages: [request.messages[0], { role: "assistant", content }, {
+            role: "user",
+            content: `根据刚才的搜索结果回答 ${crypto.randomUUID()}`,
+          }],
+        });
+        assertEquals(followup.status, 200);
+        const body = await followup.json();
+        assertEquals(body.model, "claude-opus-5.5");
+        assertEquals(JSON.stringify(body.content), JSON.stringify(content));
+        assertEquals(
+          String(calls[1].messages[1].content).includes("search-result-data"),
+          true,
+        );
+        assertEquals(
+          String(calls[1].messages[1].content).includes("srvtoolu_search"),
+          true,
+        );
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
 async function readWithTimeout(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   ms: number,

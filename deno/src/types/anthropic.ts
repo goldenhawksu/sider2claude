@@ -33,7 +33,9 @@ export type AnthropicContent =
   | AnthropicThinkingContent
   | AnthropicRedactedThinkingContent
   | AnthropicToolUse
-  | AnthropicToolResult;
+  | AnthropicToolResult
+  | AnthropicServerToolUse
+  | AnthropicServerToolResult;
 
 export interface AnthropicThinkingContent {
   type: 'thinking';
@@ -104,7 +106,9 @@ export type AnthropicResponseContent =
   | AnthropicTextResponseContent
   | AnthropicThinkingResponseContent
   | AnthropicRedactedThinkingResponseContent
-  | AnthropicToolUse;
+  | AnthropicToolUse
+  | AnthropicServerToolUse
+  | AnthropicServerToolResult;
 
 export interface AnthropicTextResponseContent {
   type: 'text';
@@ -210,4 +214,16 @@ export interface AnthropicToolResult {
   tool_use_id: string;
   content?: string | AnthropicContent[];
   is_error?: boolean;
+}
+
+// 服务端工具由上游执行，不能转换为客户端需要执行的 tool_use。
+export interface AnthropicServerToolUse extends Omit<AnthropicToolUse, 'type'> {
+  type: 'server_tool_use';
+}
+
+export interface AnthropicServerToolResult {
+  type: 'web_search_tool_result' | 'web_fetch_tool_result' | 'code_execution_tool_result'
+    | 'bash_code_execution_tool_result' | 'text_editor_code_execution_tool_result';
+  tool_use_id: string;
+  content: unknown;
 }

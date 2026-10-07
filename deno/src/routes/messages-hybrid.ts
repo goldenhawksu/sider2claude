@@ -1613,15 +1613,16 @@ function sendAnthropicResponseContentAsStream(
       return;
     }
 
+    if ('tool_use_id' in block) {
+      send({ type: 'content_block_start', index, content_block: block });
+      send({ type: 'content_block_stop', index });
+      return;
+    }
+
     send({
       type: 'content_block_start',
       index,
-      content_block: {
-        type: 'tool_use',
-        id: block.id,
-        name: block.name,
-        input: {},
-      },
+      content_block: { ...block, input: {} },
     });
     send({
       type: 'content_block_delta',

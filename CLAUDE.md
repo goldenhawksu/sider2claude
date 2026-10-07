@@ -281,6 +281,12 @@ RouterEngine
   流式/非流式识别客户端重试的观测语义），因此缓存键必须额外带流式标记，
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
+- Anthropic 兼容端还可能返回 `server_tool_use` 与搜索、网页抓取、代码执行结果块。
+  它们是上游服务端工具：适配器保留原始结构，合成流保留原类型与关联 ID，
+  历史回传转录为服务端工具记录。不能把它们编码成客户端 `tool_use`，
+  也不能仅因存在服务端工具就把 `stop_reason` 改成 `tool_use`。
+  `deno/test/messages-hybrid-stream.test.ts` 与 `test/server-tools.unit.test.ts` 覆盖
+  `claude-opus-5.5`、3 条消息、17 个工具的合成流和后续历史回传。
 - **上游三处不符合 Anthropic 规范的行为，一律在本服务层兜住**（probe 脚本见
   `deno/tools/probe-deepseek-tool-choice.ts`、`probe-upstream-stop-sequences.ts`、
   `probe-upstream-max-tokens.ts`；改这三处前先重跑对应 probe）：
