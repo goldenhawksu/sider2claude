@@ -29,6 +29,7 @@ import {
 } from '../utils/textual-tool-use.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
 import { toClientContent } from '../utils/client-content.ts';
+import { createUpstreamDeadline, DEFAULT_UPSTREAM_IDLE_MS, readUpstreamResponse } from '../utils/upstream-response.ts';
 import { cancelUpstreamReader } from '../utils/stream-cancel.ts';
 import {
   noteThinkingAteBudget,
@@ -39,7 +40,7 @@ import {
   upstreamKey,
 } from '../utils/upstream-capabilities.ts';
 
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 90_000;
+const DEFAULT_UPSTREAM_TIMEOUT_MS = DEFAULT_UPSTREAM_IDLE_MS;
 
 
 export class AnthropicBackendError extends Error {
@@ -132,7 +133,7 @@ export class AnthropicApiAdapter {
   ): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
-    const upstreamRequest = this.buildUpstreamRequest(request, false, disableThinking);
+    const upstreamRequest = this.buildUpstreamRequest(request, true, disableThinking);
 
     logInfo('upstream_request', {
       ...this.contextFields(logContext),
@@ -142,88 +143,93 @@ export class AnthropicApiAdapter {
       messages: upstreamRequest.messages.length,
       tools: upstreamRequest.tools?.length || 0,
       requestedStream: !!request.stream,
+      upstreamStream: true,
     }, 'Forwarding Anthropic-compatible request:');
 
-    let response: Response;
+    const deadline = createUpstreamDeadline(this.requestTimeoutMs);
     try {
-      response = await fetch(`${this.baseUrl}/v1/messages`, {
+      const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(upstreamRequest),
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+        signal: deadline.signal,
       });
-    } catch (error) {
-      this.handleFetchError(error, logContext, startTime);
-    }
+      deadline.touch();
 
-    if (!response.ok) {
-      const errorText = await response.text();
+      if (!response.ok) {
+        const errorText = await response.text();
+        const elapsed = Date.now() - startTime;
+        logError('upstream_error', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          status: response.status,
+          statusText: response.statusText,
+          preview: errorText.substring(0, 300),
+          elapsed: `${elapsed}ms`,
+          elapsedMs: elapsed,
+        }, 'Anthropic-compatible backend error:');
+        throw new AnthropicBackendError(
+          `${this.provider} API error: ${response.status} ${response.statusText}${
+            formatUpstreamErrorDetail(errorText)
+          }`,
+          response.status,
+          this.provider,
+        );
+      }
+
+      const data = await readUpstreamResponse(response, deadline, () => {
+        logInfo('upstream_first_chunk', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          elapsedMs: Date.now() - startTime,
+          upstreamStream: true,
+        });
+      });
+      const normalized = this.normalizeResponse(
+        data,
+        outwardModel,
+        logContext,
+        collectHistoryToolUseIds(request.messages),
+        collectToolInputKeys(request.tools),
+        // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
+        // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
+        request.tool_choice?.type !== 'none',
+        request.stop_sequences,
+      );
       const elapsed = Date.now() - startTime;
-      logError('upstream_error', {
+
+      logInfo('upstream_response', {
         ...this.contextFields(logContext),
         provider: this.provider,
-        status: response.status,
-        statusText: response.statusText,
-        preview: errorText.substring(0, 300),
+        id: normalized.id,
+        stopReason: normalized.stop_reason,
+        contentBlocks: normalized.content.length,
         elapsed: `${elapsed}ms`,
         elapsedMs: elapsed,
-      }, 'Anthropic-compatible backend error:');
-      throw new AnthropicBackendError(
-        `${this.provider} API error: ${response.status} ${response.statusText}${
-          formatUpstreamErrorDetail(errorText)
-        }`,
-        response.status,
-        this.provider,
+      }, 'Anthropic-compatible backend response:');
+      if (elapsed > NON_STREAM_SLOW_MS) {
+        logWarn('upstream_slow_response', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          upstreamModel: upstreamRequest.model,
+          outwardModel,
+          messages: upstreamRequest.messages.length,
+          tools: upstreamRequest.tools?.length || 0,
+          elapsedMs: elapsed,
+          thresholdMs: NON_STREAM_SLOW_MS,
+        });
+      }
+
+      return normalized;
+    } catch (error) {
+      this.handleFetchError(
+        deadline.signal.aborted ? deadline.signal.reason : error,
+        logContext,
+        startTime,
       );
+    } finally {
+      deadline.dispose();
     }
-
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const responseText = await response.text();
-      throw new Error(
-        `${this.provider} API returned non-JSON response: ${contentType || 'unknown'} ${
-          responseText.substring(0, 120)
-        }`,
-      );
-    }
-
-    const data = await response.json() as unknown;
-    const normalized = this.normalizeResponse(
-      data,
-      outwardModel,
-      logContext,
-      collectHistoryToolUseIds(request.messages),
-      collectToolInputKeys(request.tools),
-      // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
-      // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
-      request.tool_choice?.type !== 'none',
-      request.stop_sequences,
-    );
-    const elapsed = Date.now() - startTime;
-
-    logInfo('upstream_response', {
-      ...this.contextFields(logContext),
-      provider: this.provider,
-      id: normalized.id,
-      stopReason: normalized.stop_reason,
-      contentBlocks: normalized.content.length,
-      elapsed: `${elapsed}ms`,
-      elapsedMs: elapsed,
-    }, 'Anthropic-compatible backend response:');
-    if (elapsed > NON_STREAM_SLOW_MS) {
-      logWarn('upstream_slow_response', {
-        ...this.contextFields(logContext),
-        provider: this.provider,
-        upstreamModel: upstreamRequest.model,
-        outwardModel,
-        messages: upstreamRequest.messages.length,
-        tools: upstreamRequest.tools?.length || 0,
-        elapsedMs: elapsed,
-        thresholdMs: NON_STREAM_SLOW_MS,
-      });
-    }
-
-    return normalized;
   }
 
   private buildHeaders(): Record<string, string> {
@@ -741,14 +747,16 @@ export class AnthropicApiAdapter {
   ): Promise<void> {
     const outwardModel = request.model;
     const upstreamRequest = this.buildUpstreamRequest(request, true);
+    const deadline = createUpstreamDeadline(this.requestTimeoutMs);
 
     try {
       const response = await fetch(`${this.baseUrl}/v1/messages`, {
         method: 'POST',
         headers: this.buildHeaders(),
         body: JSON.stringify(upstreamRequest),
-        signal: AbortSignal.timeout(this.requestTimeoutMs),
+        signal: deadline.signal,
       });
+      deadline.touch();
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -837,6 +845,7 @@ export class AnthropicApiAdapter {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          if (value.length) deadline.touch();
 
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
@@ -858,7 +867,7 @@ export class AnthropicApiAdapter {
       onComplete();
     } catch (error) {
       onError(error instanceof Error ? error : new Error('Stream error'));
-    }
+    } finally { deadline.dispose(); }
   }
 
   /**
@@ -926,11 +935,16 @@ export class AnthropicApiAdapter {
       logError('upstream_timeout', {
         ...this.contextFields(logContext),
         provider: this.provider,
-        timeoutMs: this.requestTimeoutMs,
+        timeoutMs: (error as {timeoutPhase?:string;totalMs?:number}).timeoutPhase === 'total'
+          ? (error as {totalMs:number}).totalMs : this.requestTimeoutMs,
+        idleMs: this.requestTimeoutMs,
+        totalMs: (error as {totalMs?:number}).totalMs ?? 600_000,
+        idleElapsedMs: Date.now() - ((error as {lastActivityAt?:number}).lastActivityAt ?? startTime),
+        timeoutPhase: (error as {timeoutPhase?:string}).timeoutPhase ?? 'idle',
         elapsedMs: elapsed,
       });
       throw new AnthropicBackendError(
-        `${this.provider} API timeout after ${this.requestTimeoutMs}ms`,
+        `${this.provider} API ${(error as {timeoutPhase?:string}).timeoutPhase ?? 'idle'} timeout (${this.requestTimeoutMs}ms idle limit)`,
         503,
         this.provider,
       );

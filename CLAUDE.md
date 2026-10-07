@@ -281,6 +281,11 @@ RouterEngine
   流式/非流式识别客户端重试的观测语义），因此缓存键必须额外带流式标记，
   不能让非流式请求回放流式响应。
 - DeepSeek adapter 需要兼容 `text`、`thinking`、`redacted_thinking`、`tool_use`，真实上游可能在工具请求前返回推理块。
+- 上游工具响应也使用 `stream:true` 获取生成进度，完整拼接后再按既有逻辑校验和合成客户端流。
+  `DEEPSEEK_REQUEST_TIMEOUT_MS` 现表示连续无上游数据的空闲超时，默认 300000 毫秒；
+  每轮独立总时长上限 600000 毫秒。客户端 `message_start`／ping 不能刷新上游空闲计时。
+  正文读取同样受超时控制，异常必须取消 reader；超时不能盲目重试已执行的服务端工具。
+  日志用 `upstreamStream`、`upstream_first_chunk` 和 `timeoutPhase` 区分活动流与真正卡住。
 - Anthropic 兼容端还可能返回 `server_tool_use` 与搜索、网页抓取、代码执行结果块。
   它们是上游服务端工具：适配器内部保留原始结构，客户端出口统一转成文本记录，
   保留调用 ID、输入、结果、来源和错误，非流式、合成流与真流式均需转换。

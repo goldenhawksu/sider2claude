@@ -24,6 +24,7 @@ import { suite as protocolGemini } from './suites/08-protocol-gemini.ts';
 import { suite as legacyComplete } from './suites/09-legacy-complete.ts';
 import { suite as authErrors } from './suites/10-auth-errors.ts';
 import { suite as clientTools } from './suites/11-client-tools.ts';
+import { suite as longToolRequest } from './suites/12-long-tool-request.ts';
 
 const ALL_SUITES: Suite[] = [
   infrastructure,
@@ -37,6 +38,7 @@ const ALL_SUITES: Suite[] = [
   legacyComplete,
   authErrors,
   clientTools,
+  longToolRequest,
 ];
 
 const selected = Deno.args.filter((arg) => !arg.startsWith('-'));

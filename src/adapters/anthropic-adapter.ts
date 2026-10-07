@@ -28,6 +28,8 @@ import {
 } from '../utils/textual-tool-use';
 import { applyStopSequences } from '../utils/stop-sequences';
 import { toClientContent } from '../utils/client-content';
+import { createUpstreamDeadline, DEFAULT_UPSTREAM_IDLE_MS, readUpstreamResponse } from '../utils/upstream-response';
+import { getEnv } from '../utils/env';
 import {
   noteThinkingAteBudget,
   noteThinkingDisabledRejected,
@@ -127,6 +129,7 @@ export class AnthropicApiAdapter {
     const startTime = Date.now();
     const outwardModel = request.model;
     const upstreamRequest = this.buildUpstreamRequest(request, disableThinking);
+    upstreamRequest.stream = true;
 
     logInfo('upstream_request', {
       ...this.contextFields(logContext),
@@ -136,82 +139,113 @@ export class AnthropicApiAdapter {
       messages: upstreamRequest.messages.length,
       tools: upstreamRequest.tools?.length || 0,
       requestedStream: !!request.stream,
+      upstreamStream: true,
     }, 'Forwarding Anthropic-compatible request:');
 
-    const response = await fetch(`${this.baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify(upstreamRequest),
-    });
+    const configuredTimeout = Number.parseInt(
+      getEnv('DEEPSEEK_REQUEST_TIMEOUT_MS', String(DEFAULT_UPSTREAM_IDLE_MS)),
+      10,
+    );
+    const idleMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? configuredTimeout
+      : DEFAULT_UPSTREAM_IDLE_MS;
+    const deadline = createUpstreamDeadline(idleMs);
+    try {
+      const response = await fetch(`${this.baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: this.buildHeaders(),
+        body: JSON.stringify(upstreamRequest),
+        signal: deadline.signal,
+      });
+      deadline.touch();
 
-    if (!response.ok) {
-      const errorText = await response.text();
+      if (!response.ok) {
+        const errorText = await response.text();
+        const elapsed = Date.now() - startTime;
+        logError('upstream_error', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          status: response.status,
+          statusText: response.statusText,
+          preview: errorText.substring(0, 300),
+          elapsed: `${elapsed}ms`,
+          elapsedMs: elapsed,
+        }, 'Anthropic-compatible backend error:');
+        throw new AnthropicBackendError(
+          `${this.provider} API error: ${response.status} ${response.statusText}${
+            formatUpstreamErrorDetail(errorText)
+          }`,
+          response.status,
+          this.provider,
+        );
+      }
+
+      const data = await readUpstreamResponse(response, deadline, () => {
+        logInfo('upstream_first_chunk', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          elapsedMs: Date.now() - startTime,
+          upstreamStream: true,
+        });
+      });
+      const normalized = this.normalizeResponse(
+        data,
+        outwardModel,
+        logContext,
+        collectHistoryToolUseIds(request.messages),
+        collectToolInputKeys(request.tools),
+        // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
+        // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
+        request.tool_choice?.type !== 'none',
+        request.stop_sequences,
+      );
       const elapsed = Date.now() - startTime;
-      logError('upstream_error', {
+
+      logInfo('upstream_response', {
         ...this.contextFields(logContext),
         provider: this.provider,
-        status: response.status,
-        statusText: response.statusText,
-        preview: errorText.substring(0, 300),
+        id: normalized.id,
+        stopReason: normalized.stop_reason,
+        contentBlocks: normalized.content.length,
         elapsed: `${elapsed}ms`,
         elapsedMs: elapsed,
-      }, 'Anthropic-compatible backend error:');
-      throw new AnthropicBackendError(
-        `${this.provider} API error: ${response.status} ${response.statusText}${
-          formatUpstreamErrorDetail(errorText)
-        }`,
-        response.status,
-        this.provider,
-      );
+      }, 'Anthropic-compatible backend response:');
+      if (elapsed > NON_STREAM_SLOW_MS) {
+        logWarn('upstream_slow_response', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          upstreamModel: upstreamRequest.model,
+          outwardModel,
+          messages: upstreamRequest.messages.length,
+          tools: upstreamRequest.tools?.length || 0,
+          elapsedMs: elapsed,
+          thresholdMs: NON_STREAM_SLOW_MS,
+        });
+      }
+
+      return normalized;
+    } catch (error) {
+      if (deadline.signal.aborted) {
+        const phase = (deadline.signal.reason as { timeoutPhase?: string }).timeoutPhase ?? 'idle';
+        logError('upstream_timeout', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          timeoutMs: phase === 'total' ? 600_000 : idleMs,
+          idleMs,
+          totalMs: 600_000,
+          timeoutPhase: phase,
+          elapsedMs: Date.now() - startTime,
+        });
+        throw new AnthropicBackendError(
+          `${this.provider} API ${phase} timeout (${idleMs}ms idle limit)`,
+          503,
+          this.provider,
+        );
+      }
+      throw error;
+    } finally {
+      deadline.dispose();
     }
-
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const responseText = await response.text();
-      throw new Error(
-        `${this.provider} API returned non-JSON response: ${contentType || 'unknown'} ${
-          responseText.substring(0, 120)
-        }`,
-      );
-    }
-
-    const data = await response.json() as unknown;
-    const normalized = this.normalizeResponse(
-      data,
-      outwardModel,
-      logContext,
-      collectHistoryToolUseIds(request.messages),
-      collectToolInputKeys(request.tools),
-      // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
-      // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
-      request.tool_choice?.type !== 'none',
-      request.stop_sequences,
-    );
-    const elapsed = Date.now() - startTime;
-
-    logInfo('upstream_response', {
-      ...this.contextFields(logContext),
-      provider: this.provider,
-      id: normalized.id,
-      stopReason: normalized.stop_reason,
-      contentBlocks: normalized.content.length,
-      elapsed: `${elapsed}ms`,
-      elapsedMs: elapsed,
-    }, 'Anthropic-compatible backend response:');
-    if (elapsed > NON_STREAM_SLOW_MS) {
-      logWarn('upstream_slow_response', {
-        ...this.contextFields(logContext),
-        provider: this.provider,
-        upstreamModel: upstreamRequest.model,
-        outwardModel,
-        messages: upstreamRequest.messages.length,
-        tools: upstreamRequest.tools?.length || 0,
-        elapsedMs: elapsed,
-        thresholdMs: NON_STREAM_SLOW_MS,
-      });
-    }
-
-    return normalized;
   }
 
   private buildHeaders(): Record<string, string> {
