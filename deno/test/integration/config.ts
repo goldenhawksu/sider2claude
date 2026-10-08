@@ -85,6 +85,5 @@ export function getConfig(): IntegrationConfig {
 }
 
 export function maskToken(token: string): string {
-  if (!token) return '(empty)';
-  return token.length <= 10 ? '***' : `${token.slice(0, 6)}...${token.slice(-4)}`;
+  return token ? '[已配置]' : '[未配置]';
 }

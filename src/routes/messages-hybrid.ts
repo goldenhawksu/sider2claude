@@ -7,6 +7,8 @@
  */
 
 import { Hono } from 'hono';
+import { controllerEnabled } from '../utils/sider-controller.js';
+import { controllerResponse } from '../utils/controller-http.js';
 import type { Context } from 'hono';
 import { getAuthInfo, requireAuth } from '../middleware/auth';
 import type {
@@ -95,6 +97,8 @@ messagesRouter.post('/', async (c: Context) => {
     });
 
     validateAnthropicRequest(anthropicRequest);
+
+    if (controllerEnabled()) return await controllerResponse(anthropicRequest, auth.token, logContext, c.req.raw.signal, c.req.query('cid') || c.req.header('X-Conversation-ID'));
 
     const duplicate = observeDuplicateCandidate(
       logContext.requestHash,
@@ -543,6 +547,7 @@ messagesRouter.get('/backends/status', (c: Context) => {
       },
     },
     routing: {
+      siderController: controllerEnabled(),
       defaultBackend: config.routing.defaultBackend,
       autoFallback: config.routing.autoFallback,
       preferSiderForSimpleChat: config.routing.preferSiderForSimpleChat,

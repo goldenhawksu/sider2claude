@@ -9,8 +9,10 @@ import {
   maskId,
   type SiderStreamCallbacks,
   streamSiderSSE,
+  siderUpstreamError,
 } from './sse-line-reader.ts';
 import { getEnv } from './env.ts';
+import { fetchSiderResponse } from './sider-transport.ts';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -21,20 +23,23 @@ const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/comp
 export class SiderClient {
   private baseURL: string;
   private timeout: number;
+  private totalTimeout: number;
 
   constructor(options: {
     baseURL?: string;
     timeout?: number;
+    totalTimeout?: number;
   } = {}) {
     this.baseURL = options.baseURL || SIDER_API_URL;
-    this.timeout = options.timeout || 30000; // 30秒超时
+    this.timeout = options.timeout || Number(getEnv('SIDER_REQUEST_TIMEOUT_MS', '300000'));
+    this.totalTimeout = options.totalTimeout || Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000'));
   }
 
   /**
    * 发起 Sider API 请求并校验为 SSE 响应。流式与累积两条路径共用。
    */
-  private async doFetch(request: SiderRequest, authToken: string): Promise<Response> {
-    const response = await fetch(this.baseURL, {
+  private async doFetch(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<Response> {
+    const response = await fetchSiderResponse(this.baseURL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -47,16 +52,24 @@ export class SiderClient {
         'X-App-Name': 'ChitChat_Edge_Ext',
       },
       body: JSON.stringify(request),
-      signal: AbortSignal.timeout(this.timeout),
-    });
+      signal,
+    }, this.timeout, this.totalTimeout);
 
     if (!response.ok) {
+      const raw = await response.text();
+      try {
+        const body = JSON.parse(raw);
+        if (typeof body.code === 'number' && body.code !== 0) throw siderUpstreamError(body.code, String(body.msg ?? ''));
+      } catch (error) {
+        if (error instanceof Error && error.name === 'SiderUpstreamError') throw error;
+      }
       throw new Error(`Sider API error: ${response.status} ${response.statusText}`);
     }
 
     // 检查是否是 SSE 响应
     const contentType = response.headers.get('content-type');
     if (!contentType?.includes('text/event-stream')) {
+      await response.body?.cancel();
       throw new Error('Expected SSE response from Sider API');
     }
 
@@ -66,7 +79,7 @@ export class SiderClient {
   /**
    * 调用 Sider API 并把 SSE 响应累积为完整结果（非流式路径）。
    */
-  async chat(request: SiderRequest, authToken: string): Promise<SiderParsedResponse> {
+  async chat(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<SiderParsedResponse> {
     console.log('Calling Sider API:', {
       model: request.model,
       contentLength: request.multi_content[0]?.text?.length || 0,
@@ -77,7 +90,7 @@ export class SiderClient {
     });
 
     try {
-      const response = await this.doFetch(request, authToken);
+      const response = await this.doFetch(request, authToken, signal);
       const { callbacks, result, upstream } = createAccumulatorCallbacks();
       await streamSiderSSE(response, callbacks);
 

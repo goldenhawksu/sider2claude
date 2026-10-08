@@ -37,7 +37,7 @@ const MAX_PER_HOUR = 40;
 export interface SiderTelemetryRecord {
   ts: number;
   model: string;
-  strategy: SiderStrategy;
+  strategy: SiderStrategy | 'controller';
   payloadChars: number;
   ok: boolean;
   /** 上游业务错误码（603 / 1135 等）；成功时为 0。 */

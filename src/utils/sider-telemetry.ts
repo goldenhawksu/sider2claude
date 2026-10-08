@@ -10,7 +10,7 @@ import type { SiderStrategy } from '../config/backends';
 export interface SiderTelemetryRecord {
   ts: number;
   model: string;
-  strategy: SiderStrategy;
+  strategy: SiderStrategy | 'controller';
   payloadChars: number;
   ok: boolean;
   siderCode: number;

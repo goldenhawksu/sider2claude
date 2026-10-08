@@ -70,6 +70,7 @@ export type SiderResponseData =
   | SiderToolCallStart
   | SiderToolCallProgress
   | SiderToolCallResult
+  | SiderUnifiedToolCall
   | SiderIgnoredEvent;
 
 // 配额信息类型
@@ -178,6 +179,20 @@ export interface SiderToolCallResult {
     status: 'finish';
     result: any;
     error?: string;
+  };
+}
+
+// 2026-10-07 实测：服务端工具使用统一事件，search/web_fetch 的结果位于具名字段。
+export interface SiderUnifiedToolCall {
+  type: 'tool_call';
+  model: string;
+  tool_call: {
+    id: string;
+    name: string;
+    status: 'start' | 'processing' | 'finish';
+    arguments?: string;
+    error?: string;
+    [key: string]: unknown;
   };
 }
 

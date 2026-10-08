@@ -10,7 +10,7 @@ import { consola } from 'consola';
 import { siderConversationClient } from './sider-conversation.js';
 import { getNextParentMessageId, isContinuousConversation } from './sider-session-manager.js';
 import { mapModelName } from '../config/models';
-import { buildSiderMessageText } from './message-format';
+import { buildSiderMessageText, contentToText } from './message-format';
 
 /**
  * 转换 Anthropic 请求到 Sider 格式（同步版本，用于新会话）
@@ -115,7 +115,10 @@ export async function convertAnthropicToSiderAsync(
 
   // 2. 检查是否是多轮对话且有会话ID
   const realConversationId = getRealSiderConversationId(conversationId);
-  if (realConversationId && anthropicRequest.messages.length > 1) {
+  if (realConversationId && getNextParentMessageId(realConversationId)) {
+    return convertAnthropicToSiderSync(anthropicRequest, realConversationId);
+  }
+  if (realConversationId) {
     try {
       // 尝试获取真正的 Sider 会话历史
       const historyResponse = await siderConversationClient.getConversationHistory(
@@ -124,16 +127,7 @@ export async function convertAnthropicToSiderAsync(
         50, // 限制历史消息数量
       );
 
-      // 构建包含历史的上下文
-      const historyContext = siderConversationClient.buildContextFromHistory(
-        historyResponse.data.messages,
-        800, // 限制上下文长度
-      );
-
-      let requestText = currentUserInput;
-      if (historyContext) {
-        requestText = `Previous conversation:\n${historyContext}\nContinuing:\n${currentUserInput}`;
-      }
+      const requestText = currentUserInput;
 
       // 获取最新的父消息ID
       const latestMessage = historyResponse.data.messages[historyResponse.data.messages.length - 1];
@@ -157,7 +151,7 @@ export async function convertAnthropicToSiderAsync(
       consola.info('Using real Sider conversation history:', {
         conversationId: realConversationId.substring(0, 10) + '...',
         historyMessageCount: historyResponse.data.messages.length,
-        contextLength: historyContext.length,
+        onlyCurrentInput: true,
         parentMessageId: parentMessageId.substring(0, 10) + '...',
         title: historyResponse.data.conversation.title,
       });
@@ -242,12 +236,8 @@ function extractTextContent(content: string | Array<{ type: string; text?: strin
   }
 
   if (Array.isArray(content)) {
-    // 合并所有文本内容
-    return content
-      .filter((item) => item.type === 'text' && item.text)
-      .map((item) => item.text)
-      .join('\n')
-      .trim();
+    // 真实cid续轮必须保留工具结果、id和错误标记。
+    return contentToText(content as AnthropicMessage['content'] & unknown[]);
   }
 
   throw new Error('Invalid content format');
@@ -401,66 +391,76 @@ export function validateAnthropicRequest(request: AnthropicRequest): void {
  * 构建安全的工具配置
  */
 function buildSafeToolsConfig(anthropicRequest: AnthropicRequest): SiderTools {
+  // ⚠️ CRITICAL FIX: Sider API 不支持 Anthropic 的自定义工具
+  // Claude Code 发送的工具（Task, Bash, Read, Edit 等）是 Claude Code 特有的
+  // Sider API 只支持自己的工具：search, web_browse, create_image
+  // 解决方案：返回空工具配置，禁用所有工具调用
+
   // 如果没有工具，返回空配置
   if (!anthropicRequest.tools || anthropicRequest.tools.length === 0) {
     return { auto: [] };
   }
 
-  // 创建工具名称映射 - 将Anthropic工具名称映射到Sider工具名称
+  // Sider API 支持的工具白名单
+  const SIDER_SUPPORTED_TOOLS = new Set([
+    'search',
+    'web_search',
+    'search_web',
+    'internet_search',
+    'create_image',
+    'generate_image',
+    'image_generation',
+  ]);
+
+  // 工具名称映射
   const toolNameMapping: Record<string, string> = {
-    // 常见工具映射
-    'create_image': 'create_image',
-    'generate_image': 'create_image',
-    'image_generation': 'create_image',
     'web_search': 'search',
     'search_web': 'search',
     'internet_search': 'search',
-    'browse_web': 'web_browse',
-    'web_browsing': 'web_browse',
-    'visit_url': 'web_browse',
-    // 可扩展其他工具
+    'generate_image': 'create_image',
+    'image_generation': 'create_image',
   };
 
-  // 转换工具列表
+  // 转换工具列表 - 只保留 Sider 支持的工具
   const autoTools: string[] = [];
   const toolsConfig: SiderTools = { auto: autoTools };
 
-  // 处理每个Anthropic工具
   anthropicRequest.tools.forEach((tool) => {
-    const mappedName = toolNameMapping[tool.name] || tool.name;
+    // 检查是否是 Sider 支持的工具
+    if (SIDER_SUPPORTED_TOOLS.has(tool.name)) {
+      const mappedName = toolNameMapping[tool.name] || tool.name;
 
-    // 添加到auto数组
-    if (!autoTools.includes(mappedName)) {
-      autoTools.push(mappedName);
-    }
+      // 添加到auto数组（去重）
+      if (!autoTools.includes(mappedName)) {
+        autoTools.push(mappedName);
+      }
 
-    // 为特定工具添加配置
-    switch (mappedName) {
-      case 'create_image':
-        toolsConfig.image = {
-          quality_level: 'high', // 默认高质量
-        };
-        break;
-      case 'search':
-        toolsConfig.search = {
-          enabled: true,
-          max_results: 10, // 默认搜索结果数量
-        };
-        break;
-      case 'web_browse':
-        toolsConfig.web_browse = {
-          enabled: true,
-          timeout: 30, // 默认超时时间(秒)
-        };
-        break;
-        // 可扩展其他工具配置
+      // 为特定工具添加配置
+      switch (mappedName) {
+        case 'create_image':
+          toolsConfig.image = {
+            quality_level: 'high',
+          };
+          break;
+        case 'search':
+          toolsConfig.search = {
+            enabled: true,
+            max_results: 10,
+          };
+          break;
+      }
     }
   });
 
-  // 记录转换结果
+  // 记录转换结果（包括被过滤的工具）
+  const filteredTools = anthropicRequest.tools
+    .filter((t) => !SIDER_SUPPORTED_TOOLS.has(t.name))
+    .map((t) => t.name);
+
   consola.info('Tools converted from Anthropic to Sider format:', {
     anthropicTools: anthropicRequest.tools.map((t) => t.name),
     siderAutoTools: autoTools,
+    filteredOutTools: filteredTools.length > 0 ? filteredTools : 'none',
     toolsConfig: toolsConfig,
   });
 

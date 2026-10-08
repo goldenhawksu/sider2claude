@@ -10,6 +10,7 @@ import { consola } from 'consola';
 import { saveSiderSession, getOrCreateContinuousSession } from './sider-session-manager.js';
 import { cancelUpstreamReader } from './stream-cancel.js';
 import { getEnv } from './env';
+import { fetchSiderResponse } from './sider-transport.js';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -86,19 +87,22 @@ export function siderUpstreamError(code: number, msg: string): SiderUpstreamErro
 export class SiderClient {
   private baseURL: string;
   private timeout: number;
+  private totalTimeout: number;
 
   constructor(options: {
     baseURL?: string;
     timeout?: number;
+    totalTimeout?: number;
   } = {}) {
     this.baseURL = options.baseURL || SIDER_API_URL;
-    this.timeout = options.timeout || 30000; // 30秒超时
+    this.timeout = options.timeout || Number(getEnv('SIDER_REQUEST_TIMEOUT_MS', '300000'));
+    this.totalTimeout = options.totalTimeout || Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000'));
   }
 
   /**
    * 调用 Sider API 并解析 SSE 响应
    */
-  async chat(request: SiderRequest, authToken: string): Promise<SiderParsedResponse> {
+  async chat(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<SiderParsedResponse> {
     consola.info('Calling Sider API:', {
       model: request.model,
       contentLength: request.multi_content[0]?.text?.length || 0,
@@ -110,7 +114,7 @@ export class SiderClient {
     
     try {
       // 构建请求
-      const response = await fetch(this.baseURL, {
+      const response = await fetchSiderResponse(this.baseURL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -122,16 +126,24 @@ export class SiderClient {
           'X-App-Name': 'ChitChat_Edge_Ext',
         },
         body: JSON.stringify(request),
-        signal: AbortSignal.timeout(this.timeout),
-      });
+        ...(signal ? { signal } : {}),
+      }, this.timeout, this.totalTimeout);
 
       if (!response.ok) {
+        const raw = await response.text();
+        try {
+          const body = JSON.parse(raw);
+          if (typeof body.code === 'number' && body.code !== 0) throw siderUpstreamError(body.code, String(body.msg ?? ''));
+        } catch (error) {
+          if (error instanceof SiderUpstreamError) throw error;
+        }
         throw new Error(`Sider API error: ${response.status} ${response.statusText}`);
       }
 
       // 检查是否是 SSE 响应
       const contentType = response.headers.get('content-type');
       if (!contentType?.includes('text/event-stream')) {
+        await response.body?.cancel();
         throw new Error('Expected SSE response from Sider API');
       }
 
@@ -282,6 +294,20 @@ export class SiderClient {
 
         // 处理不同类型的响应数据
         switch (data.data.type) {
+          case 'tool_call': {
+            const event = data.data;
+            result.toolResults ??= [];
+            let tool = result.toolResults.find(t => t.toolId === event.tool_call.id);
+            if (!tool) {
+              tool = {toolId: event.tool_call.id, toolName: event.tool_call.name, status: event.tool_call.status, result: null};
+              result.toolResults.push(tool);
+            }
+            tool.status = event.tool_call.status;
+            tool.result = event.tool_call;
+            if (event.tool_call.error) tool.error = event.tool_call.error;
+            result.model = event.model;
+            break;
+          }
           case 'credit_info':
             // 配额信息和心跳事件属于 Sider 常规流控事件，静默跳过。
             break;

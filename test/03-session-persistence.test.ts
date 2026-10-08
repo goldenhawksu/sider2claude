@@ -135,19 +135,7 @@ async function testMultiTurnConversation(): Promise<TestResult> {
     console.log('🔑 获得会话 ID:', conversationId || '(无)');
 
     if (!conversationId) {
-      console.warn('⚠️ 警告: 未获得会话 ID，多轮对话测试可能失败');
-      console.warn('⚠️ 这在 Vercel Serverless 环境下是预期行为（内存存储失效）');
-
-      // 继续测试，但标记为警告
-      return {
-        name: testName,
-        passed: true, // 技术上仍算通过，因为这是已知限制
-        duration: Date.now() - startTime,
-        details: {
-          warning: 'Serverless 环境导致会话存储失效（预期行为）',
-          firstResponse: firstText,
-        },
-      };
+      console.log('本轮后端未返回 cid，使用完整历史实际验证第二轮，不能降级标记通过。');
     }
 
     // 等待 2 秒，模拟真实用户行为
@@ -159,6 +147,10 @@ async function testMultiTurnConversation(): Promise<TestResult> {
     const secondRequest = {
       model: 'claude-3.7-sonnet',
       messages: [
+        ...(!conversationId ? [
+          ...firstRequest.messages,
+          { role: 'assistant', content: firstText },
+        ] : []),
         {
           role: 'user',
           content: '请告诉我，我刚才说的我的名字是什么？我多大了？'
@@ -169,7 +161,7 @@ async function testMultiTurnConversation(): Promise<TestResult> {
     };
 
     // 方式1: 使用 query 参数传递会话 ID
-    const secondResponse = await fetch(`${API_BASE_URL}/v1/messages?cid=${conversationId}`, {
+    const secondResponse = await fetch(`${API_BASE_URL}/v1/messages${conversationId ? `?cid=${conversationId}` : ''}`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${AUTH_TOKEN}`,
@@ -206,7 +198,7 @@ async function testMultiTurnConversation(): Promise<TestResult> {
 
     return {
       name: testName,
-      passed: rememberedName || rememberedAge, // 至少记住一个信息就算通过
+      passed: rememberedName && rememberedAge,
       duration,
       details: {
         conversationId,

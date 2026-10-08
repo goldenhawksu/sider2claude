@@ -26,6 +26,7 @@ import { suite as authErrors } from './suites/10-auth-errors.ts';
 import { suite as clientTools } from './suites/11-client-tools.ts';
 import { suite as longToolRequest } from './suites/12-long-tool-request.ts';
 import { suite as writeIntegrity } from './suites/13-write-integrity.ts';
+import { suite as siderController } from './suites/14-sider-controller.ts';
 
 const ALL_SUITES: Suite[] = [
   infrastructure,
@@ -41,6 +42,7 @@ const ALL_SUITES: Suite[] = [
   clientTools,
   longToolRequest,
   writeIntegrity,
+  ...(Deno.env.get('E2E_CONTROLLER') === 'true' ? [siderController] : []),
 ];
 
 const selected = Deno.args.filter((arg) => !arg.startsWith('-'));
@@ -109,7 +111,7 @@ if (upstream) {
 
 await writeReport();
 
-Deno.exit(fail > 0 ? 1 : 0);
+Deno.exit(fail > 0 || (Deno.env.get('E2E_REQUIRE_ALL_PASS') === 'true' && upstream > 0) ? 1 : 0);
 
 /** 先探活，避免把"服务没起"报成一堆用例失败。 */
 async function assertReachable(): Promise<void> {

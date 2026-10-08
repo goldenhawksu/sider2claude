@@ -84,9 +84,7 @@ function resolveAuthToken(): string {
 }
 
 function maskToken(token: string): string {
-  if (!token) return '(empty)';
-  if (token.length <= 10) return '***';
-  return `${token.slice(0, 8)}...${token.slice(-4)}`;
+  return token ? '[已配置]' : '[未配置]';
 }
 
 /**

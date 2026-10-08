@@ -9,7 +9,7 @@ import type { SiderTools } from '../types/sider.ts';
 import { siderConversationClient } from './sider-conversation.ts';
 import { getNextParentMessageId, isContinuousConversation } from './sider-session-manager.ts';
 import { mapModelName } from '../config/models.ts';
-import { buildSiderMessageText } from './message-format.ts';
+import { buildSiderMessageText, contentToText } from './message-format.ts';
 
 /**
  * 转换 Anthropic 请求到 Sider 格式（同步版本，用于新会话）
@@ -114,6 +114,9 @@ export async function convertAnthropicToSiderAsync(
 
   // 2. ✅ 修复：只要有会话ID就尝试获取历史（不再检查消息数量）
   const realConversationId = getRealSiderConversationId(conversationId);
+  if (realConversationId && getNextParentMessageId(realConversationId)) {
+    return convertAnthropicToSiderSync(anthropicRequest, realConversationId);
+  }
   if (realConversationId) {
     try {
       // 尝试获取真正的 Sider 会话历史
@@ -235,12 +238,8 @@ function extractTextContent(content: string | Array<{ type: string; text?: strin
   }
 
   if (Array.isArray(content)) {
-    // 合并所有文本内容
-    return content
-      .filter((item) => item.type === 'text' && item.text)
-      .map((item) => item.text)
-      .join('\n')
-      .trim();
+    // 真实 cid 续轮只发增量，工具结果也必须完整转录。
+    return contentToText(content as AnthropicMessage['content'] & unknown[]);
   }
 
   throw new Error('Invalid content format');
@@ -410,10 +409,6 @@ function buildSafeToolsConfig(anthropicRequest: AnthropicRequest): SiderTools {
     'web_search',
     'search_web',
     'internet_search',
-    'web_browse',
-    'browse_web',
-    'web_browsing',
-    'visit_url',
     'create_image',
     'generate_image',
     'image_generation',
@@ -424,9 +419,6 @@ function buildSafeToolsConfig(anthropicRequest: AnthropicRequest): SiderTools {
     'web_search': 'search',
     'search_web': 'search',
     'internet_search': 'search',
-    'browse_web': 'web_browse',
-    'web_browsing': 'web_browse',
-    'visit_url': 'web_browse',
     'generate_image': 'create_image',
     'image_generation': 'create_image',
   };
@@ -456,12 +448,6 @@ function buildSafeToolsConfig(anthropicRequest: AnthropicRequest): SiderTools {
           toolsConfig.search = {
             enabled: true,
             max_results: 10,
-          };
-          break;
-        case 'web_browse':
-          toolsConfig.web_browse = {
-            enabled: true,
-            timeout: 30,
           };
           break;
       }

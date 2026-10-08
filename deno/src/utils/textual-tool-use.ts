@@ -16,6 +16,7 @@
  */
 
 import type { AnthropicRequest, AnthropicResponseContent } from '../types/anthropic.ts';
+import { validDeclaredToolInput } from './tool-input-validation.ts';
 
 /**
  * 解析模型模仿产出的 input_json。
@@ -658,9 +659,16 @@ export function restoreToolUseFromText(
   text: string,
   request: AnthropicRequest,
 ): ToolRestoreResult {
-  return normalizeTextualToolUseBlocks(
+  const result = normalizeTextualToolUseBlocks(
     [{ type: 'text', text }],
     collectHistoryToolUseIds(request.messages),
     collectToolInputKeys(request.tools),
   );
+  result.content = result.content.filter((block) => {
+    if (block.type !== 'tool_use' || validDeclaredToolInput(request.tools, block.name, block.input)) return true;
+    result.toolUseCount -= 1;
+    result.unparsedCount += 1;
+    return false;
+  });
+  return result;
 }

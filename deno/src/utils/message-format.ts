@@ -48,7 +48,7 @@ function buildTranscriptText(request: AnthropicRequest): string {
   return parts.join('\n\n');
 }
 
-function contentToText(content: string | AnthropicContent[]): string {
+export function contentToText(content: string | AnthropicContent[]): string {
   if (typeof content === 'string') {
     return content;
   }

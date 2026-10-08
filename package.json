@@ -16,7 +16,7 @@
     "lint": "eslint . --cache",
     "typecheck": "tsc",
     "test:unit": "deno test --allow-env --allow-read=deno deno/test",
-    "test:unit:node": "bun test test/deepseek-adapter.unit.test.ts test/request-converter.unit.test.ts test/server-tools.unit.test.ts test/upstream-timeout.unit.test.ts test/write-integrity.unit.test.ts",
+    "test:unit:node": "bun test test/deepseek-adapter.unit.test.ts test/request-converter.unit.test.ts test/server-tools.unit.test.ts test/upstream-timeout.unit.test.ts test/write-integrity.unit.test.ts test/sider-controller.unit.test.ts",
     "test:smoke": "bun run test/smoke-test.ts",
     "test:integration": "bun run test/run-all-tests.ts",
     "test:regression": "deno task test && deno task check && deno check deno/tools/probe-sider-capabilities.ts && npm run typecheck && npm run test:unit:node",
@@ -34,6 +34,7 @@
   "author": "Sider2Claude",
   "license": "MIT",
   "dependencies": {
+    "ajv": "8.17.1",
     "citty": "^0.1.6",
     "consola": "^3.4.2",
     "fetch-event-stream": "^0.1.5",

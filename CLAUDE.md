@@ -17,6 +17,17 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 
 ## 开发命令
 
+### Sider 主控模式（2026-10-08 实证开发）
+
+- `SIDER_CONTROLLER=true` 优先于下文的普通 `pro/max/conservative` 路由，Sider 保持规划、创作和工具选型权；工具由 Claude Code/MCP 执行，不把业务回合整体交给 GLM。
+- 入口是两套 `utils/sider-controller.ts` 和 `controller-http.ts`；Deno KV、Bun SQLite 保存任务、父消息、工具关联、正文引用和账号租约。参数不能靠宽松 JSON 修补；完整工具结果必须续轮回到同一 Sider 会话。
+- Opus 5.5 和 Sonnet 5.5 已实测工具契约、多轮失败恢复、长 Write 及 StoreContent→WriteFromRef。旧版 Opus 的历史额度数据不能作为硬排除 Opus 5.5 的依据。推理事件存在不等于 Anthropic thinking 预算参数已被兑现。
+- 真实 Claude Code 2.1.195 使用 JSON Schema 2020-12，校验器必须支持该方言。模型“已完成”自述不算验收；文件复制必须检查实际 Write 成功反馈、文件存在、JSON 项数和字节完整性。
+- 大上下文先完整登记规范，执行前再次提供可容纳的完整 schema，不能先登记工具后用长规范淹没它。超大工具表分段登记；参数纠正必须带相关工具的完整定义。
+- Read→Write 逐字复制的重复转义已实际复现。针对完整 JSON 的连续行号展示，代理保存去行号后的原文引用，禁止模型再生成该源正文；不猜测截断内容、编码、CRLF或未知尾部换行。
+- Bun 默认10秒空闲期限会与10秒SSE心跳竞争，已实测修复为服务端255秒、主控5秒ping。上游仍用独立空闲/总期限，客户端ping不能刷新上游期限。
+- 配置模板与边界见 `docs/Sider主控模式.md`；新增真实套件14和 `deno/test/integration/claude-code-controller.ts`。验收须明确零失败、零上游受限；`E2E_REQUIRE_ALL_PASS=true` 将受限也计为门禁未通过。保留首轮失败和修正记录，不能只展示成功重跑。
+
 ```bash
 # Bun/Node 侧
 bun run dev

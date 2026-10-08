@@ -11,6 +11,8 @@ export default defineConfig({
   target: 'node18',
   outDir: 'dist',
   external: [
+    'ajv',
+    'bun:sqlite',
     // 外部依赖，不打包进最终文件 (hono + bun 技术栈)
     'hono',
     'consola',

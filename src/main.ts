@@ -106,5 +106,7 @@ consola.info(`📖 API info: http://localhost:${PORT}/`);
 
 export default {
   port: PORT,
+  // 实测默认10秒会与SSE心跳竞争；上游独立总期限仍限制请求生命周期。
+  idleTimeout: 255,
   fetch: app.fetch,
 };

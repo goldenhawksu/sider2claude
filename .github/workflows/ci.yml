@@ -38,6 +38,9 @@ jobs:
       - name: Deno check (集成测试库)
         run: deno check deno/test/integration/run.ts
 
+      - name: Deno check (真实 Claude Code 验证入口)
+        run: deno check deno/test/integration/claude-code-controller.ts
+
   # ── Bun/Node 类型检查 ──
   bun-typecheck:
     name: Bun — TypeScript 检查
@@ -58,6 +61,9 @@ jobs:
 
       - name: TypeScript 类型检查
         run: bun run typecheck
+
+      - name: Bun 确定性单元回归
+        run: bun run test:unit:node
 
   # ── 汇总 ──
   summary:

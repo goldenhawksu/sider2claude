@@ -15,6 +15,8 @@
     "fmt": "deno fmt deno/"
   },
   "imports": {
+    "ajv": "npm:ajv@8.17.1",
+    "ajv/": "npm:ajv@8.17.1/",
     "hono": "npm:hono@4.9.0",
     "hono/": "npm:hono@4.9.0/",
     "consola": "npm:consola@3.2.3",

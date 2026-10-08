@@ -183,6 +183,17 @@ function dispatchSSELine(line: string, callbacks: SiderStreamCallbacks): void {
   }
 
   switch (data.data.type) {
+    case 'tool_call': {
+      const event = data.data;
+      if (event.tool_call.status === 'start') {
+        callbacks.onToolCallStart?.({ ...event, type: 'tool_call_start', tool_call: { ...event.tool_call, status: 'start' } });
+      } else if (event.tool_call.status === 'finish') {
+        callbacks.onToolCallResult?.({ ...event, type: 'tool_call_result', tool_call: { ...event.tool_call, status: 'finish', result: event.tool_call } });
+      } else {
+        callbacks.onToolCallProgress?.({ ...event, type: 'tool_call_progress', tool_call: { ...event.tool_call, status: 'processing' } });
+      }
+      break;
+    }
     case 'credit_info':
       callbacks.onCreditInfo?.(data.data);
       break;
