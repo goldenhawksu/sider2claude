@@ -18,6 +18,7 @@ import { getStatsSnapshot } from './src/utils/usage-stats.ts';
 import { renderStatsPage } from './src/utils/stats-page.ts';
 import { setSiderStrategy } from './src/utils/runtime-strategy.ts';
 import { readSiderTelemetry } from './src/utils/sider-telemetry.ts';
+import { requireAuth } from './src/middleware/auth.ts';
 
 const app = new Hono();
 
@@ -36,15 +37,44 @@ const PORT = parseInt(getEnv('PORT', '8000'), 10);
  */
 const SERVICE_VERSION = '1.0.0';
 const buildTag = getEnv('DENO_DEPLOYMENT_ID');
-const VERSION = buildTag ? `${SERVICE_VERSION}+${buildTag.slice(0, 8)}` : `${SERVICE_VERSION}-local`;
+const VERSION = buildTag
+  ? `${SERVICE_VERSION}+${buildTag.slice(0, 8)}`
+  : `${SERVICE_VERSION}-local`;
 
 // 中间件
+app.use('*', async (c, next) => {
+  await next();
+  c.header('X-Content-Type-Options', 'nosniff');
+  c.header('X-Frame-Options', 'DENY');
+  c.header('Referrer-Policy', 'no-referrer');
+  c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  if (!c.res.headers.has('Cache-Control')) c.header('Cache-Control', 'no-store');
+});
+
 app.use(
   '*',
   cors({
     origin: '*',
     allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization'],
+    allowHeaders: [
+      'Content-Type',
+      'Authorization',
+      'X-API-Key',
+      'Anthropic-Version',
+      'Anthropic-Beta',
+      'X-Conversation-ID',
+      'X-Parent-Message-ID',
+      'X-Request-ID',
+    ],
+    exposeHeaders: [
+      'X-Conversation-ID',
+      'X-Assistant-Message-ID',
+      'X-User-Message-ID',
+      'X-Request-ID',
+      'X-Backend-Used',
+      'X-Routing-Rule',
+    ],
   }),
 );
 
@@ -103,9 +133,8 @@ app.get('/stats.json', async (c) => {
   return c.json(await getStatsSnapshot());
 });
 
-// 网页切换调度策略。用户已明确不考虑安全问题，故不挂 requireAuth。
 // 写进 KV 让多实例最多 3 秒收敛；当前实例立即生效。
-app.post('/stats/strategy', async (c) => {
+app.post('/stats/strategy', requireAuth, async (c) => {
   const body = await c.req.json().catch(() => ({})) as { strategy?: unknown };
   const strategy = body.strategy;
   if (strategy !== 'conservative' && strategy !== 'pro' && strategy !== 'max') {
@@ -116,7 +145,7 @@ app.post('/stats/strategy', async (c) => {
 });
 
 // 运行遥测原始记录，供离线分析优化调度策略。
-app.get('/stats/telemetry.json', async (c) => {
+app.get('/stats/telemetry.json', requireAuth, async (c) => {
   return c.json({ records: await readSiderTelemetry() });
 });
 

@@ -561,9 +561,9 @@ a { color: var(--s1); }
   <div class="card tile"><div class="v">${
     compact(totals.inputTokens + totals.outputTokens)
   }</div><div class="k">Token 总量</div></div>
-  <div class="card tile"><div class="v">${
-    totals.cacheHitRate
-  }</div><div class="k">缓存命中（${compact(totals.cacheReadTokens)} tok）</div></div>
+  <div class="card tile"><div class="v">${totals.cacheHitRate}</div><div class="k">缓存命中（${
+    compact(totals.cacheReadTokens)
+  } tok）</div></div>
   <div class="card tile"><div class="v">${totals.fallbacks}</div><div class="k">Fallback 次数</div></div>
   <div class="card tile"><div class="v">${totals.toolCalls}</div><div class="k">工具调用</div></div>
 </div>
@@ -659,6 +659,15 @@ const STRATEGY_SCRIPT = `<script>
 (function () {
   var buttons = document.querySelectorAll('#strategy-control .strategy-btn');
   var status = document.getElementById('strategy-status');
+  var tokenKey = 's2c-admin-token';
+  function getToken() {
+    var token = sessionStorage.getItem(tokenKey);
+    if (!token) {
+      token = prompt('请输入管理凭证') || '';
+      if (token) sessionStorage.setItem(tokenKey, token);
+    }
+    return token;
+  }
   function setActive(strategy) {
     buttons.forEach(function (b) {
       b.classList.toggle('active', b.getAttribute('data-strategy') === strategy);
@@ -668,12 +677,18 @@ const STRATEGY_SCRIPT = `<script>
     btn.addEventListener('click', function () {
       var strategy = btn.getAttribute('data-strategy');
       if (!strategy) return;
+      var token = getToken();
+      if (!token) {
+        if (status) status.textContent = '未授权';
+        return;
+      }
       if (status) status.textContent = '切换中…';
       fetch('/stats/strategy', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-api-key': token },
         body: JSON.stringify({ strategy: strategy }),
       }).then(function (r) {
+        if (r.status === 401) sessionStorage.removeItem(tokenKey);
         if (!r.ok) throw new Error('HTTP ' + r.status);
         setActive(strategy);
         if (status) status.textContent = '已切换，最多 3 秒内全实例生效';

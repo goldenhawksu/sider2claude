@@ -75,7 +75,7 @@ export const suite: Suite = {
       },
     },
     {
-      name: '畸形 JSON 返回 4xx/5xx 而非挂起',
+      name: '畸形 JSON 返回 400 invalid_request_error',
       async run({ config }) {
         const res = await fetch(`${config.baseUrl}/v1/messages`, {
           method: 'POST',
@@ -84,8 +84,11 @@ export const suite: Suite = {
           signal: AbortSignal.timeout(config.timeoutMs),
         });
         const text = await res.text();
-        assertTrue(res.status >= 400, `返回错误状态（实际 ${res.status}）`);
-        return `HTTP ${res.status} :: ${brief(text, 60)}`;
+        const json = JSON.parse(text);
+        assertEquals(res.status, 400, 'HTTP 状态');
+        assertEquals(json?.type, 'error', 'type');
+        assertEquals(json?.error?.type, 'invalid_request_error', 'error.type');
+        return `HTTP ${res.status} :: ${brief(json.error.message, 60)}`;
       },
     },
     {

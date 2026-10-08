@@ -59,6 +59,10 @@ function ensureDotenvLoaded(): void {
 
   dotenvLoaded = true;
 
+  if (getRuntimeEnv('S2C_DISABLE_DOTENV') === 'true') {
+    return;
+  }
+
   // 按优先级找第一个存在的 dotenv：`deno/.env` 是本运行时的配置源，
   // 根 `.env` 仅作旧布局的兼容回退。找到一个就停——两份都读会让"改了哪个生效"
   // 变成猜谜，而这正是此前 Z.AI 切换只改 deno/.env 却不生效的坑。

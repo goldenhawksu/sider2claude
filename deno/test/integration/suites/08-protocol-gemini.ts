@@ -38,20 +38,23 @@ export const suite: Suite = {
           typeof res.json?.usageMetadata?.totalTokenCount === 'number',
           'usageMetadata.totalTokenCount',
         );
-        return `finishReason=STOP tokens=${res.json.usageMetadata.totalTokenCount} :: ${brief(text, 24)}`;
+        return `finishReason=STOP tokens=${res.json.usageMetadata.totalTokenCount} :: ${
+          brief(text, 24)
+        }`;
       },
     },
     {
       name: ':generateContent 支持 systemInstruction',
       async run({ api }) {
+        const marker = `GEMINI-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
         const res = await api.post(`/v1beta/models/${MODEL}:generateContent`, {
-          systemInstruction: { parts: [{ text: '你必须在回答最开头加上前缀 [S2C]。' }] },
-          contents: [{ role: 'user', parts: [{ text: '中国的首都是哪里？' }] }],
+          systemInstruction: { parts: [{ text: `本次对话的确认码是 ${marker}。` }] },
+          contents: [{ role: 'user', parts: [{ text: '确认码是什么？只回答确认码。' }] }],
         });
         bailIfUpstreamLimited(res, 'systemInstruction 用例上游限流');
         assertStatus(res, 200);
         const text = res.json.candidates[0].content.parts.map((p: any) => p.text).join('');
-        assertIncludes(text, '[S2C]', 'systemInstruction 指定前缀');
+        assertIncludes(text, marker, 'systemInstruction 提供的确认码');
         return brief(text, 50);
       },
     },
@@ -93,7 +96,9 @@ export const suite: Suite = {
           .map((e) => e.candidates[0]?.content?.parts?.map((p: any) => p.text).join('') ?? '')
           .join('');
         assertTrue(text.length > 0, '流式累计文本非空');
-        return `事件=${res.events.length} 含candidates=${withCandidates.length} :: ${brief(text, 24)}`;
+        return `事件=${res.events.length} 含candidates=${withCandidates.length} :: ${
+          brief(text, 24)
+        }`;
       },
     },
   ],

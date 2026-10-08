@@ -23,9 +23,9 @@ import { siderClient } from '../utils/sider-client.ts';
 import { SiderUpstreamError, siderUpstreamError } from '../utils/sse-line-reader.ts';
 import { recordSiderQuotaExhausted, resolveSiderCooldownMs } from '../utils/sider-availability.ts';
 import {
+  recordSiderConcurrencyLimit,
   recordSiderOversize,
   recordSiderQuotaExhausted as recordThrottleQuota,
-  recordSiderConcurrencyLimit,
   recordSiderRejection,
   recordSiderSuccess,
 } from '../utils/sider-throttle.ts';
@@ -104,7 +104,19 @@ messagesRouter.post('/', async (c: Context) => {
       );
     }
 
-    const anthropicRequest = normalizeAnthropicRequest(await c.req.json() as AnthropicRequest);
+    let requestBody: AnthropicRequest;
+    try {
+      requestBody = await c.req.json() as AnthropicRequest;
+    } catch {
+      return c.json(
+        {
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'Invalid JSON body' },
+        } satisfies AnthropicError,
+        400,
+      );
+    }
+    const anthropicRequest = normalizeAnthropicRequest(requestBody);
     logContext = createRequestLogContext(anthropicRequest, inboundRequestId);
     logInfo('request_received', {
       requestId: logContext.requestId,
@@ -114,7 +126,15 @@ messagesRouter.post('/', async (c: Context) => {
 
     validateAnthropicRequest(anthropicRequest);
 
-    if (controllerEnabled()) return await controllerResponse(anthropicRequest, auth.token, logContext, c.req.raw.signal, c.req.query('cid') || c.req.header('X-Conversation-ID'));
+    if (controllerEnabled()) {
+      return await controllerResponse(
+        anthropicRequest,
+        auth.token,
+        logContext,
+        c.req.raw.signal,
+        c.req.query('cid') || c.req.header('X-Conversation-ID'),
+      );
+    }
 
     const duplicate = observeDuplicateCandidate(
       logContext.requestHash,

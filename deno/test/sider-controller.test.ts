@@ -613,3 +613,49 @@ Deno.test('主控兼容原会话query cid：单消息续轮恢复真实父消息
     equal(calls, 2);
   });
 });
+
+Deno.test('主控响应缓存：相同续轮正文按query cid隔离', async () => {
+  let calls = 0;
+  await appWithMock((body) => {
+    calls++;
+    if (calls === 1) return sse('已记住A', 'real-cid-a', 'parent-a-1');
+    if (calls === 2) {
+      equal(body.cid, 'real-cid-a');
+      return sse('MARKER_A', 'real-cid-a', 'parent-a-2');
+    }
+    if (calls === 3) return sse('已记住B', 'real-cid-b', 'parent-b-1');
+    equal(body.cid, 'real-cid-b');
+    return sse('MARKER_B', 'real-cid-b', 'parent-b-2');
+  }, async (app) => {
+    const create = async (marker: string) => {
+      const response = await send(app, {
+        model: 'claude-opus-5.5',
+        messages: [{ role: 'user', content: `记住${marker}-${crypto.randomUUID()}` }],
+      });
+      return await response.json();
+    };
+    const resume = async (cid: string) => {
+      const response = await app.request(`/v1/messages?cid=${cid}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-opus-5.5',
+          messages: [{ role: 'user', content: '标记是什么？' }],
+        }),
+      });
+      equal(response.status, 200);
+      return await response.json();
+    };
+
+    const first = await create('MARKER_A');
+    const firstReply = await resume(first.sider_session.conversation_id);
+    equal(firstReply.content[0].text, 'MARKER_A');
+    equal(firstReply.sider_session.conversation_id, first.sider_session.conversation_id);
+
+    const second = await create('MARKER_B');
+    const secondReply = await resume(second.sider_session.conversation_id);
+    equal(secondReply.content[0].text, 'MARKER_B');
+    equal(secondReply.sider_session.conversation_id, second.sider_session.conversation_id);
+    equal(calls, 4);
+  });
+});

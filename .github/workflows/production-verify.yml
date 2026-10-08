@@ -119,12 +119,25 @@ jobs:
       - name: CORS 检查
         run: |
           echo "🌐 检查 CORS 配置..."
-          STATUS=$(curl -s -4 --max-time 30 -o /dev/null -w "%{http_code}" \
-            -X OPTIONS "${{ steps.target.outputs.url }}/health" \
+          HEADERS=$(mktemp)
+          STATUS=$(curl -s -4 --max-time 30 -D "$HEADERS" -o /dev/null -w "%{http_code}" \
+            -X OPTIONS "${{ steps.target.outputs.url }}/v1/messages" \
             -H "Origin: http://localhost:3000" \
-            -H "Access-Control-Request-Method: POST")
-          echo "   OPTIONS 状态码: $STATUS"
-          echo "✅ CORS 配置可访问"
+            -H "Access-Control-Request-Method: POST" \
+            -H "Access-Control-Request-Headers: content-type,x-api-key,anthropic-version")
+          if [[ "$STATUS" != "204" ]]; then
+            echo "❌ OPTIONS 应返回 204，实际: $STATUS"
+            exit 1
+          fi
+          tr -d '\r' < "$HEADERS" | grep -qi '^access-control-allow-headers:.*x-api-key' || {
+            echo "❌ CORS 未允许 x-api-key"
+            exit 1
+          }
+          tr -d '\r' < "$HEADERS" | grep -qi '^access-control-allow-headers:.*anthropic-version' || {
+            echo "❌ CORS 未允许 anthropic-version"
+            exit 1
+          }
+          echo "✅ CORS 预检与 Anthropic 请求头正常"
 
   # ── 集成回归测试（消耗上游配额，仅手动触发时可选） ──
   integration-regression:

@@ -58,15 +58,16 @@ export const suite: Suite = {
     {
       name: 'system prompt 生效',
       async run({ api, config }) {
+        const marker = `CONTEXT-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
         const res = await api.post('/v1/messages', {
           model: config.liveModel,
-          max_tokens: 256,
-          system: '你必须在每个回答的最开头原样加上前缀 [S2C]，然后再回答。',
-          messages: [{ role: 'user', content: '中国的首都是哪里？' }],
+          max_tokens: 64,
+          system: `本次对话的确认码是 ${marker}。`,
+          messages: [{ role: 'user', content: '确认码是什么？只回答确认码。' }],
         });
         bailIfUpstreamLimited(res, 'system prompt 用例上游限流');
         assertStatus(res, 200);
-        assertIncludes(textOf(res.json), '[S2C]', 'system prompt 指定的前缀');
+        assertIncludes(textOf(res.json), marker, 'system prompt 提供的确认码');
         return brief(textOf(res.json), 50);
       },
     },

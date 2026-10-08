@@ -238,6 +238,43 @@ export const suite: Suite = {
         return `system=${system.length}字符，工具定义完整保留，分段后选型及路径正确`;
       },
     },
+    {
+      name: '相同续轮正文按cid隔离响应缓存',
+      async run({ api, config }: any) {
+        const create = async (marker: string) => {
+          const response = await api.post('/v1/messages', {
+            model: config.liveModel,
+            max_tokens: 128,
+            messages: [{ role: 'user', content: `请记住唯一标记${marker}，只回复已记住。` }],
+          });
+          assertStatus(response, 200);
+          return response.json.sider_session.conversation_id as string;
+        };
+        const resume = async (cid: string) => {
+          const response = await api.post(`/v1/messages?cid=${encodeURIComponent(cid)}`, {
+            model: config.liveModel,
+            max_tokens: 128,
+            messages: [{ role: 'user', content: '只回复刚才的唯一标记。' }],
+          });
+          assertStatus(response, 200);
+          return response.json;
+        };
+
+        const markerA = `CID-A-${crypto.randomUUID()}`;
+        const markerB = `CID-B-${crypto.randomUUID()}`;
+        const cidA = await create(markerA);
+        const replyA = await resume(cidA);
+        const cidB = await create(markerB);
+        const replyB = await resume(cidB);
+
+        assertTrue(cidA !== cidB, '两个任务使用不同cid');
+        assertTrue(textOf(replyA).includes(markerA), 'A会话召回A标记');
+        assertTrue(textOf(replyB).includes(markerB), 'B会话召回B标记');
+        assertEquals(replyA.sider_session.conversation_id, cidA, 'A返回自身cid');
+        assertEquals(replyB.sider_session.conversation_id, cidB, 'B返回自身cid');
+        return '相同请求体未跨cid回放，正文和返回会话ID均隔离';
+      },
+    },
     ...(Deno.env.get('E2E_CONTROLLER_SECOND_URL')
       ? [{
         name: '两个独立服务进程：工具结果移动实例后恢复Sider主控检查点',

@@ -57,17 +57,18 @@ export const suite: Suite = {
     {
       name: 'chat/completions 支持 system 角色',
       async run({ api, config }) {
+        const marker = `ORBIT-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
         const res = await api.post('/v1/chat/completions', {
           model: config.liveModel,
-          max_tokens: 256,
+          max_tokens: 64,
           messages: [
-            { role: 'system', content: '你必须在回答最开头加上前缀 [S2C]。' },
-            { role: 'user', content: '中国的首都是哪里？' },
+            { role: 'system', content: `本次对话的项目代号是 ${marker}。` },
+            { role: 'user', content: '项目代号是什么？只回答代号。' },
           ],
         });
         bailIfUpstreamLimited(res, 'chat/completions system 用例上游限流');
         assertStatus(res, 200);
-        assertIncludes(res.json.choices[0].message.content, '[S2C]', 'system 指定前缀');
+        assertIncludes(res.json.choices[0].message.content, marker, 'system 提供的项目代号');
         return brief(res.json.choices[0].message.content, 50);
       },
     },

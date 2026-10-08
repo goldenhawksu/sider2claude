@@ -260,7 +260,7 @@ export async function runSiderController(
     totalMs,
     async () => {
       const replayKey = `${owner}:response:${await controllerHash(
-        JSON.stringify({ ...request, stream: undefined }),
+        JSON.stringify({ session: session ?? null, request: { ...request, stream: undefined } }),
       )}`;
       const cached = await store.read<{ responseKey: string }>(replayKey);
       if (cached) return JSON.parse(await readControllerText(store, cached.responseKey));

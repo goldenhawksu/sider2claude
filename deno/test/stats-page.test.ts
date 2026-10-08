@@ -452,6 +452,13 @@ Deno.test('stats 页面：策略切换脚本 POST 到 /stats/strategy', () => {
   assertIncludes(html, 'method:', 'POST 方法');
 });
 
+Deno.test('stats 页面：策略切换要求会话级管理凭证', () => {
+  const html = renderStatsPage(snapshot());
+  assertIncludes(html, 'sessionStorage', '凭证仅保存在当前浏览器会话');
+  assertIncludes(html, "'x-api-key'", '策略请求携带管理凭证');
+  assertIncludes(html, 'prompt(', '未配置凭证时主动询问');
+});
+
 /**
  * 环形图必须永远是完整的圆。
  *
