@@ -23,9 +23,11 @@
  */
 
 const A = { name: "A", base: Deno.env.get("AB_A") ?? "http://localhost:8000" };
+const bBase = Deno.env.get("AB_B");
+if (!bBase) throw new Error("必须通过 AB_B 环境变量提供第二个实例地址");
 const B = {
   name: "B",
-  base: Deno.env.get("AB_B") ?? "https://sider2claude.asu.deno.net",
+  base: bBase,
 };
 
 const TOKEN = (await Deno.readTextFile("deno/.env")).split(/\r?\n/)

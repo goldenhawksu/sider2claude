@@ -9,22 +9,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      target_url:
-        description: '远端部署地址（留空则用 DEPLOY_URL secret，再退到默认部署地址）'
-        required: false
-        type: string
-        default: ''
       run_integration:
         description: '是否运行集成回归测试 (消耗上游配额)'
         required: false
         type: boolean
         default: false
-
-# 目标地址优先级：手动输入 > DEPLOY_URL secret > 此默认值。
-# 这是公开可访问的部署地址，写在这里让 workflow 开箱即用；
-# 换环境时配 DEPLOY_URL secret 覆盖即可，不必改这个文件。
-env:
-  DEFAULT_DEPLOY_URL: https://sider2claude.asu.deno.net
 
 jobs:
   # ── 冒烟验证（零上游成本） ──
@@ -48,23 +37,29 @@ jobs:
         run: bun install
 
       - name: 确定目标地址
-        id: target
         env:
-          INPUT_URL: ${{ github.event.inputs.target_url }}
           SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          RAW="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          RAW="${SECRET_URL:-}"
+          if [[ -z "$RAW" ]]; then
+            echo "::error::未配置生产地址：请设置 DEPLOY_URL secret。"
+            exit 1
+          fi
           # 去掉末尾斜杠：拼接 $URL/health 时若原值以 / 结尾会变成 //health，
           # 上游按不同路径处理并返回 404，而值来自 secret 时日志显示为 ***，极难排查。
           URL="${RAW%"${RAW##*[!/]}"}"
+          if [[ "$URL" != https://* || "$URL" == *$'\n'* || "$URL" == *$'\r'* ]]; then
+            echo "::error::生产地址必须是单行 HTTPS URL。"
+            exit 1
+          fi
           [[ "$URL" != "$RAW" ]] && echo "⚠️ 已移除目标地址末尾的斜杠"
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "目标地址: $URL"
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+          echo "目标地址已从 DEPLOY_URL secret 加载"
 
       - name: 健康检查
         run: |
-          URL="${{ steps.target.outputs.url }}"
-          echo "🔍 检查目标服务: $URL"
+          URL="$TARGET_URL"
+          echo "🔍 检查目标服务"
           # 本 workflow 由 CI 完成触发，而同一次 push 也会让 Deno Deploy 重新部署，
           # 两者是并行的——健康检查可能撞上部署窗口（旧实例已停、新实例未就绪），
           # 加上实例有冷启动（实测首次请求约 4.4s），一击不中就判死会误报。
@@ -86,7 +81,7 @@ jobs:
       - name: 模型列表验证
         run: |
           echo "📋 检查模型列表..."
-          RESPONSE=$(curl -s -4 --max-time 30 -w "\n%{http_code}" "${{ steps.target.outputs.url }}/v1/models")
+          RESPONSE=$(curl -s -4 --max-time 30 -w "\n%{http_code}" "$TARGET_URL/v1/models")
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | sed '$d')
 
@@ -107,7 +102,7 @@ jobs:
         run: |
           echo "🔒 检查认证保护..."
           STATUS=$(curl -s -4 --max-time 30 -o /dev/null -w "%{http_code}" \
-            -X POST "${{ steps.target.outputs.url }}/v1/messages" \
+            -X POST "$TARGET_URL/v1/messages" \
             -H "Content-Type: application/json" \
             -d '{"model":"test","messages":[{"role":"user","content":"hi"}],"max_tokens":10}')
           if [[ "$STATUS" != "401" ]]; then
@@ -121,7 +116,7 @@ jobs:
           echo "🌐 检查 CORS 配置..."
           HEADERS=$(mktemp)
           STATUS=$(curl -s -4 --max-time 30 -D "$HEADERS" -o /dev/null -w "%{http_code}" \
-            -X OPTIONS "${{ steps.target.outputs.url }}/v1/messages" \
+            -X OPTIONS "$TARGET_URL/v1/messages" \
             -H "Origin: http://localhost:3000" \
             -H "Access-Control-Request-Method: POST" \
             -H "Access-Control-Request-Headers: content-type,x-api-key,anthropic-version")
@@ -160,25 +155,30 @@ jobs:
         run: bun install
 
       - name: 确定目标地址
-        id: target
         env:
-          INPUT_URL: ${{ github.event.inputs.target_url }}
           SECRET_URL: ${{ secrets.DEPLOY_URL }}
         run: |
-          RAW="${INPUT_URL:-${SECRET_URL:-$DEFAULT_DEPLOY_URL}}"
+          RAW="${SECRET_URL:-}"
+          if [[ -z "$RAW" ]]; then
+            echo "::error::未配置生产地址：请设置 DEPLOY_URL secret。"
+            exit 1
+          fi
           # 去掉末尾斜杠：拼接 $URL/health 时若原值以 / 结尾会变成 //health，
           # 上游按不同路径处理并返回 404，而值来自 secret 时日志显示为 ***，极难排查。
           URL="${RAW%"${RAW##*[!/]}"}"
+          if [[ "$URL" != https://* || "$URL" == *$'\n'* || "$URL" == *$'\r'* ]]; then
+            echo "::error::生产地址必须是单行 HTTPS URL。"
+            exit 1
+          fi
           [[ "$URL" != "$RAW" ]] && echo "⚠️ 已移除目标地址末尾的斜杠"
-          echo "url=$URL" >> $GITHUB_OUTPUT
-          echo "目标地址: $URL"
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
+          echo "目标地址已从 DEPLOY_URL secret 加载"
 
       - name: 运行集成测试
         env:
           TEST_ENV: deno-deploy
-          TEST_API_BASE_URL: ${{ steps.target.outputs.url }}
           TEST_AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
-        run: bun run test:integration
+        run: TEST_API_BASE_URL="$TARGET_URL" bun run test:integration
 
   # ── 汇总 ──
   summary:
