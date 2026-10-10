@@ -3,8 +3,8 @@
 Sider2Claude 是一个面向 Claude Code 的 Anthropic API 兼容代理。当前落地方案是：
 
 - 主模型普通对话由 Sider 提供，模型仍以 Claude/Anthropic 名称对外暴露。
-- Claude Code 工具、MCP 工具、自定义 `tool_use` 等 Sider 无法稳定提供的能力，由 DeepSeek Anthropic
-  兼容端补齐。
+- 非流式 Controller 可用 Sider 5.5 文本工具契约；流式 Claude Code 工具请求在 SSE 开始前由
+  混合路由交给 Anthropic 兼容能力端，避免不可回退的半截响应。
 - DeepSeek 上游模型固定默认为 `deepseek-v4-flash`，对外响应仍保留客户端请求的 Claude 模型名。
 - DeepSeek 返回的 `thinking` / `redacted_thinking` / `tool_use` 内容块会按 Anthropic Messages
   结构透传。
@@ -18,9 +18,10 @@ Sider2Claude 是一个面向 Claude Code 的 Anthropic API 兼容代理。当前
 
 - Sider 能提供普通文本对话事件：`text`。
 - Sider think 模型能提供推理事件：`reasoning_content`。
-- 典型模型 `claude-sonnet-4.6` 对 Anthropic `tool_use` 探测返回 `NO_TOOL_USE`，未出现 `tool_use`
-  内容块。
-- 因此工具能力统一路由到 DeepSeek 是当前最稳妥的设计。
+- `claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5` 均通过严格文本工具契约与
+  tool_result 续轮探测，并可完整输出约 9K 文本。
+- Sider 直接输入约 7.7K 中文会返回 603；Controller 使用 6K 安全分段。流式工具请求默认在
+  SSE 开始前走混合路由，非流式 Controller 工具流可用开关单独验证。
 
 相关脚本：
 
@@ -32,7 +33,7 @@ deno task probe:sider
 
 ```bash
 # 只探测一个模型的普通对话
-$env:SIDER_PROBE_MODEL="claude-sonnet-4.6"
+$env:SIDER_PROBE_MODEL="claude-sonnet-5.5"
 $env:SIDER_PROBE_CASES="simple_chat"
 deno task probe:sider
 ```
@@ -46,15 +47,15 @@ Claude Code / Anthropic 客户端
   v
 Sider2Claude
   |
-  |-- 普通对话 -----------------> Sider
+  |-- 普通对话 / 非流式 Controller -> Sider 5.5
   |
-  |-- Claude Code 工具/MCP/tool_use -> DeepSeek /anthropic
+  |-- 流式工具/MCP/tool_use --------> Anthropic 兼容能力端
 ```
 
 核心模块：
 
 - `src/config/backends.ts` / `deno/src/config/backends.ts`：统一后端配置。
-- `src/config/models.ts` / `deno/src/config/models.ts`：18 个 Claude 模型/别名到 Sider 模型的映射。
+- `src/config/models.ts` / `deno/src/config/models.ts`：106 个上游模型及 Claude 5.5 默认映射。
 - `src/routing/router-engine.ts` / `deno/src/routing/router-engine.ts`：路由决策。
 - `src/adapters/anthropic-adapter.ts` / `deno/src/adapters/anthropic-adapter.ts`：DeepSeek Anthropic
   兼容适配器。
@@ -83,6 +84,8 @@ AUTH_TOKEN=your-client-token
 
 SIDER_API_URL=https://sider.ai/api/chat/v1/completions
 SIDER_AUTH_TOKEN=your-sider-jwt
+SIDER_CONTROLLER=true
+SIDER_CONTROLLER_STREAMING=false
 
 DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 DEEPSEEK_API_KEY=your-deepseek-key
@@ -94,6 +97,9 @@ PREFER_SIDER_FOR_CHAT=true
 DEBUG_ROUTING=false
 REQUEST_TIMEOUT=30000
 ```
+
+Controller 默认处理非流式长上下文；流式请求由混合路由直接选择可用后端，避免 SSE
+开始后无法回退。只有在验证 Sider 文本工具契约时才设置 `SIDER_CONTROLLER_STREAMING=true`。
 
 兼容旧变量：
 
@@ -134,8 +140,9 @@ curl http://localhost:4141/health
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:4141
 export ANTHROPIC_AUTH_TOKEN=your-client-token
-export ANTHROPIC_MODEL=claude-sonnet-4.6
-export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5.5
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5.5
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5.5
 ```
 
 Windows PowerShell：
@@ -143,15 +150,22 @@ Windows PowerShell：
 ```powershell
 $env:ANTHROPIC_BASE_URL="http://localhost:4141"
 $env:ANTHROPIC_AUTH_TOKEN="your-client-token"
-$env:ANTHROPIC_MODEL="claude-sonnet-4.6"
-$env:ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-4.5"
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5.5"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5.5"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5.5"
 ```
 
 `ANTHROPIC_AUTH_TOKEN` 应填写本服务的 `AUTH_TOKEN`，不是 Sider token，也不是 DeepSeek key。
 
 ## 支持模型
 
-当前对外暴露 18 个模型/别名，统一映射到 Sider：
+当前对外暴露 106 个 Sider 上游模型；Claude Code 默认使用以下三款：
+
+- `claude-opus-5.5`
+- `claude-sonnet-5.5`
+- `claude-haiku-5.5`
+
+以下旧 Claude 名称仍保留兼容：
 
 - `claude-3.7-sonnet`
 - `claude-3-7-sonnet`
@@ -238,20 +252,21 @@ curl -X POST http://localhost:4141/v1/messages \
   -H "Authorization: Bearer your-client-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.6",
+    "model": "claude-sonnet-5.5",
     "messages": [{"role": "user", "content": "你好"}],
     "max_tokens": 200
   }'
 ```
 
-工具请求会被路由到 DeepSeek：
+以下流式工具请求默认由混合路由选择 Anthropic 兼容能力端；设置
+`SIDER_CONTROLLER_STREAMING=true` 可实验性地改由 Sider Controller 处理：
 
 ```bash
 curl -X POST http://localhost:4141/v1/messages \
   -H "Authorization: Bearer your-client-token" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-sonnet-4.6",
+    "model": "claude-sonnet-5.5",
     "messages": [{"role": "user", "content": "运行 pwd"}],
     "tools": [{
       "name": "Bash",

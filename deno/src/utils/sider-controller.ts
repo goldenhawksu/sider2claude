@@ -45,6 +45,7 @@ interface Task {
   model: string;
   cid: string;
   parent: string;
+  goalHint?: string;
   refs: string[];
   pending: Array<{ id: string; upstreamId: string; name?: string; readPath?: string }>;
   uploads?: Record<string, number>;
@@ -59,6 +60,8 @@ export class ControllerError extends Error {
   }
 }
 export const controllerEnabled = () => getEnv('SIDER_CONTROLLER') === 'true';
+export const controllerHandlesRequest = (request: AnthropicRequest) =>
+  controllerEnabled() && (!request.stream || getEnv('SIDER_CONTROLLER_STREAMING') === 'true');
 export async function controllerHash(text: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))]
     .map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -194,6 +197,34 @@ function pendingUserMessages(request: AnthropicRequest) {
   });
   return request.messages.slice(lastAssistant + 1).filter((message) => message.role === 'user');
 }
+
+function latestUserInstruction(request: AnthropicRequest): string | undefined {
+  const instructions = request.messages.filter((message) => message.role === 'user').flatMap(
+    (message) => {
+      if (typeof message.content === 'string') {
+        const text = stripClientSystemReminders(message.content);
+        return text ? [text] : [];
+      }
+      if (message.content.some((block) => block.type === 'tool_result')) {
+        return [];
+      }
+      const text = message.content
+        .filter((block) => block.type === 'text')
+        .map((block) => block.text ?? '')
+        .join('\n')
+        .trim();
+      const instruction = stripClientSystemReminders(text);
+      return instruction ? [instruction] : [];
+    },
+  );
+  return instructions.at(-1);
+}
+
+function stripClientSystemReminders(text: string): string {
+  const withoutClosed = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, ' ');
+  const unclosed = withoutClosed.indexOf('<system-reminder>');
+  return (unclosed >= 0 ? withoutClosed.slice(0, unclosed) : withoutClosed).trim();
+}
 function containsImage(content: AnthropicRequest['messages'][number]['content']): boolean {
   return Array.isArray(content) &&
     content.some((block) =>
@@ -277,6 +308,10 @@ export async function runSiderController(
       const inflightKey = `${replayKey}:task`;
       const resumeId = await store.read<string>(inflightKey);
       const task = await resolveTask(store, owner, request, session ?? resumeId ?? undefined);
+      const currentInstruction = latestUserInstruction(request);
+      if (currentInstruction) {
+        task.goalHint = currentInstruction.length <= 8000 ? currentInstruction : undefined;
+      }
       task.exactCopy ??= /逐字复制|原样复制/.test(contentToText(request.messages[0]!.content));
       await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
       await store.write(`${owner}:session:${task.id}`, task.id, RETENTION_MS);
@@ -324,6 +359,15 @@ export async function runSiderController(
           `tool_use_id=${p.upstreamId}`,
         );
       }
+      const hasToolResult = pendingUserMessages(request).some((message) =>
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === 'tool_result')
+      );
+      if (hasToolResult) {
+        text +=
+          '\n\n以上是你为执行既有任务而请求的工具结果，不是新的用户任务。继续原始任务，不得停在“已加载”“已记住”或“等待指令”。';
+        if (task.goalHint) text += `\n原始任务目标提示：${task.goalHint}`;
+      }
       if (task.refs.length) text += `\n代理可信正文引用：${JSON.stringify(task.refs)}`;
       if (task.copyRef) {
         text +=
@@ -332,8 +376,8 @@ export async function runSiderController(
       let corrections = 0;
       let totalInputTokens = 0, totalOutputTokens = 0;
       const paceKey = `pace:${await controllerHash(siderToken)}`;
-      // 当前实测13,662字符通过、25,671字符中文被拒；大上下文按已测会话续轮分段登记。
-      const maxChars = Number(getEnv('SIDER_CONTROLLER_MAX_INPUT_CHARS', '14000'));
+      // 5.5 三模型实测：约7.7K中文已触发603，5.7K仍可投递；保守留出契约包装空间。
+      const maxChars = Number(getEnv('SIDER_CONTROLLER_MAX_INPUT_CHARS', '6000'));
       if (!Number.isFinite(maxChars) || maxChars < 2000) {
         throw new ControllerError(
           '主控输入体量配置无效',
@@ -434,7 +478,7 @@ export async function runSiderController(
         return upstream;
       };
       const upload = async (context: string) => {
-        const hash = await controllerHash(context), size = maxChars - 256;
+        const hash = await controllerHash(context), size = maxChars - 512;
         const count = Math.ceil(context.length / size);
         if (count > 16) {
           throw new ControllerError('上下文超过单次可登记的16个分段，检查点保留', 413);
@@ -447,12 +491,7 @@ export async function runSiderController(
           }/${count}。仅记住，暂时不执行任务、不调用工具；只确认已记住，所有片段发送完后再执行。\n${
             context.slice(i * size, (i + 1) * size)
           }`;
-          const result = await sendText(chunk);
-          if (/\[tool_use:/.test(result.textParts.join(''))) {
-            throw new ControllerError(
-              'Sider在上下文登记阶段提前提出执行意图',
-            );
-          }
+          await sendText(chunk);
           task.uploads[hash] = i + 1;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
           persistSiderTelemetry({
@@ -471,7 +510,18 @@ export async function runSiderController(
       let contract = buildToolContract(tools);
       if (text.length + Math.min(contract.length, maxChars - 1000) + 512 > maxChars) {
         await upload(text);
-        text = '所有上下文已经完整发送。现在根据已提供的规范、历史及最新用户需求继续任务。';
+        const latestUserInput = latestUserInstruction(request) || task.goalHint || '';
+        const inlineLimit = Math.max(500, maxChars - 1200);
+        const latestReminder = latestUserInput.length <= inlineLimit
+          ? `\n最新用户请求原文：\n${latestUserInput}`
+          : '\n最新用户请求已在刚才的上下文片段中完整登记，请按其原文执行。';
+        const continuationReminder = hasToolResult
+          ? '\n当前回合的工具结果不是新的用户任务；必须继续原始任务。'
+          : '';
+        text =
+          '上下文登记阶段已经结束。禁止再次回复“已记住”、索要指令或只复述规范；现在必须直接执行最新用户请求。' +
+          continuationReminder +
+          latestReminder;
       }
       if (contract.length > maxChars - 1000) {
         const toolsHash = await controllerHash(contract);
@@ -491,9 +541,15 @@ export async function runSiderController(
           : request.tool_choice?.type === 'any'
           ? '\n本轮必须调用一个工具。'
           : '';
-        const prompt = tools.length
+        let prompt = tools.length
           ? `${text}\n\n${contract}${choice}\n实际工具由客户端执行，不能在收到成功tool_result之前声称已执行。长正文先StoreContent，再用WriteFromRef；正文引用必须保持原样。`
           : `${text}\n本轮没有可调用的工具，直接回答，不得输出工具意图。`;
+        if (prompt.length > maxChars) {
+          await upload(prompt);
+          prompt = tools.length
+            ? '完整的执行与纠错指令已经分段登记完毕。现在直接继续原始任务；需要工具时只输出一个符合已登记schema的严格单行工具意图，不得再次确认已记住或索要指令。'
+            : '完整指令已经分段登记完毕。现在直接回答原始任务，不得再次确认已记住或索要指令。';
+        }
         const callStarted = Date.now();
         const upstream = await sendText(prompt);
         const raw = upstream.textParts.join('');

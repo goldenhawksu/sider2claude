@@ -65,6 +65,7 @@ const CLAUDE_MODELS: ModelInfo[] = [
   model('claude-3.5-haiku'),
   model('claude-haiku-4.5'),
   model('claude-haiku-4.5-think'),
+  model('claude-haiku-5.5'),
 ];
 
 // ── Sider 支持的其余上游模型（参考 sider2api deno_pro.ts MODEL_MAPPING） ──
@@ -121,6 +122,7 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'claude-sonnet-5-think',
   'claude-haiku-4.5',
   'claude-haiku-4.5-think',
+  'claude-haiku-5.5',
   'claude-3.5-haiku',
   'claude-opus-5.5',
   'claude-sonnet-5.5',
@@ -250,22 +252,22 @@ export function mapModelName(anthropicModel: string): string {
 
   // 未知 Claude 族按家族保守映射
   if (normalizedModel.includes('opus')) {
-    return normalizedModel.includes('think') ? 'claude-opus-4.8-think' : 'claude-opus-4.8';
+    return normalizedModel.includes('think') ? 'claude-opus-4.8-think' : 'claude-opus-5.5';
   }
 
   if (normalizedModel.includes('haiku')) {
-    return normalizedModel.includes('think') ? 'claude-haiku-4.5-think' : 'claude-haiku-4.5';
+    return normalizedModel.includes('think') ? 'claude-haiku-4.5-think' : 'claude-haiku-5.5';
   }
 
   if (normalizedModel.includes('sonnet')) {
-    return normalizedModel.includes('think') ? 'claude-sonnet-4.6-think' : 'claude-sonnet-4.6';
+    return normalizedModel.includes('think') ? 'claude-sonnet-5-think' : 'claude-sonnet-5.5';
   }
 
   console.warn('Unknown model, using Sider default:', {
     requested: anthropicModel,
-    fallback: 'claude-sonnet-4.6',
+    fallback: 'claude-sonnet-5.5',
   });
-  return 'claude-sonnet-4.6';
+  return 'claude-sonnet-5.5';
 }
 
 export function isModelSupported(modelId: string): boolean {

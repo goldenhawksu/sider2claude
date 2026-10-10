@@ -5,7 +5,7 @@
  * 文本工具调用兜底是路由/适配器关键路径，两侧都必须覆盖。
  */
 
-import { describe, expect, test, afterEach } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
 import type { AnthropicRequest } from '../src/types/anthropic';
 
@@ -105,11 +105,40 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     });
   });
 
-  test('复述历史 id 不还原，避免重复执行写操作', async () => {
+  test('还原 Previous-assistant-tool-run 变体，避免重试后假完成', async () => {
     stubUpstreamContent([{
       type: 'text',
       text:
-        '回顾：\n[tool_use:Bash] id=toolu_history_1 input={"command":"rm -rf build"}',
+        'Previous assistant tool run: name=Bash id=call_retry_1 input_json={"command":"pwd","description":"Print cwd"}',
+    }]);
+
+    const response = await newAdapter().sendRequest({
+      model: 'claude-sonnet-5.5',
+      messages: [{ role: 'user', content: '必须运行 pwd' }],
+      max_tokens: 128,
+      tools: [{
+        name: 'Bash',
+        description: 'Run shell',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' }, description: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+
+    expect(response.stop_reason).toBe('tool_use');
+    expect(response.content[0]).toMatchObject({
+      type: 'tool_use',
+      name: 'Bash',
+      input: { command: 'pwd' },
+    });
+  });
+
+  test('复述历史 id 不还原，避免重复执行写操作', async () => {
+    stubUpstreamContent([{
+      type: 'text',
+      text: '回顾：\n[tool_use:Bash] id=toolu_history_1 input={"command":"rm -rf build"}',
     }]);
 
     const response = await newAdapter().sendRequest({
@@ -138,7 +167,8 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
   test('还原含未转义 Windows 路径的转录（生产 log 原文）', async () => {
     stubUpstreamContent([{
       type: 'text',
-      text: String.raw`Previous assistant tool request: name=Grep id=call_00_GfLr3D3R input_json={"-n":true,"path":"d:\Github_repo\sider2api\deno_pro.ts","pattern":"stats.json"}`,
+      text: String
+        .raw`Previous assistant tool request: name=Grep id=call_00_GfLr3D3R input_json={"-n":true,"path":"d:\Github_repo\sider2api\deno_pro.ts","pattern":"stats.json"}`,
     }]);
 
     const response = await newAdapter().sendRequest({
@@ -159,7 +189,8 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
   test('修补反斜杠时不破坏非路径字符串里的合法转义', async () => {
     stubUpstreamContent([{
       type: 'text',
-      text: String.raw`Previous assistant tool request: name=Bash id=call_esc input_json={"command":"echo \"hi\"\nls","path":"C:\ref\bin\x.ts"}`,
+      text: String
+        .raw`Previous assistant tool request: name=Bash id=call_esc input_json={"command":"echo \"hi\"\nls","path":"C:\ref\bin\x.ts"}`,
     }]);
 
     const response = await newAdapter().sendRequest({
@@ -179,7 +210,8 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
   test('真正无法解析的 input_json 保持文本，不伪造工具调用', async () => {
     stubUpstreamContent([{
       type: 'text',
-      text: 'Previous assistant tool request: name=Read id=call_broken input_json={"file_path":"a.ts",',
+      text:
+        'Previous assistant tool request: name=Read id=call_broken input_json={"file_path":"a.ts",',
     }]);
 
     const response = await newAdapter().sendRequest({
@@ -445,7 +477,8 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
   test('内容里的逗号不构成字段分隔，命令不得被截断', async () => {
     stubUpstreamContent([{
       type: 'text',
-      text: String.raw`Previous assistant tool request: name=Bash id=call_q3 input_json={"command":"echo "a", b"}`,
+      text: String
+        .raw`Previous assistant tool request: name=Bash id=call_q3 input_json={"command":"echo "a", b"}`,
     }]);
 
     const response = await sendWithBashTool();

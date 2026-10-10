@@ -89,7 +89,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   const models = getAllModels();
   const ids = models.map((model) => model.id);
 
-  assertEquals(models.length, 105);
+  assertEquals(models.length, 106);
   for (
     const id of [
       'claude-sonnet-4.6',
@@ -99,6 +99,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
       'claude-fable-5.1',
       'claude-opus-5.5',
       'claude-sonnet-5.5',
+      'claude-haiku-5.5',
       'gemini-3.5-flash',
       'gemini-3.8-flash',
       'gemini-3.5-flash-lite-think',
@@ -143,7 +144,9 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
 
   assertEquals(mapModelName('gpt-5.5-think'), 'gpt-5.5-think');
   assertEquals(mapModelName('gemini-3.5-flash'), 'gemini-3.5-flash');
-  assertEquals(mapModelName('claude-opus-4.5'), 'claude-opus-4.8');
+  assertEquals(mapModelName('claude-opus-4.5'), 'claude-opus-5.5');
+  assertEquals(mapModelName('claude-sonnet-future'), 'claude-sonnet-5.5');
+  assertEquals(mapModelName('claude-haiku-future'), 'claude-haiku-5.5');
 
   const app = new Hono();
   app.route('/v1/models', modelsRouter);
@@ -152,7 +155,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   assertEquals(listResponse.status, 200);
   const list = await listResponse.json() as { data?: Array<{ id?: string }> };
   const listIds = idsFromOpenAIModelList(list);
-  assertEquals(listIds.length, 105);
+  assertEquals(listIds.length, 106);
   assertEquals(listIds.includes('gpt-5.5-think'), true);
   assertEquals(listIds.includes('gemini-3.5-flash'), true);
 
@@ -180,7 +183,7 @@ Deno.test('Gemini model discovery exposes every upstream model', async () => {
     assertEquals(listResponse.status, 200);
     const list = await listResponse.json() as { models?: Array<{ name?: string }> };
     const ids = idsFromGeminiModelList(list);
-    assertEquals(ids.length, 105);
+    assertEquals(ids.length, 106);
     assertEquals(ids.includes('gpt-5.5-think'), true);
     assertEquals(ids.includes('gemini-3.5-flash'), true);
 

@@ -71,6 +71,7 @@ async function appWithMock(
     SIDER_AUTH_TOKEN: 'controller-sider-token',
     DEEPSEEK_API_KEY: 'unused-key',
     SIDER_CONTROLLER: 'true',
+    SIDER_CONTROLLER_STREAMING: 'true',
     SIDER_CONTROLLER_STORAGE: 'memory',
     SIDER_CONTROLLER_PACE_MS: '0',
   };
@@ -426,13 +427,22 @@ Deno.test('Sider总期限：持续心跳仍不能无限占用账号', async () =
   }
 });
 
-Deno.test('主控大上下文：先完整登记正文，最后提供完整可容纳的工具schema', async () => {
+Deno.test('主控大上下文：安全分块登记后重申最新请求并直接执行，不能再次只确认已记住', async () => {
   let uploads = 0;
+  const latestRequest = '必须使用Read读取a-' + crypto.randomUUID();
   await appWithMock((body) => {
     const text = body.multi_content[0].text;
     if (text.includes('上下文片段')) {
       uploads++;
-      return sse('已记住', 'bootstrap-cid', `parent-${uploads}`);
+      equal(text.length <= 6000, true);
+      return sse(
+        uploads === 1 ? '[tool_use:Read] id=early input={"file_path":"不能提前执行"}' : '已记住',
+        'bootstrap-cid',
+        `parent-${uploads}`,
+      );
+    }
+    if (!text.includes('上下文登记阶段已经结束') || !text.includes(latestRequest)) {
+      return sse('已记住任务上下文，请提供具体指令。', 'bootstrap-cid', 'still-bootstrapping');
     }
     equal(text.includes('"name":"Read"'), true);
     equal(text.includes('"file_path":{"type":"string"}'), true);
@@ -442,10 +452,128 @@ Deno.test('主控大上下文：先完整登记正文，最后提供完整可容
       model: 'claude-opus-5.5',
       tools,
       system: '独立完整规范'.repeat(5000),
-      messages: [{ role: 'user', content: '读取a-' + crypto.randomUUID() }],
+      messages: [{ role: 'user', content: latestRequest }],
     });
     equal(response.status, 200);
     equal(uploads >= 2, true);
+    const result = await response.json();
+    equal(result.stop_reason, 'tool_use');
+    equal(result.content[0].name, 'Read');
+  });
+});
+
+Deno.test('主控纠错：完整工具schema超出单轮上限时再次分段，不能返回413', async () => {
+  const largeTools: AnthropicRequest['tools'] = [{
+    name: 'Read',
+    description: '完整工具说明'.repeat(1800),
+    input_schema: {
+      type: 'object',
+      properties: { file_path: { type: 'string' } },
+      required: ['file_path'],
+    },
+  }];
+  let businessCalls = 0;
+  let uploads = 0;
+  await appWithMock((body) => {
+    const text = body.multi_content[0].text;
+    if (text.includes('上下文片段')) {
+      uploads++;
+      equal(text.length <= 6000, true);
+      return sse('已记住', 'large-correction-cid', crypto.randomUUID());
+    }
+    businessCalls++;
+    if (businessCalls === 1) {
+      return sse(
+        '[tool_use:Read] id=bad input={"file_path":123}',
+        'large-correction-cid',
+        'large-correction-parent-1',
+      );
+    }
+    return sse(
+      '[tool_use:Read] id=good input={"file_path":"valid.txt"}',
+      'large-correction-cid',
+      'large-correction-parent-2',
+    );
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      tools: largeTools,
+      messages: [{ role: 'user', content: '读取valid.txt' }],
+    });
+    equal(response.status, 200);
+    const result = await response.json();
+    equal(uploads >= 2, true);
+    equal(result.stop_reason, 'tool_use');
+    equal(result.content[0].input.file_path, 'valid.txt');
+  });
+});
+
+Deno.test('主控工具续轮：大型Read结果不是新需求，必须继续原始任务而非等待指令', async () => {
+  const goal = '先读取技能规范，然后生成C:/isolated/result.txt并写入完成。' +
+    '必须保持原始任务约束。'.repeat(80);
+  let businessCalls = 0;
+  let sawContinuationAnchor = false;
+  let sawCompleteGoal = false;
+  await appWithMock((body) => {
+    const text = body.multi_content[0].text;
+    if (text.includes('上下文片段')) {
+      return sse('已记住', 'goal-anchor-cid', crypto.randomUUID());
+    }
+    businessCalls++;
+    if (businessCalls === 1) {
+      return sse(
+        '[tool_use:Read] id=read_skill input={"file_path":"C:/skills/SKILL.md"}',
+        'goal-anchor-cid',
+        'goal-parent-1',
+      );
+    }
+    sawContinuationAnchor = text.includes('工具结果不是新的用户任务');
+    sawCompleteGoal = text.includes(goal);
+    if (!sawContinuationAnchor || !sawCompleteGoal) {
+      return sse('规范已加载，请提供初始任务。', 'goal-anchor-cid', 'goal-parent-wait');
+    }
+    return sse(
+      '[tool_use:Write] id=write_result input={"file_path":"C:/isolated/result.txt","content":"完成"}',
+      'goal-anchor-cid',
+      'goal-parent-2',
+    );
+  }, async (app) => {
+    const initial: AnthropicRequest = {
+      model: 'claude-opus-5.5',
+      tools,
+      messages: [{ role: 'user', content: goal }, {
+        role: 'assistant',
+        content: [{ type: 'text', text: '准备按任务读取技能。' }],
+      }, {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: '<system-reminder>内部动态上下文，不是用户任务，且可能在传输中被截断',
+        }],
+      }],
+    };
+    const first = await (await send(app, initial)).json();
+    equal(first.stop_reason, 'tool_use');
+
+    const second = await (await send(app, {
+      ...initial,
+      messages: [...initial.messages, { role: 'assistant', content: first.content }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: first.content[0].id,
+          content: '技能规范正文\n'.repeat(3000),
+        }, {
+          type: 'text',
+          text: '最新用户请求原文：',
+        }],
+      }],
+    })).json();
+
+    equal(sawContinuationAnchor, true);
+    equal(sawCompleteGoal, true);
+    equal(second.stop_reason, 'tool_use');
+    equal(second.content[0].name, 'Write');
   });
 });
 Deno.test('主控建立连接失败仅重试一次，已读取的业务错误不重试', async () => {

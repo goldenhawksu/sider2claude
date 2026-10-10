@@ -36,8 +36,16 @@ let pending: Promise<ControllerStore> | undefined;
 export function getControllerStore(): Promise<ControllerStore> {
   pending ??= getEnv('SIDER_CONTROLLER_STORAGE') === 'memory'
     ? Promise.resolve(new ControllerMemoryStore())
-    : Deno.openKv(getEnv('SIDER_CONTROLLER_KV_PATH') || undefined).then((kv) =>
-      new ControllerKvStore(kv)
-    );
+    : openControllerKv().then((kv) => new ControllerKvStore(kv));
   return pending;
+}
+
+async function openControllerKv(): Promise<Deno.Kv> {
+  const configured = getEnv('SIDER_CONTROLLER_KV_PATH');
+  const path = configured ||
+    (getEnv('DENO_DEPLOYMENT_ID') ? undefined : '.runtime/controller.sqlite');
+  if (path?.startsWith('.runtime/')) {
+    await Deno.mkdir('.runtime', { recursive: true });
+  }
+  return await Deno.openKv(path);
 }

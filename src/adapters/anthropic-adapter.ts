@@ -29,7 +29,11 @@ import {
 } from '../utils/textual-tool-use';
 import { applyStopSequences } from '../utils/stop-sequences';
 import { toClientContent } from '../utils/client-content';
-import { createUpstreamDeadline, DEFAULT_UPSTREAM_IDLE_MS, readUpstreamResponse } from '../utils/upstream-response';
+import {
+  createUpstreamDeadline,
+  DEFAULT_UPSTREAM_IDLE_MS,
+  readUpstreamResponse,
+} from '../utils/upstream-response';
 import { getEnv } from '../utils/env';
 import {
   noteThinkingAteBudget,
@@ -39,7 +43,6 @@ import {
   thinkingDisableRejected,
   upstreamKey,
 } from '../utils/upstream-capabilities';
-
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -347,7 +350,8 @@ export class AnthropicApiAdapter {
 
     const instruction =
       'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. ' +
-      'Lines like "[tool_use:Name] id=... input=..." and "[tool_result] tool_use_id=..." are a ' +
+      'Lines like "Previous assistant tool request/run: name=... id=... input_json=...", ' +
+      '"[tool_use:Name] id=... input=..." and "[tool_result] tool_use_id=..." are a ' +
       'read-only transcript of what already happened. Never reproduce those lines to request a tool, ' +
       'and never write textual tool-call transcripts in normal text.';
     const writeInstruction = tools.some((tool) => tool.name === 'Write')
@@ -356,9 +360,11 @@ export class AnthropicApiAdapter {
         'Never put explanations or apologies into the content argument unless explicitly requested.'
       : '';
 
-    return system ? `${system}
+    return system
+      ? `${system}
 
-${instruction}${writeInstruction}` : instruction + writeInstruction;
+${instruction}${writeInstruction}`
+      : instruction + writeInstruction;
   }
 
   private appendInstructionToLastUser(
@@ -578,7 +584,9 @@ ${instruction}${writeInstruction}` : instruction + writeInstruction;
       .filter((block, index) => block !== clientContent[index]).map((block) => block.type);
     if (convertedTypes.length) {
       logInfo('server_tool_content_normalized', {
-        ...this.contextFields(logContext), provider: this.provider, blockTypes: convertedTypes,
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        blockTypes: convertedTypes,
       });
     }
 
@@ -594,7 +602,8 @@ ${instruction}${writeInstruction}` : instruction + writeInstruction;
         ? 'stop_sequence'
         : hasToolUse && (stopReason === 'end_turn' || stopReason === null)
         ? 'tool_use'
-        : stopReason === 'tool_use' && !hasToolUse && content.some((block) => 'tool_use_id' in block)
+        : stopReason === 'tool_use' && !hasToolUse &&
+            content.some((block) => 'tool_use_id' in block)
         ? 'end_turn'
         : stopReason,
       ...(stopped.matched
@@ -663,7 +672,8 @@ ${instruction}${writeInstruction}` : instruction + writeInstruction;
         ) {
           throw new AnthropicBackendError(
             '上游 Write 参数无效，已阻止写入；file_path 和 content 必须为完整字符串。',
-            502, this.provider,
+            502,
+            this.provider,
           );
         }
         return {
@@ -696,12 +706,14 @@ ${instruction}${writeInstruction}` : instruction + writeInstruction;
     );
     if (converted.unparsedWriteCount > 0) {
       logError('invalid_write_tool_input', {
-        ...this.contextFields(logContext), provider: this.provider,
+        ...this.contextFields(logContext),
+        provider: this.provider,
         count: converted.unparsedWriteCount,
       });
       throw new AnthropicBackendError(
         '上游文本 Write 参数不是严格 JSON 或不完整，已阻止本轮工具执行；请重新生成结构化 Write 调用。',
-        502, this.provider,
+        502,
+        this.provider,
       );
     }
     if (converted.toolUseCount > 0) {

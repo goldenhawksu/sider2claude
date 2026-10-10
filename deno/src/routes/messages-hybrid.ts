@@ -7,7 +7,7 @@
  */
 
 import { Hono } from 'hono';
-import { controllerEnabled } from '../utils/sider-controller.ts';
+import { controllerEnabled, controllerHandlesRequest } from '../utils/sider-controller.ts';
 import { controllerResponse } from '../utils/controller-http.ts';
 import type { Context } from 'hono';
 import { getAuthInfo, requireAuth } from '../middleware/auth.ts';
@@ -126,7 +126,7 @@ messagesRouter.post('/', async (c: Context) => {
 
     validateAnthropicRequest(anthropicRequest);
 
-    if (controllerEnabled()) {
+    if (controllerHandlesRequest(anthropicRequest)) {
       return await controllerResponse(
         anthropicRequest,
         auth.token,

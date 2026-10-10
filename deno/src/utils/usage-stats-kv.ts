@@ -29,6 +29,7 @@
 // Deno Deploy 平台默认开放 unstable API）。
 
 import type { Backend } from '../config/backends.ts';
+import { getEnv } from './env.ts';
 import type { DeepSeekReason, UsageRecord } from './usage-stats.ts';
 
 const BUCKET_MS = 60 * 60_000;
@@ -112,9 +113,15 @@ export function getKv(): Promise<Deno.Kv | null> {
   if (!kvPromise) {
     kvPromise = (async () => {
       try {
-        const mode = (Deno.env.get('STATS_KV') ?? '').toLowerCase();
+        const mode = getEnv('STATS_KV').toLowerCase();
         if (!mode) return null; // 未显式启用：完全跳过，行为同纯进程内
-        const kv = mode === 'kv' ? await Deno.openKv() : await Deno.openKv(':memory:');
+        const configuredPath = getEnv('STATS_KV_PATH');
+        const path = configuredPath ||
+          (getEnv('DENO_DEPLOYMENT_ID') ? undefined : '.runtime/stats.sqlite');
+        if (mode === 'kv' && path?.startsWith('.runtime/')) {
+          await Deno.mkdir('.runtime', { recursive: true });
+        }
+        const kv = mode === 'kv' ? await Deno.openKv(path) : await Deno.openKv(':memory:');
         // 首次写入时记下统计起点（check 不存在才写，重启后才会产生新值）
         await kv.atomic()
           .check({ key: ['stats', 'since'], versionstamp: null })

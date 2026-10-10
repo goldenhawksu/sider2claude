@@ -30,7 +30,11 @@ import {
 } from '../utils/textual-tool-use.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
 import { toClientContent } from '../utils/client-content.ts';
-import { createUpstreamDeadline, DEFAULT_UPSTREAM_IDLE_MS, readUpstreamResponse } from '../utils/upstream-response.ts';
+import {
+  createUpstreamDeadline,
+  DEFAULT_UPSTREAM_IDLE_MS,
+  readUpstreamResponse,
+} from '../utils/upstream-response.ts';
 import { cancelUpstreamReader } from '../utils/stream-cancel.ts';
 import {
   noteThinkingAteBudget,
@@ -42,7 +46,6 @@ import {
 } from '../utils/upstream-capabilities.ts';
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS = DEFAULT_UPSTREAM_IDLE_MS;
-
 
 export class AnthropicBackendError extends Error {
   constructor(
@@ -333,7 +336,7 @@ export class AnthropicApiAdapter {
 
     const instruction =
       'Tool protocol: when you need a tool, emit a structured tool_use content block through the API. ' +
-      'Lines like "Previous assistant tool request: name=... id=... input_json=..." and ' +
+      'Lines like "Previous assistant tool request/run: name=... id=... input_json=..." and ' +
       '"Previous tool result: ..." are a read-only transcript of what already happened. ' +
       'Never reproduce those lines to request a tool, and never write textual tool-call ' +
       'transcripts such as [tool_use:Name] in normal text.';
@@ -343,7 +346,9 @@ export class AnthropicApiAdapter {
         'Never put explanations or apologies into the content argument unless explicitly requested.'
       : '';
 
-    return system ? `${system}\n\n${instruction}${writeInstruction}` : instruction + writeInstruction;
+    return system
+      ? `${system}\n\n${instruction}${writeInstruction}`
+      : instruction + writeInstruction;
   }
 
   private appendInstructionToLastUser(
@@ -568,7 +573,9 @@ export class AnthropicApiAdapter {
       .filter((block, index) => block !== clientContent[index]).map((block) => block.type);
     if (convertedTypes.length) {
       logInfo('server_tool_content_normalized', {
-        ...this.contextFields(logContext), provider: this.provider, blockTypes: convertedTypes,
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        blockTypes: convertedTypes,
       });
     }
 
@@ -582,7 +589,8 @@ export class AnthropicApiAdapter {
         ? 'stop_sequence'
         : hasToolUse && (stopReason === 'end_turn' || stopReason === null)
         ? 'tool_use'
-        : stopReason === 'tool_use' && !hasToolUse && content.some((block) => 'tool_use_id' in block)
+        : stopReason === 'tool_use' && !hasToolUse &&
+            content.some((block) => 'tool_use_id' in block)
         ? 'end_turn'
         : stopReason,
       ...(stopped.matched
@@ -651,7 +659,8 @@ export class AnthropicApiAdapter {
         ) {
           throw new AnthropicBackendError(
             '上游 Write 参数无效，已阻止写入；file_path 和 content 必须为完整字符串。',
-            502, this.provider,
+            502,
+            this.provider,
           );
         }
         return {
@@ -684,12 +693,14 @@ export class AnthropicApiAdapter {
     );
     if (converted.unparsedWriteCount > 0) {
       logError('invalid_write_tool_input', {
-        ...this.contextFields(logContext), provider: this.provider,
+        ...this.contextFields(logContext),
+        provider: this.provider,
         count: converted.unparsedWriteCount,
       });
       throw new AnthropicBackendError(
         '上游文本 Write 参数不是严格 JSON 或不完整，已阻止本轮工具执行；请重新生成结构化 Write 调用。',
-        502, this.provider,
+        502,
+        this.provider,
       );
     }
     if (converted.toolUseCount > 0) {
@@ -892,7 +903,9 @@ export class AnthropicApiAdapter {
       onComplete();
     } catch (error) {
       onError(error instanceof Error ? error : new Error('Stream error'));
-    } finally { deadline.dispose(); }
+    } finally {
+      deadline.dispose();
+    }
   }
 
   /**
@@ -960,16 +973,20 @@ export class AnthropicApiAdapter {
       logError('upstream_timeout', {
         ...this.contextFields(logContext),
         provider: this.provider,
-        timeoutMs: (error as {timeoutPhase?:string;totalMs?:number}).timeoutPhase === 'total'
-          ? (error as {totalMs:number}).totalMs : this.requestTimeoutMs,
+        timeoutMs: (error as { timeoutPhase?: string; totalMs?: number }).timeoutPhase === 'total'
+          ? (error as { totalMs: number }).totalMs
+          : this.requestTimeoutMs,
         idleMs: this.requestTimeoutMs,
-        totalMs: (error as {totalMs?:number}).totalMs ?? 600_000,
-        idleElapsedMs: Date.now() - ((error as {lastActivityAt?:number}).lastActivityAt ?? startTime),
-        timeoutPhase: (error as {timeoutPhase?:string}).timeoutPhase ?? 'idle',
+        totalMs: (error as { totalMs?: number }).totalMs ?? 600_000,
+        idleElapsedMs: Date.now() -
+          ((error as { lastActivityAt?: number }).lastActivityAt ?? startTime),
+        timeoutPhase: (error as { timeoutPhase?: string }).timeoutPhase ?? 'idle',
         elapsedMs: elapsed,
       });
       throw new AnthropicBackendError(
-        `${this.provider} API ${(error as {timeoutPhase?:string}).timeoutPhase ?? 'idle'} timeout (${this.requestTimeoutMs}ms idle limit)`,
+        `${this.provider} API ${
+          (error as { timeoutPhase?: string }).timeoutPhase ?? 'idle'
+        } timeout (${this.requestTimeoutMs}ms idle limit)`,
         503,
         this.provider,
       );

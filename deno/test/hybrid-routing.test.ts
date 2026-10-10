@@ -135,15 +135,16 @@ Deno.test('配置加载：同一环境只加载一次，环境变化时重新加
   });
 });
 
-Deno.test('模型清单：暴露参考映射中的 105 个上游模型，并统一映射到 Sider 模型', () => {
+Deno.test('模型清单：暴露参考映射中的 106 个上游模型，并统一映射到 Sider 模型', () => {
   const models = getAllModels();
 
-  assertEquals(models.length, 105);
-  assertEquals(mapModelName('claude-opus-4.5'), 'claude-opus-4.8');
+  assertEquals(models.length, 106);
+  assertEquals(mapModelName('claude-opus-4.5'), 'claude-opus-5.5');
   assertEquals(mapModelName('claude-opus-4.5-think'), 'claude-opus-4.8-think');
   assertEquals(mapModelName('claude-sonnet-4.6'), 'claude-sonnet-4.6');
-  assertEquals(mapModelName('claude-sonnet'), 'claude-sonnet-4.6');
+  assertEquals(mapModelName('claude-sonnet'), 'claude-sonnet-5.5');
   assertEquals(mapModelName('claude-haiku-4.5-think'), 'claude-haiku-4.5-think');
+  assertEquals(mapModelName('claude-haiku-5.5'), 'claude-haiku-5.5');
 });
 
 Deno.test('路由策略：普通 Claude 对话由 Sider 提供', () => {

@@ -3,6 +3,7 @@ import { restoreToolUseFromText } from '../src/utils/textual-tool-use.ts';
 import type { AnthropicRequest } from '../src/types/anthropic.ts';
 import { createAccumulatorCallbacks, streamSiderSSE } from '../src/utils/sse-line-reader.ts';
 import { SiderClient } from '../src/utils/sider-client.ts';
+import { controllerHandlesRequest } from '../src/utils/sider-controller.ts';
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -30,6 +31,24 @@ const request: AnthropicRequest = {
     }],
   }],
 };
+
+Deno.test('Controller默认不接管流式请求；实验开关可显式启用', () => {
+  const previousController = Deno.env.get('SIDER_CONTROLLER');
+  const previousStreaming = Deno.env.get('SIDER_CONTROLLER_STREAMING');
+  try {
+    Deno.env.set('SIDER_CONTROLLER', 'true');
+    Deno.env.delete('SIDER_CONTROLLER_STREAMING');
+    equal(controllerHandlesRequest({ ...request, stream: false }), true);
+    equal(controllerHandlesRequest({ ...request, stream: true }), false);
+    Deno.env.set('SIDER_CONTROLLER_STREAMING', 'true');
+    equal(controllerHandlesRequest({ ...request, stream: true }), true);
+  } finally {
+    if (previousController === undefined) Deno.env.delete('SIDER_CONTROLLER');
+    else Deno.env.set('SIDER_CONTROLLER', previousController);
+    if (previousStreaming === undefined) Deno.env.delete('SIDER_CONTROLLER_STREAMING');
+    else Deno.env.set('SIDER_CONTROLLER_STREAMING', previousStreaming);
+  }
+});
 
 Deno.test('Sider真实cid续轮完整保留纯工具结果及错误标记', () => {
   const text = convertAnthropicToSiderSync(request, 'probe-real-cid').multi_content[0].text;

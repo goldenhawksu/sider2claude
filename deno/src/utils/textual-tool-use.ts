@@ -405,7 +405,7 @@ function looksLikeWindowsPath(body: string): boolean {
  * 否则前者会静默混进普通文本里，只表现为"助手莫名停下"。
  */
 export const TEXTUAL_TOOL_LINE_SHAPE =
-  /^(Previous assistant tool request:\s*name=\S+\s+id=\S+\s+input_json=\{|\[tool_use:[^\]]+\]\s+id=\S+\s+input=\{)/;
+  /^(Previous assistant tool (?:request|run):\s*name=\S+\s+id=\S+\s+input_json=\{|\[tool_use:[^\]]+\]\s+id=\S+\s+input=\{)/;
 
 /**
  * 采集各工具 `input_schema` 声明的合法键。
@@ -505,7 +505,9 @@ export function normalizeTextualToolUseBlocks(
         if (TEXTUAL_TOOL_LINE_SHAPE.test(line.trim())) {
           unparsedCount += 1;
           if (
-            /^(Previous assistant tool request:\s*name=Write\s|\[tool_use:Write\])/i.test(line.trim())
+            /^(Previous assistant tool (?:request|run):\s*name=Write\s|\[tool_use:Write\])/i.test(
+              line.trim(),
+            )
           ) {
             unparsedWriteCount += 1;
           }
@@ -543,7 +545,7 @@ export function normalizeTextualToolUseBlocks(
  * 还原单行文本工具调用。
  *
  * 支持两种格式：
- * - `Previous assistant tool request: name=X id=Y input_json={...}`（Deno 侧 sanitize 产出）
+ * - `Previous assistant tool request/run: name=X id=Y input_json={...}`（兼容上游转录变体）
  * - `[tool_use:X] id=Y input={...}`（message-format 的转录格式，也是 Sider 契约格式）
  */
 export function parseTextualToolUseLine(
@@ -552,7 +554,7 @@ export function parseTextualToolUseLine(
 ): AnthropicResponseContent | undefined {
   const trimmed = line.trim();
   const match = trimmed.match(
-    /^Previous assistant tool request:\s*name=(\S+)\s+id=(\S+)\s+input_json=(.+)$/,
+    /^Previous assistant tool (?:request|run):\s*name=(\S+)\s+id=(\S+)\s+input_json=(.+)$/,
   ) ||
     trimmed.match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=(.+)$/);
   if (!match) {
@@ -665,7 +667,9 @@ export function restoreToolUseFromText(
     collectToolInputKeys(request.tools),
   );
   result.content = result.content.filter((block) => {
-    if (block.type !== 'tool_use' || validDeclaredToolInput(request.tools, block.name, block.input)) return true;
+    if (
+      block.type !== 'tool_use' || validDeclaredToolInput(request.tools, block.name, block.input)
+    ) return true;
     result.toolUseCount -= 1;
     result.unparsedCount += 1;
     return false;

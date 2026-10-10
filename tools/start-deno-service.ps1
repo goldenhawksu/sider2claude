@@ -15,14 +15,17 @@ if (-not $DenoExe) {
 }
 
 $argumentList = @(
-  'serve',
+  'run',
+  '--unstable-kv',
   '--allow-net',
   '--allow-env',
   '--allow-read',
-  '--port',
-  $Port,
+  '--allow-write=.runtime',
   $Entrypoint
 )
+
+$env:PORT = $Port
+New-Item -ItemType Directory -Path (Join-Path $Root '.runtime') -Force | Out-Null
 
 $process = Start-Process `
   -FilePath $DenoExe `

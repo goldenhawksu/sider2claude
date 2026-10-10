@@ -582,6 +582,40 @@ Deno.test('DeepSeek adapter 还原 Previous-assistant-tool-request 文本为结�
   }
 });
 
+Deno.test('DeepSeek adapter 还原上游 Previous-assistant-tool-run 变体，避免假完成', async () => {
+  const restore = stubUpstreamContent([{
+    type: 'text',
+    text:
+      'Previous assistant tool run: name=Bash id=call_retry_1 input_json={"command":"pwd","description":"Print cwd"}',
+  }]);
+
+  try {
+    const response = await newAdapter().sendRequest({
+      model: 'claude-sonnet-5.5',
+      messages: [{ role: 'user', content: '必须运行 pwd' }],
+      max_tokens: 128,
+      tools: [{
+        name: 'Bash',
+        description: 'Run shell',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' }, description: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+
+    assertEquals(response.stop_reason, 'tool_use');
+    assertEquals(response.content[0].type, 'tool_use');
+    if (response.content[0].type === 'tool_use') {
+      assertEquals(response.content[0].name, 'Bash');
+      assertEquals(response.content[0].input.command, 'pwd');
+    }
+  } finally {
+    restore();
+  }
+});
+
 Deno.test('DeepSeek adapter 还原多行 Previous-assistant-tool-request（log 中的真实形态）', async () => {
   const restore = stubUpstreamContent([{
     type: 'text',

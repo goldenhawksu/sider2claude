@@ -4,10 +4,10 @@
     "entrypoint": "deno/main.ts"
   },
   "tasks": {
-    "dev": "deno run --unstable-kv --allow-net --allow-env --allow-read --watch deno/main.ts",
-    "start": "deno run --unstable-kv --allow-net --allow-env --allow-read deno/main.ts",
+    "dev": "deno run --unstable-kv --allow-net --allow-env --allow-read --allow-write=.runtime --watch deno/main.ts",
+    "start": "deno run --unstable-kv --allow-net --allow-env --allow-read --allow-write=.runtime deno/main.ts",
     "check": "deno check deno/main.ts",
-    "test": "S2C_DISABLE_DOTENV=true deno test --unstable-kv --allow-env --allow-read=deno deno/test",
+    "test": "S2C_DISABLE_DOTENV=true deno test --unstable-kv --allow-env --allow-read=deno,tools,deno.json deno/test",
     "test:e2e": "deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts",
     "regression": "deno task test && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts && deno check deno/test/integration/run.ts",
     "probe:sider": "deno run --allow-net --allow-env --allow-read --allow-write deno/tools/probe-sider-capabilities.ts",
