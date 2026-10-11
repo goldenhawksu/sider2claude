@@ -19,6 +19,9 @@ import { recordUsage } from './usage-stats.ts';
 import { applyStopSequences } from './stop-sequences.ts';
 
 const RETENTION_MS = 24 * 60 * 60_000;
+const MIN_DIRECT_WRITE_VERIFY_CHARS = 4_000;
+const MAX_WRITE_VERIFY_CHARS = 64_000;
+const MAX_READ_LINES = 2_000;
 const INTERNAL_TOOLS: AnthropicTool[] = [
   {
     name: 'StoreContent',
@@ -40,6 +43,20 @@ const INTERNAL_TOOLS: AnthropicTool[] = [
     },
   },
 ];
+interface WriteIntegrity {
+  contentRef: string;
+  filePath: string;
+  sha256: string;
+  characters: number;
+  verification: 'readback' | 'dispatch';
+}
+interface PendingTool {
+  id: string;
+  upstreamId: string;
+  name?: string;
+  readPath?: string;
+  writeIntegrity?: WriteIntegrity;
+}
 interface Task {
   id: string;
   model: string;
@@ -47,7 +64,7 @@ interface Task {
   parent: string;
   goalHint?: string;
   refs: string[];
-  pending: Array<{ id: string; upstreamId: string; name?: string; readPath?: string }>;
+  pending: PendingTool[];
   uploads?: Record<string, number>;
   toolsHash?: string;
   mustWrite?: boolean;
@@ -121,23 +138,57 @@ export function strictControllerCalls(text: string, tools: AnthropicTool[]): Ant
   if (calls.length > 1) throw new ControllerError('主控契约每轮只允许一个工具意图');
   return calls;
 }
-/** 真实Claude Code Read返回连续“行号+制表符”；只接收可确认完整且合法的JSON展示正文。 */
-export function extractReadJson(text: string): string | null {
+/** 真实Claude Code Read返回连续“行号+制表符”；拒绝截断、跳号和超出默认Read上限的正文。 */
+export function extractReadText(text: string): string | null {
   const lines = text.split(/\r?\n/);
-  if (lines.length >= 2000) return null;
+  if (lines.length >= MAX_READ_LINES) return null;
   const decoded: string[] = [];
   for (const [index, line] of lines.entries()) {
     const match = line.match(/^(\d+)\t(.*)$/);
     if (!match || Number(match[1]) !== index + 1) return null;
     decoded.push(match[2]!);
   }
-  const content = decoded.join('\n');
+  return decoded.join('\n');
+}
+/** JSON复制沿用通用Read解码，并额外要求语法完整。 */
+export function extractReadJson(text: string): string | null {
+  const content = extractReadText(text);
+  if (content === null) return null;
   try {
     JSON.parse(content);
     return content;
   } catch {
     return null;
   }
+}
+function writeIntegrityReceipt(integrity: WriteIntegrity, verified: boolean): string {
+  return JSON.stringify({
+    written: true,
+    verified,
+    verification: integrity.verification,
+    content_ref: integrity.contentRef,
+    sha256: integrity.sha256,
+    characters: integrity.characters,
+    file_path: integrity.filePath,
+  });
+}
+function writeIntegrityFailure(
+  integrity: WriteIntegrity,
+  upstreamId: string,
+  error: string,
+): string {
+  return `[tool_result] tool_use_id=${upstreamId} is_error=true\n${
+    JSON.stringify({
+      written: true,
+      verified: false,
+      verification: integrity.verification,
+      content_ref: integrity.contentRef,
+      sha256: integrity.sha256,
+      characters: integrity.characters,
+      file_path: integrity.filePath,
+      error,
+    })
+  }`;
 }
 async function historyKey(request: AnthropicRequest, messages = request.messages): Promise<string> {
   // 客户端可重新分块文本或省略thinking；工具id与参数保持原样。
@@ -158,6 +209,11 @@ async function resolveTask(
   session?: string,
 ): Promise<Task> {
   let id: string | null = session ? await store.read(`${owner}:session:${session}`) : null;
+  const historyId = request.messages.length > 1
+    ? await store.read<string>(
+      `${owner}:history:${await historyKey(request, request.messages.slice(0, -1))}`,
+    )
+    : null;
   const results = pendingUserMessages(request).flatMap((message) =>
     Array.isArray(message.content)
       ? message.content.filter((block) => block.type === 'tool_result')
@@ -167,26 +223,33 @@ async function resolveTask(
     const ids = await Promise.all(
       results.map((block) => store.read<string>(`${owner}:tool:${block.tool_use_id}`)),
     );
-    if (ids.some((value) => !value) || new Set(ids).size !== 1) {
-      throw new ControllerError('工具结果没有有效主控检查点或属于不同任务', 409);
+    const mappedIds = ids.filter((value): value is string => !!value);
+    if (new Set(mappedIds).size > 1) {
+      throw new ControllerError('工具结果属于不同主控任务', 400);
     }
-    if (id && id !== ids[0]) throw new ControllerError('会话与工具结果归属不一致', 409);
-    id = ids[0] ?? null;
+    const mappedId = mappedIds[0] ?? null;
+    const candidateId = id ?? historyId;
+    if (mappedId && candidateId && mappedId !== candidateId) {
+      throw new ControllerError('会话与工具结果归属不一致', 400);
+    }
+    id = mappedId ?? candidateId;
   }
-  if (!id && request.messages.length > 1) {
-    id = await store.read(
-      `${owner}:history:${await historyKey(request, request.messages.slice(0, -1))}`,
-    );
-  }
+  id ??= historyId;
   const task = id ? await store.read<Task>(`${owner}:task:${id}`) : null;
-  if (id && !task) throw new ControllerError('主控检查点已过期', 409);
+  if (id && !task) throw new ControllerError('主控检查点已过期', 400);
   if (task && task.model !== request.model) {
-    throw new ControllerError('恢复主控会话时不能静默切换模型', 409);
+    throw new ControllerError('恢复主控会话时不能静默切换模型', 400);
   }
-  if (
-    results.length && task &&
-    results.some((block) => !task.pending.some((p) => p.id === block.tool_use_id))
-  ) throw new ControllerError('工具结果已处理或不是待执行工具', 409);
+  if (results.length) {
+    if (!task) throw new ControllerError('工具结果没有可恢复的主控检查点', 400);
+    if (results.some((block) => !task.pending.some((p) => p.id === block.tool_use_id))) {
+      throw new ControllerError('工具结果已处理或不是待执行工具', 400);
+    }
+    for (const block of results) {
+      const key = `${owner}:tool:${block.tool_use_id}`;
+      if (!await store.read<string>(key)) await store.write(key, task.id, RETENTION_MS);
+    }
+  }
   return task ??
     { id: crypto.randomUUID(), model: request.model, cid: '', parent: '', refs: [], pending: [] };
 }
@@ -196,6 +259,41 @@ function pendingUserMessages(request: AnthropicRequest) {
     if (message.role === 'assistant') lastAssistant = index;
   });
   return request.messages.slice(lastAssistant + 1).filter((message) => message.role === 'user');
+}
+async function persistControllerResponse(
+  store: ControllerStore,
+  owner: string,
+  task: Task,
+  request: AnthropicRequest,
+  response: AnthropicResponse,
+  replayKey: string,
+  started: number,
+): Promise<void> {
+  await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
+  await store.write(`${owner}:session:${task.id}`, task.id, RETENTION_MS);
+  await store.write(
+    `${owner}:history:${await historyKey(request, [...request.messages, {
+      role: 'assistant',
+      content: response.content,
+    }])}`,
+    task.id,
+    RETENTION_MS,
+  );
+  const responseKey = `${owner}:${task.id}:reply:${response.id}`;
+  await saveControllerText(store, responseKey, JSON.stringify(response));
+  await store.write(replayKey, { responseKey }, RETENTION_MS);
+  recordUsage({
+    model: request.model,
+    backend: 'sider',
+    fallback: false,
+    toolUses: response.content.filter((block) => block.type === 'tool_use').map((block) =>
+      block.name
+    ),
+    stream: !!request.stream,
+    ms: Date.now() - started,
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  });
 }
 
 function latestUserInstruction(request: AnthropicRequest): string | undefined {
@@ -323,6 +421,7 @@ export async function runSiderController(
       const tools = clientTools.some((t) => t.name === 'Write')
         ? [...clientTools, ...INTERNAL_TOOLS]
         : clientTools;
+      let writeIntegrityResult: string | undefined;
       for (const message of pendingUserMessages(request)) {
         if (!Array.isArray(message.content)) continue;
         for (const block of message.content) {
@@ -330,6 +429,91 @@ export async function runSiderController(
           const pending = task.pending.find((p) => p.id === block.tool_use_id);
           if (block.is_error) {
             if (pending?.name === 'Write') task.mustWrite = true;
+            if (pending?.name === 'Read' && pending.writeIntegrity) {
+              task.mustWrite = true;
+              writeIntegrityResult = writeIntegrityFailure(
+                pending.writeIntegrity,
+                pending.upstreamId,
+                '写后回读失败，必须使用原content_ref重新写入并校验',
+              );
+            }
+            continue;
+          }
+          if (pending?.name === 'Write' && pending.writeIntegrity) {
+            if (pending.writeIntegrity.verification === 'readback') {
+              const call: AnthropicToolUse = {
+                type: 'tool_use',
+                id: `toolu_${crypto.randomUUID().replaceAll('-', '')}`,
+                name: 'Read',
+                input: { file_path: pending.writeIntegrity.filePath },
+              };
+              task.pending = [{
+                id: call.id,
+                upstreamId: pending.upstreamId,
+                name: 'Read',
+                readPath: pending.writeIntegrity.filePath,
+                writeIntegrity: pending.writeIntegrity,
+              }];
+              await store.write(`${owner}:tool:${call.id}`, task.id, RETENTION_MS);
+              const response: AnthropicResponse = {
+                id: `msg_${crypto.randomUUID().replaceAll('-', '')}`,
+                type: 'message',
+                role: 'assistant',
+                model: request.model,
+                content: [call],
+                stop_reason: 'tool_use',
+                usage: { input_tokens: 0, output_tokens: 0 },
+                sider_session: { conversation_id: task.id },
+              };
+              await persistControllerResponse(
+                store,
+                owner,
+                task,
+                request,
+                response,
+                replayKey,
+                started,
+              );
+              return response;
+            }
+            task.mustWrite = false;
+            writeIntegrityResult = `[tool_result] tool_use_id=${pending.upstreamId}\n${
+              writeIntegrityReceipt(pending.writeIntegrity, false)
+            }`;
+            continue;
+          }
+          if (pending?.name === 'Read' && pending.writeIntegrity) {
+            const content = extractReadText(
+              typeof block.content === 'string'
+                ? block.content
+                : contentToText(block.content ?? []),
+            );
+            if (content === null) {
+              task.mustWrite = true;
+              writeIntegrityResult = writeIntegrityFailure(
+                pending.writeIntegrity,
+                pending.upstreamId,
+                '写后回读不完整，必须使用原content_ref重新写入并校验',
+              );
+              continue;
+            }
+            const actualHash = await controllerHash(content);
+            if (
+              actualHash !== pending.writeIntegrity.sha256 ||
+              content.length !== pending.writeIntegrity.characters
+            ) {
+              task.mustWrite = true;
+              writeIntegrityResult = writeIntegrityFailure(
+                pending.writeIntegrity,
+                pending.upstreamId,
+                `写后回读不匹配，实际sha256=${actualHash}，实际字符数=${content.length}；必须使用原content_ref重新写入并校验`,
+              );
+              continue;
+            }
+            task.mustWrite = false;
+            writeIntegrityResult = `[tool_result] tool_use_id=${pending.upstreamId}\n${
+              writeIntegrityReceipt(pending.writeIntegrity, true)
+            }`;
             continue;
           }
           if (pending?.name !== 'Read' || !pending.readPath?.endsWith('.json')) continue;
@@ -347,12 +531,15 @@ export async function runSiderController(
           }
         }
       }
-      let text = task.cid
-        ? pendingUserMessages(request).map((message) => contentToText(message.content)).join('\n\n')
-        : buildSiderMessageText(request, {
-          includeHistory: request.messages.length > 1,
-          currentUserInput: contentToText(request.messages.at(-1)!.content),
-        });
+      let text = writeIntegrityResult ??
+        (task.cid
+          ? pendingUserMessages(request).map((message) => contentToText(message.content)).join(
+            '\n\n',
+          )
+          : buildSiderMessageText(request, {
+            includeHistory: request.messages.length > 1,
+            currentUserInput: contentToText(request.messages.at(-1)!.content),
+          }));
       for (const p of task.pending) {
         text = text.replace(
           `tool_use_id=${p.id}`,
@@ -627,6 +814,7 @@ export async function runSiderController(
           restoredToolUse: !!calls.length,
         });
         const call = calls[0];
+        let writeIntegrity: WriteIntegrity | undefined;
         if (call?.name === 'StoreContent') {
           if (Object.keys(call.input).some((key) => key !== 'content')) {
             throw new ControllerError(
@@ -663,8 +851,21 @@ export async function runSiderController(
             store,
             `${owner}:${task.id}:asset:${call.input.content_ref}`,
           );
+          const contentRef = String(call.input.content_ref);
+          const filePath = String(call.input.file_path);
+          writeIntegrity = {
+            contentRef,
+            filePath,
+            sha256: contentRef.slice('sha256:'.length),
+            characters: content.length,
+            verification: content.length <= MAX_WRITE_VERIFY_CHARS &&
+                content.split(/\r?\n/).length < MAX_READ_LINES &&
+                clientTools.some((tool) => tool.name === 'Read')
+              ? 'readback'
+              : 'dispatch',
+          };
           call.name = 'Write';
-          call.input = { file_path: call.input.file_path, content };
+          call.input = { file_path: filePath, content };
           const error = declaredToolInputError(clientTools, 'Write', call.input);
           if (!isValidWriteInput(call.input) || error) {
             task.mustWrite = true;
@@ -683,10 +884,31 @@ export async function runSiderController(
             continue;
           }
         }
+        if (
+          call?.name === 'Write' && !writeIntegrity &&
+          String(call.input.content).length >= MIN_DIRECT_WRITE_VERIFY_CHARS
+        ) {
+          const content = String(call.input.content);
+          const contentRef = `sha256:${await controllerHash(content)}`;
+          await saveControllerText(store, `${owner}:${task.id}:asset:${contentRef}`, content);
+          if (!task.refs.includes(contentRef)) task.refs.push(contentRef);
+          if (task.refs.length > 32) throw new ControllerError('任务正文引用数量超过上限');
+          writeIntegrity = {
+            contentRef,
+            filePath: String(call.input.file_path),
+            sha256: contentRef.slice('sha256:'.length),
+            characters: content.length,
+            verification: content.length <= MAX_WRITE_VERIFY_CHARS &&
+                content.split(/\r?\n/).length < MAX_READ_LINES &&
+                clientTools.some((tool) => tool.name === 'Read')
+              ? 'readback'
+              : 'dispatch',
+          };
+        }
         // 对外id由代理生成，防止模型重复call_1导致会话归属冲突。
         task.pending = [];
         if (call) {
-          if (call.name === 'Write') task.mustWrite = false;
+          if (call.name === 'Write') task.mustWrite = !!writeIntegrity;
           const upstreamId = call.id;
           call.id = `toolu_${crypto.randomUUID().replaceAll('-', '')}`;
           task.pending.push({
@@ -697,6 +919,7 @@ export async function runSiderController(
                 call.input.offset === undefined && typeof call.input.file_path === 'string'
               ? { readPath: call.input.file_path }
               : {}),
+            ...(writeIntegrity ? { writeIntegrity } : {}),
           });
           await store.write(`${owner}:tool:${call.id}`, task.id, RETENTION_MS);
         }
@@ -719,29 +942,15 @@ export async function runSiderController(
           }
         }
         if (combined.aborted) throw combined.reason;
-        await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
-        await store.write(`${owner}:session:${task.id}`, task.id, RETENTION_MS);
-        await store.write(
-          `${owner}:history:${await historyKey(request, [...request.messages, {
-            role: 'assistant',
-            content: response.content,
-          }])}`,
-          task.id,
-          RETENTION_MS,
+        await persistControllerResponse(
+          store,
+          owner,
+          task,
+          request,
+          response,
+          replayKey,
+          started,
         );
-        const responseKey = `${owner}:${task.id}:reply:${response.id}`;
-        await saveControllerText(store, responseKey, JSON.stringify(response));
-        await store.write(replayKey, { responseKey }, RETENTION_MS);
-        recordUsage({
-          model: request.model,
-          backend: 'sider',
-          fallback: false,
-          toolUses: call ? [call.name] : [],
-          stream: !!request.stream,
-          ms: Date.now() - started,
-          inputTokens: response.usage.input_tokens,
-          outputTokens: response.usage.output_tokens,
-        });
         return response;
       }
       throw new ControllerError('主控内部保存或参数纠正超过单请求轮数，检查点保留');

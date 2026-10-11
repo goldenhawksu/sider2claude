@@ -15,7 +15,7 @@
 ## 工作流程
 
 1. 请求通过项目现有认证中间件后，进入独立主控路径；`pro/max/conservative` 的既有行为仍由原路由负责。
-2. 按调用者凭证摘要隔离任务，使用代理生成的唯一工具 ID 查找持久化检查点。Claude Code 无需回传自定义会话头。
+2. 按调用者凭证摘要隔离任务，使用代理生成的唯一工具 ID 查找持久化检查点。工具映射缺失时，只允许从历史指纹恢复唯一任务，并要求该任务的 `pending` 精确包含当前 `tool_use_id`；恢复后补写映射。归属冲突、过期结果和已处理结果返回 400，不再用 409 触发客户端无效重试。Claude Code 无需回传自定义会话头。
 3. 首轮把 system、历史和当前需求完整发送。大内容按已验证的真实 `cid + parent_message_id` 分段登记，禁止截断 schema 或用模型摘要替代原始规范。
 4. 续轮只发送最新助手之后的用户输入与工具结果，保留结果 ID、错误标记及内容；不会因为旧历史长就提前转给 GLM。
 5. Sider 每轮输出最多一个文本工具意图。代理仅接受严格 JSON，并按客户端声明的工具名和 schema 校验，不转换类型、不删字段、不补默认值。
@@ -28,7 +28,9 @@
 - StoreContent 保存 Sider 创作的完整正文，分块落库后计算 SHA-256，返回任务内的正文引用。
 - WriteFromRef 核验调用者、任务归属、分块和哈希，然后装配成客户端声明的 Write。
 - 引用不能跨任务使用，过期、缺块或哈希错误会明确拒绝。
-- 正文保存成功不等于文件写入成功。在提交真正的 Write 前，不能把“文件已完成”当作最终回答。
+- 正文保存成功不等于文件写入成功。在提交真正的 Write 前，不能把“文件已完成”当作最终回答。客户端返回 Write 成功后，正文不超过 64,000 字符、少于 2,000 行且声明了 Read 时，代理会自动发起完整回读，逐字比较字符数与 SHA-256。
+- 回读失败、不完整或哈希不匹配不会终止任务；代理把带 `is_error=true` 的校验结果送回同一个 Sider 会话，保留原 `content_ref` 并强制重新 WriteFromRef，直到客户端再次写入和校验。
+- 绕过 WriteFromRef 的直接 Write 达到 4,000 字符时也会自动保存可信引用并进入同一回读门禁。超过 Read 安全边界或客户端未声明 Read 时，回执会明确标记 `verified=false`，不能把它表述为已完成逐字回读。
 - 直接 Write 同样要求路径和正文类型正确；文件内容的业务正确性仍由任务要求和客户端校验确认。
 
 针对实测出现的 Read→Write 复制重复转义，代理可从完整 Read JSON 的连续“行号＋制表符”展示格式提取正文，直接保存为引用。在明确“逐字复制／原样复制”的任务中，禁止模型重新生成该源正文。仅支持已测的完整合法 JSON 展示，不猜测缺失行号、截断结果或坏 JSON。
@@ -58,7 +60,7 @@ Claude Code 客户端模板：`config/claude-code.sider-controller.json.example`
 | SIDER_CONTROLLER | `true` 启用独立主控模式；未设则维持现有路由 |
 | SIDER_CONTROLLER_STORAGE | Deno 使用 `kv`，Bun 使用 `sqlite`；`memory` 仅用于隔离测试 |
 | SIDER_CONTROLLER_KV_PATH | Deno 本地可指定 `.runtime` 内数据库；Deploy 留空连接关联的 Deno KV |
-| SIDER_CONTROLLER_MAX_INPUT_CHARS | 默认 `14000`，限制实际单次新增输入；更长内容完整分段登记 |
+| SIDER_CONTROLLER_MAX_INPUT_CHARS | 默认 `6000`，限制实际单次新增输入；更长内容完整分段登记 |
 | SIDER_CONTROLLER_PACE_MS | 默认 `12000`，上游流结束后的账号级间隔，来自本次成功探测节奏 |
 | SIDER_REQUEST_TIMEOUT_MS | 默认 `300000`，Sider 上游真实字节的空闲期限 |
 | SIDER_TOTAL_TIMEOUT_MS | 默认 `600000`，独立总期限；客户端 ping 不刷新它 |

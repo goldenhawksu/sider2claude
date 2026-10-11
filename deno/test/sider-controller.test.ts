@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { ControllerKvStore } from '../src/utils/controller-storage.ts';
+import { getControllerStore } from '../src/utils/controller-storage.ts';
 import { ControllerMemoryStore } from '../src/utils/controller-memory-store.ts';
 import {
   controllerHash,
@@ -154,20 +155,56 @@ Deno.test('主控HTTP：无cid工具续轮发送增量并保留错误结果，�
         content: [{ type: 'tool_result', tool_use_id: 'foreign-id', content: 'x' }],
       }],
     });
-    equal(invalid.status, 409);
+    equal(invalid.status, 400);
+  });
+});
+Deno.test('主控HTTP：tool映射丢失时从history唯一任务自愈并补回映射', async () => {
+  let count = 0;
+  const request: AnthropicRequest = {
+    model: 'claude-opus-5.5',
+    tools,
+    messages: [{ role: 'user', content: '读取并继续-' + crypto.randomUUID() }],
+  };
+  await appWithMock((body) => {
+    count++;
+    if (count === 1) {
+      return sse(
+        '[tool_use:Read] id=read_1 input={"file_path":"resume.txt"}',
+        'self-heal-cid',
+        'self-heal-parent-1',
+      );
+    }
+    equal(body.cid, 'self-heal-cid');
+    equal(body.parent_message_id, 'self-heal-parent-1');
+    equal(body.multi_content[0].text.includes('tool_use_id=read_1'), true);
+    return sse('已从检查点继续', 'self-heal-cid', 'self-heal-parent-2');
+  }, async (app) => {
+    const first = await (await send(app, request)).json();
+    const toolUseId = first.content[0].id;
+    const owner = await controllerHash('controller-test-token');
+    const store = await getControllerStore();
+    await store.write(`${owner}:tool:${toolUseId}`, 'expired', -1);
+
+    const response = await send(app, {
+      ...request,
+      messages: [...request.messages, { role: 'assistant', content: first.content }, {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: toolUseId, content: '文件正文' }],
+      }],
+    });
+
+    equal(response.status, 200);
+    equal((await response.json()).content[0].text, '已从检查点继续');
+    equal(await store.read(`${owner}:tool:${toolUseId}`), first.sider_session.conversation_id);
+    equal(count, 2);
   });
 });
 Deno.test('主控HTTP：StoreContent→本地哈希保存→WriteFromRef展开，长正文逐字保真', async () => {
-  const content = JSON.stringify({
-    images: Array.from(
-      { length: 12 },
-      (_, i) => ({
-        id: i + 1,
-        content: '中文"引号"\\路径\n😀'.repeat(900),
-        file_path: `asset${i}.png`,
-      }),
-    ),
-  });
+  const content = Array.from(
+    { length: 320 },
+    (_, i) => `${i + 1}. 中文"引号"\\路径😀-${'正文'.repeat(32)}`,
+  ).join('\n');
+  const expectedHash = await controllerHash(content);
   let count = 0;
   await appWithMock((body) => {
     count++;
@@ -178,28 +215,196 @@ Deno.test('主控HTTP：StoreContent→本地哈希保存→WriteFromRef展开�
         'long-parent-1',
       );
     }
+    if (count === 2) {
+      equal(body.cid, 'long-body-cid');
+      equal(body.parent_message_id, 'long-parent-1');
+      const ref = body.multi_content[0].text.match(/sha256:[a-f0-9]{64}/)[0];
+      return sse(
+        `[tool_use:WriteFromRef] id=write_1 input=${
+          JSON.stringify({ file_path: 'C:\\isolated\\manifest.md', content_ref: ref })
+        }`,
+        'long-body-cid',
+        'long-parent-2',
+      );
+    }
     equal(body.cid, 'long-body-cid');
-    equal(body.parent_message_id, 'long-parent-1');
-    const ref = body.multi_content[0].text.match(/sha256:[a-f0-9]{64}/)[0];
-    return sse(
-      `[tool_use:WriteFromRef] id=write_1 input=${
-        JSON.stringify({ file_path: 'C:\\isolated\\manifest.json', content_ref: ref })
-      }`,
-      'long-body-cid',
-      'long-parent-2',
-    );
+    equal(body.parent_message_id, 'long-parent-2');
+    equal(body.multi_content[0].text.includes('"verified":true'), true);
+    equal(body.multi_content[0].text.includes(expectedHash), true);
+    equal(body.multi_content[0].text.includes(content.slice(0, 200)), false);
+    return sse('写入并回读校验通过', 'long-body-cid', 'long-parent-3');
   }, async (app) => {
-    const response = await send(app, {
+    const initial: AnthropicRequest = {
       model: 'claude-opus-5.5',
       tools,
       messages: [{ role: 'user', content: '生成12项manifest-' + crypto.randomUUID() }],
-    });
-    equal(response.status, 200);
-    const result = await response.json();
+    };
+    const result = await (await send(app, initial)).json();
     equal(count, 2);
     equal(result.content[0].name, 'Write');
     equal(result.content[0].input.content, content);
-    equal(result.content[0].input.file_path, 'C:\\isolated\\manifest.json');
+    equal(result.content[0].input.file_path, 'C:\\isolated\\manifest.md');
+
+    const afterWrite = [...initial.messages, {
+      role: 'assistant' as const,
+      content: result.content,
+    }, {
+      role: 'user' as const,
+      content: [{
+        type: 'tool_result' as const,
+        tool_use_id: result.content[0].id,
+        content: 'File written successfully',
+      }],
+    }];
+    const verification = await (await send(app, { ...initial, messages: afterWrite })).json();
+    equal(count, 2);
+    equal(verification.stop_reason, 'tool_use');
+    equal(verification.content[0].name, 'Read');
+    equal(verification.content[0].input.file_path, 'C:\\isolated\\manifest.md');
+
+    const readResult = content.split('\n').map((line, index) => `${index + 1}\t${line}`).join('\n');
+    const final = await send(app, {
+      ...initial,
+      messages: [...afterWrite, { role: 'assistant', content: verification.content }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: verification.content[0].id,
+          content: readResult,
+        }],
+      }],
+    });
+    equal(final.status, 200);
+    equal((await final.json()).content[0].text, '写入并回读校验通过');
+    equal(count, 3);
+  });
+});
+Deno.test('主控HTTP：长正文回读不一致时同会话自动用原引用重写', async () => {
+  const content = Array.from({ length: 80 }, (_, i) => `${i + 1}. ${'正文'.repeat(32)}`).join('\n');
+  let count = 0;
+  let contentRef = '';
+  await appWithMock((body) => {
+    count++;
+    if (count === 1) {
+      return sse(
+        `[tool_use:StoreContent] id=store_retry input=${JSON.stringify({ content })}`,
+        'integrity-retry-cid',
+        'integrity-retry-parent-1',
+      );
+    }
+    if (count === 2) {
+      contentRef = body.multi_content[0].text.match(/sha256:[a-f0-9]{64}/)[0];
+      return sse(
+        `[tool_use:WriteFromRef] id=write_retry input=${
+          JSON.stringify({ file_path: 'C:\\isolated\\retry.md', content_ref: contentRef })
+        }`,
+        'integrity-retry-cid',
+        'integrity-retry-parent-2',
+      );
+    }
+    equal(body.multi_content[0].text.includes('is_error=true'), true);
+    equal(body.multi_content[0].text.includes('写后回读不匹配'), true);
+    equal(body.multi_content[0].text.includes(contentRef), true);
+    return sse(
+      `[tool_use:WriteFromRef] id=write_retry_2 input=${
+        JSON.stringify({ file_path: 'C:\\isolated\\retry.md', content_ref: contentRef })
+      }`,
+      'integrity-retry-cid',
+      'integrity-retry-parent-3',
+    );
+  }, async (app) => {
+    const initial: AnthropicRequest = {
+      model: 'claude-opus-5.5',
+      tools,
+      messages: [{ role: 'user', content: '写入长正文并自动校验-' + crypto.randomUUID() }],
+    };
+    const first = await (await send(app, initial)).json();
+    const afterWrite = [
+      ...initial.messages,
+      { role: 'assistant' as const, content: first.content },
+      {
+        role: 'user' as const,
+        content: [{
+          type: 'tool_result' as const,
+          tool_use_id: first.content[0].id,
+          content: 'File written successfully',
+        }],
+      },
+    ];
+    const verification = await (await send(app, { ...initial, messages: afterWrite })).json();
+    const retry = await send(app, {
+      ...initial,
+      messages: [...afterWrite, { role: 'assistant', content: verification.content }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: verification.content[0].id,
+          content: '1\t损坏的正文',
+        }],
+      }],
+    });
+    equal(retry.status, 200);
+    const retryBody = await retry.json();
+    equal(retryBody.stop_reason, 'tool_use');
+    equal(retryBody.content[0].name, 'Write');
+    equal(retryBody.content[0].input.content, content);
+    equal(count, 3);
+  });
+});
+Deno.test('主控HTTP：较长的直接Write同样强制回读哈希校验', async () => {
+  const content = Array.from({ length: 60 }, (_, i) => `${i + 1}. ${'直写正文'.repeat(24)}`).join(
+    '\n',
+  );
+  let count = 0;
+  await appWithMock((body) => {
+    count++;
+    if (count === 1) {
+      return sse(
+        `[tool_use:Write] id=direct_write input=${
+          JSON.stringify({ file_path: 'C:\\isolated\\direct.md', content })
+        }`,
+        'direct-write-cid',
+        'direct-write-parent-1',
+      );
+    }
+    equal(body.multi_content[0].text.includes('"verified":true'), true);
+    return sse('直接长写回读校验通过', 'direct-write-cid', 'direct-write-parent-2');
+  }, async (app) => {
+    const initial: AnthropicRequest = {
+      model: 'claude-opus-5.5',
+      tools,
+      messages: [{ role: 'user', content: '直接写入长正文-' + crypto.randomUUID() }],
+    };
+    const first = await (await send(app, initial)).json();
+    const afterWrite = [
+      ...initial.messages,
+      { role: 'assistant' as const, content: first.content },
+      {
+        role: 'user' as const,
+        content: [{
+          type: 'tool_result' as const,
+          tool_use_id: first.content[0].id,
+          content: 'File written successfully',
+        }],
+      },
+    ];
+    const verification = await (await send(app, { ...initial, messages: afterWrite })).json();
+    equal(verification.content[0].name, 'Read');
+    const readResult = content.split('\n').map((line, index) => `${index + 1}\t${line}`).join('\n');
+    const final = await send(app, {
+      ...initial,
+      messages: [...afterWrite, { role: 'assistant', content: verification.content }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: verification.content[0].id,
+          content: readResult,
+        }],
+      }],
+    });
+    equal(final.status, 200);
+    equal((await final.json()).content[0].text, '直接长写回读校验通过');
+    equal(count, 2);
   });
 });
 Deno.test('主控校验：未知工具、错误schema、宽松JSON及多工具都禁止执行', async () => {

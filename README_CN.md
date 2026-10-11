@@ -22,6 +22,10 @@ Sider2Claude 是一个面向 Claude Code 的 Anthropic API 兼容代理。当前
   tool_result 续轮探测，并可完整输出约 9K 文本。
 - Sider 直接输入约 7.7K 中文会返回 603；Controller 使用 6K 安全分段。流式工具请求默认在
   SSE 开始前走混合路由，非流式 Controller 工具流可用开关单独验证。
+- Controller 工具映射缺失时可从历史指纹与精确 `pending tool_use_id` 自愈检查点，无法安全恢复的
+  工具结果返回 400，避免 409 重试风暴。
+- `StoreContent -> WriteFromRef` 与较长的直接 `Write` 支持写后 Read 回读、字符数与 SHA-256
+  校验；校验失败会在同一 Sider 会话自动使用原正文引用重写，不要求人工新建会话。
 
 相关脚本：
 
