@@ -94,6 +94,45 @@ Deno.test('Write：结构化和严格文本长参数逐字保留，12 项 manife
   }
 });
 
+Deno.test('Write：多行格式化的严格 JSON 长参数逐字还原', async () => {
+  const originalFetch = globalThis.fetch;
+  const input = {
+    file_path: String.raw`d:\AI_Coder\ppt-master\projects\用户文档\design_spec.md`,
+    content: '# 用户说明文档\n\n' +
+      '包含 `file_path`、"引号"、中文和反斜杠 C:\\next。\n'.repeat(300),
+  };
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'text',
+              text: `Previous assistant tool request: name=Write id=pretty_1 input_json=${
+                JSON.stringify(input, null, 2)
+              }`,
+            }],
+            stop_reason: 'end_turn',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      )) as typeof fetch;
+    const response = await adapter().sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [WRITE],
+      messages: [{ role: 'user', content: '写设计说明' }],
+    });
+    const actual = response.content[0];
+    assert(actual.type === 'tool_use', '多行严格 JSON 必须还原为工具调用');
+    if (actual.type === 'tool_use') {
+      assert(actual.input.file_path === input.file_path, '路径必须逐字一致');
+      assert(actual.input.content === input.content, '长正文必须逐字一致');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test('Write：坏文本和无效结构化参数明确阻止执行，不转成空输入', async () => {
   const originalFetch = globalThis.fetch;
   try {
@@ -103,6 +142,11 @@ Deno.test('Write：坏文本和无效结构化参数明确阻止执行，不转�
           type: 'text',
           text:
             'Previous assistant tool request: name=Write id=bad_1 input_json={"file_path":"correct.json","content":"{"title":"demo","file_path":"wrong.json"}"}',
+        }],
+        [{
+          type: 'text',
+          text:
+            'Previous assistant tool request: name=Write id=bad_multiline input_json={\n  "file_path": "correct.json",\n  "content": "正文被截断"',
         }],
         [{
           type: 'tool_use',

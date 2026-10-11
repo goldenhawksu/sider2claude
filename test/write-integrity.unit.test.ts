@@ -93,6 +93,53 @@ test('合法长 Write 的路径和正文完全保留，包括同名字段、引�
   }
 });
 
+test('多行格式化的严格 JSON 长 Write 逐字还原', async () => {
+  const originalFetch = globalThis.fetch;
+  const input = {
+    file_path: String.raw`d:\AI_Coder\ppt-master\projects\用户文档\design_spec.md`,
+    content: '# 用户说明文档\n\n' +
+      '包含 `file_path`、"引号"、中文和反斜杠 C:\\next。\n'.repeat(300),
+  };
+  const adapter = new AnthropicApiAdapter({
+    enabled: true,
+    provider: 'anthropic-compatible',
+    baseUrl: 'https://write.example',
+    apiKey: 'test-key',
+    model: 'glm-5.3-flash',
+  });
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'text',
+              text: `Previous assistant tool request: name=Write id=pretty_1 input_json=${
+                JSON.stringify(input, null, 2)
+              }`,
+            }],
+            stop_reason: 'end_turn',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      )) as typeof fetch;
+    const response = await adapter.sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [WRITE],
+      messages: [{ role: 'user', content: '写设计说明' }],
+    });
+    expect(response.content[0]).toEqual({
+      type: 'tool_use',
+      id: 'pretty_1',
+      name: 'Write',
+      input,
+    });
+    expect(response.stop_reason).toBe('tool_use');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('坏 Write 阻止整轮工具执行，不能先执行同轮其他调用', async () => {
   const originalFetch = globalThis.fetch;
   const adapter = new AnthropicApiAdapter({
@@ -109,6 +156,11 @@ test('坏 Write 阻止整轮工具执行，不能先执行同轮其他调用', a
           type: 'text',
           text:
             '[tool_use:Read] id=read_1 input={"file_path":"a.md"}\nPrevious assistant tool request: name=Write id=bad_2 input_json={"file_path":"correct.json","content":"{"title":"demo","file_path":"wrong.json"}"}',
+        }],
+        [{
+          type: 'text',
+          text:
+            'Previous assistant tool request: name=Write id=bad_multiline input_json={\n  "file_path": "correct.json",\n  "content": "正文被截断"',
         }],
         [{
           type: 'tool_use',

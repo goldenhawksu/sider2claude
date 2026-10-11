@@ -497,8 +497,27 @@ export function normalizeTextualToolUseBlocks(
       pendingText.length = 0;
     };
 
-    for (const line of block.text.split(/\r?\n/)) {
-      const toolUse = parseTextualToolUseLine(line, toolInputKeys);
+    const lines = block.text.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      let line = lines[index]!;
+      let toolUse = parseTextualToolUseLine(line, toolInputKeys);
+
+      // 上游偶尔会把外层 input_json 格式化成多行。只有完整候选能按原文解析时
+      // 才合并，Write 仍走严格 JSON，不修补路径或正文。
+      if (!toolUse && TEXTUAL_TOOL_LINE_SHAPE.test(line.trim()) && !line.trimEnd().endsWith('}')) {
+        let candidate = line;
+        for (let end = index + 1; end < lines.length; end += 1) {
+          candidate += `\n${lines[end]}`;
+          if (!lines[end]!.trimEnd().endsWith('}')) continue;
+          const multiline = parseTextualToolUseLine(candidate, toolInputKeys);
+          if (!multiline) continue;
+          line = candidate;
+          toolUse = multiline;
+          index = end;
+          break;
+        }
+      }
+
       if (!toolUse) {
         // 形状像调用却没解析出来 = 兜底网漏了一次，回合会退化成 end_turn。
         // 单独计数并告警，否则用户只会看到"助手莫名停下"，无从诊断。
@@ -542,7 +561,7 @@ export function normalizeTextualToolUseBlocks(
 }
 
 /**
- * 还原单行文本工具调用。
+ * 还原一段完整的文本工具调用（JSON 参数可跨行格式化）。
  *
  * 支持两种格式：
  * - `Previous assistant tool request/run: name=X id=Y input_json={...}`（兼容上游转录变体）
@@ -554,9 +573,9 @@ export function parseTextualToolUseLine(
 ): AnthropicResponseContent | undefined {
   const trimmed = line.trim();
   const match = trimmed.match(
-    /^Previous assistant tool (?:request|run):\s*name=(\S+)\s+id=(\S+)\s+input_json=(.+)$/,
+    /^Previous assistant tool (?:request|run):\s*name=(\S+)\s+id=(\S+)\s+input_json=([\s\S]+)$/,
   ) ||
-    trimmed.match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=(.+)$/);
+    trimmed.match(/^\[tool_use:([^\]]+)\]\s+id=([^\s]+)\s+input=([\s\S]+)$/);
   if (!match) {
     return undefined;
   }
