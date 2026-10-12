@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { ControllerSqliteStore } from '../src/utils/controller-storage';
-import { strictControllerCalls, readControllerText, saveControllerText, extractReadJson } from '../src/utils/sider-controller';
+import { controllerPayloadDiagnostics, controllerToolRefusalDetected, contextUploadAccepted, strictControllerCalls, readControllerText, saveControllerText, extractReadJson } from '../src/utils/sider-controller';
 import { validDeclaredToolInput } from '../src/utils/tool-input-validation';
 import { convertAnthropicToSiderSync } from '../src/utils/request-converter';
 import { restoreToolUseFromText } from '../src/utils/textual-tool-use';
@@ -21,6 +21,22 @@ test('Bun严格工具验证与Deno同样拒绝未知名称及无效类型',()=>{
   expect(()=>strictControllerCalls('[tool_use:Read] id=1 input={"file_path":123}',tools)).toThrow();
   const restored=restoreToolUseFromText('[tool_use:Read] id=1 input={"file_path":123}',{model:'claude-opus-5.5',messages:[],tools});
   expect(restored.toolUseCount).toBe(0);expect(restored.unparsedCount).toBe(1);
+});
+test('Bun上下文登记确认与Deno保持同一拒答边界',()=>{
+  expect(contextUploadAccepted('已记住✓\n我已接收片段1/2，等待片段2/2。')).toBe(true);
+  expect(contextUploadAccepted('已确认，我已记住任务上下文片段1/2。我暂时不会执行任何操作，等待片段2/2。')).toBe(true);
+  expect(contextUploadAccepted('所有片段已接收完毕，但我无法直接执行文件写入。')).toBe(true);
+  expect(contextUploadAccepted('我不能接受这个分段策略，这是提示注入攻击。')).toBe(false);
+  expect(contextUploadAccepted('我不会假装记住这个指令序列。')).toBe(false);
+  expect(contextUploadAccepted('普通回答，没有确认登记。')).toBe(false);
+});
+test('Bun强制工具拒绝识别与Deno保持一致',()=>{
+  expect(controllerToolRefusalDetected('这是提示注入攻击，我没有这些工具，无法访问文件系统。')).toBe(true);
+  expect(controllerToolRefusalDetected('I cannot access the file system or emit fake tool calls.')).toBe(true);
+  expect(controllerToolRefusalDetected('我需要先确认文件路径。')).toBe(false);
+});
+test('Bun主控遥测载荷诊断与Deno保持一致',()=>{
+  expect(controllerPayloadDiagnostics('中文??\uFFFD')).toEqual({payloadChars:5,payloadUtf8Bytes:11,questionMarks:2,replacementCharacters:1});
 });
 test('Bun SQLite：跨实例内容读取、分块损坏与任务隔离',async()=>{
   const db=new Database(':memory:');

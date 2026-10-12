@@ -67,6 +67,12 @@ Deno.test({
         ms: 320,
         hasTools: true,
         restoredToolUse: true,
+        phase: 'tool_selection',
+        outcome: 'tool_protocol_refused',
+        correctionCount: 0,
+        payloadUtf8Bytes: 900,
+        questionMarks: 12,
+        replacementCharacters: 0,
       });
 
       let records: Awaited<ReturnType<typeof readSiderTelemetry>> = [];
@@ -81,6 +87,12 @@ Deno.test({
       assertEquals(r.strategy, 'max', '策略');
       assertEquals(r.ok, true, '结果');
       assertEquals(r.restoredToolUse, true, '是否还原 tool_use');
+      assertEquals(r.phase, 'tool_selection', '主控阶段');
+      assertEquals(r.outcome, 'tool_protocol_refused', '语义结果');
+      assertEquals(r.correctionCount, 0, '纠正次数');
+      assertEquals(r.payloadUtf8Bytes, 900, 'UTF-8字节数');
+      assertEquals(r.questionMarks, 12, '问号数量');
+      assertEquals(r.replacementCharacters, 0, '替换字符数量');
     });
   },
 });

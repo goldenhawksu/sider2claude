@@ -169,6 +169,16 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   assertEquals(removedResponse.status, 404);
 });
 
+Deno.test('Claude Code上下文窗口标签不影响严格模型查找与映射', () => {
+  for (const decorated of ['claude-sonnet-5.5[1m]', 'CLAUDE-SONNET-5.5[200K]']) {
+    const found = getModelById(decorated);
+    assertExists(found);
+    assertEquals(found?.siderModel, 'claude-sonnet-5.5');
+    assertEquals(mapModelName(decorated), 'claude-sonnet-5.5');
+  }
+  assertEquals(getModelById('claude-sonnet-5.5[beta]'), undefined);
+});
+
 Deno.test('Gemini model discovery exposes every upstream model', async () => {
   await withEnv({
     AUTH_TOKEN: 'test-token-12345',

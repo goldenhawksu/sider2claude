@@ -81,6 +81,16 @@ export async function controllerHash(text: string): Promise<string> {
     .map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** 发送前的无内容诊断，用于区分输入损坏与上游展示问题。 */
+export function controllerPayloadDiagnostics(text: string) {
+  return {
+    payloadChars: text.length,
+    payloadUtf8Bytes: new TextEncoder().encode(text).length,
+    questionMarks: [...text].filter((char) => char === '?').length,
+    replacementCharacters: [...text].filter((char) => char === '\uFFFD').length,
+  };
+}
+
 // 分块后每个KV值小于64KiB；哈希校验不能依赖expireIn是否及时回收。
 export async function saveControllerText(
   store: ControllerStore,
@@ -256,6 +266,19 @@ function pendingUserMessages(request: AnthropicRequest) {
     if (message.role === 'assistant') lastAssistant = index;
   });
   return request.messages.slice(lastAssistant + 1).filter((message) => message.role === 'user');
+}
+
+/** 只有模型明确确认已接收分片时才推进检查点。 */
+export function contextUploadAccepted(text: string): boolean {
+  const accepted =
+    /已(?:经)?记住|已(?:完整)?(?:接收|收到|记忆)|(?:等待|请发送)[\s\S]*(?:片段|执行指令)|\b(?:received|remembered)[\s\S]*\b(?:part|context)\b/i;
+  return accepted.test(text);
+}
+
+/** 识别模型明确拒绝客户端工具协议的回复；普通说明或漏调不在此列。 */
+export function controllerToolRefusalDetected(text: string): boolean {
+  return /提示注入|越狱|没有(?:这些|任何|真实的)?工具|虚假工具|伪造[\s\S]*工具|无法[\s\S]*(?:访问|写入|执行|调用)|不能[\s\S]*(?:访问|写入|执行|调用)|不会[\s\S]*(?:调用|执行|遵从)|\b(?:prompt injection|jailbreak|fake tool|do not have[\s\S]*tool|cannot[\s\S]*(?:file system|tool|execute|write)|can't[\s\S]*(?:file system|tool|execute|write))\b/i
+    .test(text);
 }
 async function persistControllerResponse(
   store: ControllerStore,
@@ -563,12 +586,14 @@ export async function runSiderController(
               ts: Date.now(),
               model: request.model,
               strategy: 'controller',
-              payloadChars: prompt.length,
+              ...controllerPayloadDiagnostics(prompt),
               ok: false,
               siderCode: 0,
               ms: Date.now() - callStarted,
               hasTools: !!tools.length,
               restoredToolUse: false,
+              phase: 'upstream',
+              outcome: 'connect_retry',
             });
             await new Promise((resolve) => setTimeout(resolve, 1000));
             upstream = await siderClient.chat(body, siderToken, combined);
@@ -578,12 +603,14 @@ export async function runSiderController(
             ts: Date.now(),
             model: request.model,
             strategy: 'controller',
-            payloadChars: prompt.length,
+            ...controllerPayloadDiagnostics(prompt),
             ok: false,
             siderCode: error instanceof SiderUpstreamError ? error.siderCode : 0,
             ms: Date.now() - callStarted,
             hasTools: !!tools.length,
             restoredToolUse: false,
+            phase: 'upstream',
+            outcome: 'upstream_error',
           });
           if (error instanceof SiderUpstreamError && error.siderCode === 1135) {
             const wait = error.retryAfterMs ?? 60_000;
@@ -635,9 +662,22 @@ export async function runSiderController(
             context.slice(i * size, (i + 1) * size)
           }`;
           const result = await sendText(chunk);
-          if (/\[tool_use:/.test(result.textParts.join(''))) {
+          if (!contextUploadAccepted(result.textParts.join(''))) {
+            persistSiderTelemetry({
+              ts: Date.now(),
+              model: request.model,
+              strategy: 'controller',
+              ...controllerPayloadDiagnostics(chunk),
+              ok: false,
+              siderCode: 0,
+              ms: Date.now() - uploadStarted,
+              hasTools: !!tools.length,
+              restoredToolUse: false,
+              phase: 'context_upload',
+              outcome: 'context_unconfirmed',
+            });
             throw new ControllerError(
-              'Sider在上下文登记阶段提前提出执行意图',
+              `Sider未确认上下文分片${i + 1}/${count}，已停止后续发送`,
             );
           }
           task.uploads[hash] = i + 1;
@@ -646,12 +686,14 @@ export async function runSiderController(
             ts: Date.now(),
             model: request.model,
             strategy: 'controller',
-            payloadChars: chunk.length,
+            ...controllerPayloadDiagnostics(chunk),
             ok: true,
             siderCode: 0,
             ms: Date.now() - uploadStarted,
             hasTools: !!tools.length,
             restoredToolUse: false,
+            phase: 'context_upload',
+            outcome: 'context_accepted',
           });
         }
       };
@@ -725,18 +767,32 @@ export async function runSiderController(
               ['StoreContent', 'WriteFromRef'].includes(calls[0].name))
           ) throw new ControllerError('Sider调用与tool_choice不一致');
         } catch (error) {
+          const forcedToolMissing = error instanceof ControllerError &&
+            error.message === 'Sider未满足强制工具选择';
+          const toolProtocolRefused = forcedToolMissing && controllerToolRefusalDetected(raw);
           persistSiderTelemetry({
             ts: Date.now(),
             model: request.model,
             strategy: 'controller',
-            payloadChars: prompt.length,
+            ...controllerPayloadDiagnostics(prompt),
             ok: false,
             siderCode: 0,
             ms: Date.now() - callStarted,
             hasTools: !!tools.length,
             restoredToolUse: false,
+            phase: 'tool_selection',
+            outcome: toolProtocolRefused
+              ? 'tool_protocol_refused'
+              : forcedToolMissing
+              ? 'forced_tool_missing'
+              : 'invalid_tool_intent',
+            correctionCount: corrections,
           });
-          if (++corrections > 2) throw error;
+          if (toolProtocolRefused) {
+            throw new ControllerError('Sider拒绝客户端工具协议，已停止重复纠错');
+          }
+          const correctionLimit = forcedToolMissing ? 1 : 2;
+          if (++corrections > correctionLimit) throw error;
           const name = raw.match(/\[tool_use:([^\]]+)\]/)?.[1];
           const declared = tools.find((tool) => tool.name === name);
           text = `代理校验失败，尚未执行任何工具：${
@@ -750,12 +806,15 @@ export async function runSiderController(
           ts: Date.now(),
           model: request.model,
           strategy: 'controller',
-          payloadChars: prompt.length,
+          ...controllerPayloadDiagnostics(prompt),
           ok: true,
           siderCode: 0,
           ms: Date.now() - callStarted,
           hasTools: !!tools.length,
           restoredToolUse: !!calls.length,
+          phase: 'tool_selection',
+          outcome: calls.length ? 'tool_restored' : 'text_answer',
+          correctionCount: corrections,
         });
         const call = calls[0];
         let writeIntegrity: WriteIntegrity | undefined;

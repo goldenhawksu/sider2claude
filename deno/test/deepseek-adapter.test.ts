@@ -698,7 +698,7 @@ Deno.test('DeepSeek adapter 不把复述历史的 tool_use id 当成新调用（
   }
 });
 
-Deno.test('DeepSeek adapter 的防模仿提示词禁止实际在用的转录格式', async () => {
+Deno.test('DeepSeek adapter 按工具能力注入稳定的协议提示词', async () => {
   const calls: { body: AnthropicRequest }[] = [];
   const originalFetch = globalThis.fetch;
   globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
@@ -738,6 +738,25 @@ Deno.test('DeepSeek adapter 的防模仿提示词禁止实际在用的转录格�
       throw new Error('断言失败：期望 user content 为文本');
     }
     assertEquals(userContent.includes('Tool protocol:'), false);
+
+    await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: '读取网页' }],
+      max_tokens: 128,
+      tools: [{
+        name: 'mcp__webReader__read',
+        input_schema: {
+          type: 'object',
+          properties: { url: { type: 'string' } },
+          required: ['url'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+    assertEquals(
+      String(calls[1].body.system).includes('do not use the server-side built-in webReader'),
+      true,
+    );
+    assertEquals(systemContent.includes('server-side built-in webReader'), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

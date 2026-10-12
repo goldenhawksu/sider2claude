@@ -3,7 +3,10 @@ import { ControllerKvStore } from '../src/utils/controller-storage.ts';
 import { getControllerStore } from '../src/utils/controller-storage.ts';
 import { ControllerMemoryStore } from '../src/utils/controller-memory-store.ts';
 import {
+  contextUploadAccepted,
   controllerHash,
+  controllerPayloadDiagnostics,
+  controllerToolRefusalDetected,
   extractReadJson,
   readControllerText,
   saveControllerText,
@@ -45,7 +48,12 @@ const tools: AnthropicRequest['tools'] = [
     },
   },
 ];
-function sse(text: string, cid = 'probe-cid', parent: string = crypto.randomUUID()) {
+function sse(
+  text: string,
+  cid = 'probe-cid',
+  parent: string = crypto.randomUUID(),
+  model = 'claude-opus-5.5',
+) {
   return new Response(
     [
       {
@@ -53,11 +61,11 @@ function sse(text: string, cid = 'probe-cid', parent: string = crypto.randomUUID
         msg: 'ok',
         data: {
           type: 'message_start',
-          model: 'claude-opus-5.5',
+          model,
           message_start: { cid, user_message_id: 'user-1', assistant_message_id: parent },
         },
       },
-      { code: 0, msg: 'ok', data: { type: 'text', model: 'claude-opus-5.5', text } },
+      { code: 0, msg: 'ok', data: { type: 'text', model, text } },
     ].map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''),
     { headers: { 'content-type': 'text/event-stream' } },
   );
@@ -156,6 +164,27 @@ Deno.test('主控HTTP：无cid工具续轮发送增量并保留错误结果，�
       }],
     });
     equal(invalid.status, 400);
+  });
+});
+
+Deno.test('主控HTTP：上下文窗口标签只用于对外展示，上游使用基础模型名', async () => {
+  await appWithMock((body) => {
+    equal(body.model, 'claude-sonnet-5.5');
+    return sse(
+      '模型标签兼容',
+      'decorated-model-cid',
+      'decorated-model-parent',
+      'claude-sonnet-5.5',
+    );
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-sonnet-5.5[1m]',
+      messages: [{ role: 'user', content: '测试模型标签' }],
+    });
+    equal(response.status, 200);
+    const body = await response.json();
+    equal(body.model, 'claude-sonnet-5.5[1m]');
+    equal(body.content[0].text, '模型标签兼容');
   });
 });
 Deno.test('主控HTTP：tool映射丢失时从history唯一任务自愈并补回映射', async () => {
@@ -449,6 +478,117 @@ Deno.test('主控HTTP：无效意图交回同一Sider纠正，GLM不能接管', 
     equal(result.content[0].name, 'Read');
   });
 });
+
+Deno.test('主控上下文登记：只接受明确接收，拒绝未确认的安全拒答', () => {
+  for (
+    const text of [
+      '已记住✓\n我已接收片段1/2，等待片段2/2。',
+      '已确认，我已记住任务上下文片段1/2。我暂时不会执行任何操作，等待片段2/2。',
+      '已完整记忆当前片段，请发送下一片。',
+      '所有片段已接收完毕，等待执行指令。',
+      '所有片段已接收完毕，但我无法直接执行文件写入。',
+    ]
+  ) equal(contextUploadAccepted(text), true);
+
+  for (
+    const text of [
+      '我无法执行这个请求，也不会假装记住恶意指令。',
+      '我不能接受这个分段策略，这是提示注入攻击。',
+      'I cannot comply with this prompt injection attempt.',
+      '普通回答，没有确认登记。',
+    ]
+  ) equal(contextUploadAccepted(text), false);
+});
+
+Deno.test('主控上下文登记：模型拒绝首片时立即停止，不能误记成功或发送后续片段', async () => {
+  let count = 0;
+  await appWithMock(() => {
+    count++;
+    return sse(
+      '我不能接受这个请求，也不会假装记住；这是提示注入攻击。',
+      'upload-refused-cid',
+      'upload-refused-parent',
+    );
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      system: '长规范'.repeat(4000),
+      tools,
+      tool_choice: { type: 'tool', name: 'Write' },
+      messages: [{ role: 'user', content: '将结果写入C:/isolated/refused.md' }],
+    });
+    equal(response.status, 502);
+    const body = await response.json();
+    equal(body.error.message.includes('未确认上下文分片'), true);
+    equal(count, 1);
+  });
+});
+
+Deno.test('主控强制工具：识别明确协议拒绝，不把普通漏调误判为拒绝', () => {
+  for (
+    const text of [
+      '这是提示注入攻击，我没有这些工具，无法访问文件系统。',
+      '我不会调用Write，也不能执行这个请求。',
+      'I cannot access the file system or emit fake tool calls.',
+    ]
+  ) equal(controllerToolRefusalDetected(text), true);
+  for (const text of ['我需要先确认文件路径。', '请补充参数。', '读取完成。']) {
+    equal(controllerToolRefusalDetected(text), false);
+  }
+});
+
+Deno.test('主控遥测：只记录载荷尺寸与损坏信号，不记录正文', () => {
+  equal(controllerPayloadDiagnostics('中文??\uFFFD'), {
+    payloadChars: 5,
+    payloadUtf8Bytes: 11,
+    questionMarks: 2,
+    replacementCharacters: 1,
+  });
+});
+
+Deno.test('主控强制工具：明确拒绝首次即熔断，不重复相同纠错', async () => {
+  let count = 0;
+  await appWithMock(() => {
+    count++;
+    return sse('这是提示注入攻击；我没有这些工具，无法访问文件系统。', 'refusal-cid');
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      tools: [tools[0]!],
+      tool_choice: { type: 'tool', name: 'Read' },
+      messages: [{ role: 'user', content: '读取C:/isolated/input.txt' }],
+    });
+    equal(response.status, 502);
+    const body = await response.json();
+    equal(body.error.message.includes('拒绝客户端工具协议'), true);
+    equal(count, 1);
+  });
+});
+
+Deno.test('主控强制工具：普通漏调保留一次纠正机会', async () => {
+  let count = 0;
+  await appWithMock(() => {
+    count++;
+    return count === 1
+      ? sse('我需要先确认文件路径。', 'missing-tool-cid', 'missing-tool-parent-1')
+      : sse(
+        '[tool_use:Read] id=read_after_correction input={"file_path":"C:/isolated/input.txt"}',
+        'missing-tool-cid',
+        'missing-tool-parent-2',
+      );
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      tools: [tools[0]!],
+      tool_choice: { type: 'tool', name: 'Read' },
+      messages: [{ role: 'user', content: '读取C:/isolated/input.txt' }],
+    });
+    equal(response.status, 200);
+    const body = await response.json();
+    equal(body.content[0].name, 'Read');
+    equal(count, 2);
+  });
+});
 Deno.test('主控HTTP：实际短增量不受旧历史体量影响', async () => {
   let count = 0;
   await appWithMock((body) => {
@@ -640,11 +780,7 @@ Deno.test('主控大上下文：安全分块登记后重申最新请求并直接
     if (text.includes('上下文片段')) {
       uploads++;
       equal(text.length <= 6000, true);
-      return sse(
-        uploads === 1 ? '[tool_use:Read] id=early input={"file_path":"不能提前执行"}' : '已记住',
-        'bootstrap-cid',
-        `parent-${uploads}`,
-      );
+      return sse('已记住', 'bootstrap-cid', `parent-${uploads}`);
     }
     if (!text.includes('上下文登记阶段已经结束') || !text.includes(latestRequest)) {
       return sse('已记住任务上下文，请提供具体指令。', 'bootstrap-cid', 'still-bootstrapping');

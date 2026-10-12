@@ -46,9 +46,18 @@ const ALL_SUITES: Suite[] = [
 ];
 
 const selected = Deno.args.filter((arg) => !arg.startsWith('-'));
-const suites = selected.length
+let suites = selected.length
   ? ALL_SUITES.filter((s) => selected.includes(s.id) || selected.includes(s.title))
   : ALL_SUITES;
+
+const casePatternSource = Deno.env.get('E2E_CASE_PATTERN');
+if (casePatternSource) {
+  const casePattern = new RegExp(casePatternSource, 'i');
+  suites = suites.map((suite) => ({
+    ...suite,
+    cases: suite.cases.filter((testCase) => casePattern.test(testCase.name)),
+  })).filter((suite) => suite.cases.length > 0);
+}
 
 if (!suites.length) {
   console.error(`未匹配到套件：${selected.join(', ')}`);
@@ -65,6 +74,7 @@ console.log(`认证 Token ${maskToken(ctx.config.authToken)}`);
 console.log(`对话模型   live=${ctx.config.liveModel}`);
 console.log(`CC 模型    sonnet=${ctx.config.claudeCodeSonnet} opus=${ctx.config.claudeCodeOpus}`);
 console.log(`套件       ${suites.map((s) => s.id).join(', ')}`);
+if (casePatternSource) console.log(`用例过滤   /${casePatternSource}/i`);
 
 await assertReachable();
 
@@ -80,7 +90,11 @@ const fail = results.filter((r) => r.outcome === 'fail').length;
 const upstream = results.filter((r) => r.outcome === 'upstream').length;
 
 console.log('\n' + '='.repeat(78));
-console.log(`总计 ${results.length} 项：通过 ${pass}｜失败 ${fail}｜上游受限 ${upstream}｜耗时 ${(elapsedMs / 1000).toFixed(1)}s`);
+console.log(
+  `总计 ${results.length} 项：通过 ${pass}｜失败 ${fail}｜上游受限 ${upstream}｜耗时 ${
+    (elapsedMs / 1000).toFixed(1)
+  }s`,
+);
 
 console.log('\n分组统计');
 console.log('| 套件 | 用例 | 通过 | 失败 | 上游受限 | 耗时 |');
@@ -90,8 +104,12 @@ for (const suite of suites) {
   if (!rows.length) continue;
   const ms = rows.reduce((sum, r) => sum + r.ms, 0);
   console.log(
-    `| ${suite.id} ${suite.title} | ${rows.length} | ${rows.filter((r) => r.outcome === 'pass').length} | ` +
-      `${rows.filter((r) => r.outcome === 'fail').length} | ${rows.filter((r) => r.outcome === 'upstream').length} | ${(ms / 1000).toFixed(1)}s |`,
+    `| ${suite.id} ${suite.title} | ${rows.length} | ${
+      rows.filter((r) => r.outcome === 'pass').length
+    } | ` +
+      `${rows.filter((r) => r.outcome === 'fail').length} | ${
+        rows.filter((r) => r.outcome === 'upstream').length
+      } | ${(ms / 1000).toFixed(1)}s |`,
   );
 }
 
@@ -154,8 +172,12 @@ async function writeReport(): Promise<void> {
     if (!rows.length) continue;
     const ms = rows.reduce((sum, r) => sum + r.ms, 0);
     lines.push(
-      `| ${suite.id} ${suite.title} | ${rows.length} | ${rows.filter((r) => r.outcome === 'pass').length} | ` +
-        `${rows.filter((r) => r.outcome === 'fail').length} | ${rows.filter((r) => r.outcome === 'upstream').length} | ${(ms / 1000).toFixed(1)}s |`,
+      `| ${suite.id} ${suite.title} | ${rows.length} | ${
+        rows.filter((r) => r.outcome === 'pass').length
+      } | ` +
+        `${rows.filter((r) => r.outcome === 'fail').length} | ${
+          rows.filter((r) => r.outcome === 'upstream').length
+        } | ${(ms / 1000).toFixed(1)}s |`,
     );
   }
 
@@ -164,7 +186,13 @@ async function writeReport(): Promise<void> {
   for (const r of results) {
     if (r.suiteId !== currentSuite) {
       currentSuite = r.suiteId;
-      lines.push('', `### ${r.suiteId} ${r.suiteTitle}`, '', '| 用例 | 结果 | 耗时 | 实测细节 |', '|---|---|---|---|');
+      lines.push(
+        '',
+        `### ${r.suiteId} ${r.suiteTitle}`,
+        '',
+        '| 用例 | 结果 | 耗时 | 实测细节 |',
+        '|---|---|---|---|',
+      );
     }
     const mark = r.outcome === 'pass' ? '通过' : r.outcome === 'upstream' ? '上游受限' : '失败';
     lines.push(`| ${r.name} | ${mark} | ${r.ms}ms | ${r.detail.replace(/\|/g, '\\|')} |`);
@@ -175,6 +203,8 @@ async function writeReport(): Promise<void> {
     await Deno.writeTextFile(path, lines.join('\n') + '\n');
     console.log(`\n报告已写入 ${path}`);
   } catch (error) {
-    console.warn(`\n报告写入失败（不影响测试结果）：${error instanceof Error ? error.message : error}`);
+    console.warn(
+      `\n报告写入失败（不影响测试结果）：${error instanceof Error ? error.message : error}`,
+    );
   }
 }

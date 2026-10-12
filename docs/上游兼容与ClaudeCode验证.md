@@ -9,12 +9,22 @@
 DeepSeek 对照来自项目此前官方入口的 `deepseek-v4-flash`／`deepseek-v4-flash-vision-exp`
 实测记录和确定性重放；这些记录不能证明其他名为 `deepseek-flash` 的入口行为完全相同。
 
+2026-10-12 根据生产 ppt-master 运行记录补测：Claude Code 会为长上下文请求使用
+`claude-sonnet-5.5[1m]` 形式的模型名。代理现仅在查找上游时剥离末尾 `[1m]`／`[200k]`
+数字窗口标签，主控与普通路由统一映射到基础模型；对外响应仍保留客户端原始名称。
+
+同轮还确认 Z.ai 内置 `webReader` 对含中文路径的 GitHub URL（包括百分号编码 raw URL）
+可能返回 MCP -400。真实 raw SSE 证明：声明客户端 `webReader`／`WebFetch` 工具时，
+条件 system 指令可直接得到客户端 `tool_use`，避开两次无效的内置工具尝试。因此该提示
+只对网页工具集合注入；普通 Read／Write／Bash 的稳定提示前缀不变。
+
 ## 行为依据
 
 | 项目 | GLM 当前探测／既有实测 | DeepSeek 官方入口既有实测 | 代理处理 |
 |---|---|---|---|
 | MCP 工具 | 当前 auto、强制指定均返回标准 `tool_use` | 支持标准工具调用；thinking 下强制指定曾返回 400 | 保留工具名、ID、参数；强制指定继续沿用已有文本意图兼容 |
 | 服务端搜索 | 当前实际出现 `server_tool_use`、通用 `tool_result`，同轮可有多个调用 | 当前未重新验证原生搜索能力 | 输出转换按内容类型处理，不按厂商猜测 |
+| 网页读取 | 内置 `webReader` 对中文 GitHub 路径可返回 -400；声明客户端网页工具后可直接返回其 `tool_use` | 未重新验证 | 有客户端网页工具时提示优先客户端执行，不重写 URL 或伪造结果 |
 | thinking 预算 | 当前 64 token 只产出 thinking；历史 256 仍可能无正文 | 历史 64 失败、256 已有正文 | 按 `baseUrl::model` 学习失败预算，仅在符合判据时关闭 thinking 重试一次 |
 | 历史工具块 | 工具循环可用，历史参数兼容程度较宽 | thinking passback 校验更严格 | 保留既有历史文本转录与图片透传策略 |
 | `tool_choice: none` | 历史观察到忽略参数 | 历史观察到原生生效 | 隐藏客户端工具，避免仅靠参数导致意外调用 |
@@ -86,6 +96,10 @@ JSON 末尾换行不算业务数据损坏。参数传输的逐字一致由确定
    safe-mode，排除个人 provider 与工具权限设置对测试地址的覆盖。
    本地转发日志确认客户端发送了 Read、Write 并实际访问本次代理；
    先移除旧的测试输出，再以新文件内容为验收依据，不能把退出码 0 当成任务完成。
+5. `deno/tools/probe-server-tool-continuation.ts` 可分别观察 raw SSE 和 adapter 归一化结果。
+   2026-10-12 实测 raw 响应先出现两个失败的 `server_tool_use:webReader`，随后产生
+   `tool_use:mcp__webReader__read`；adapter 输出保持 `tool_use` 和客户端工具名。
+   加入优先客户端网页工具提示后，raw 响应不再出现服务端工具块，直接请求客户端 MCP。
 
 ```bash
 npm run test:regression

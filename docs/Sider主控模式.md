@@ -8,6 +8,8 @@
 
 2026-10-08 补测 StoreContent→本地真实保存与 SHA-256→同一会话 WriteFromRef，两模型共四轮校验通过；规范与完整工具表分段登记后，两模型均可按唯一随机路径正确调用 Read。大上下文实际集成使用 39,111 字符规范，保留全部内容及工具定义。
 
+2026-10-12 针对 Sonnet 5.5 将损坏长上下文误判为提示注入的记录重新探测：正常中文、引号、反斜杠和 emoji 的两段载荷可生成完整 StoreContent；大量字面 `?` 的损坏载荷稳定触发拒绝。要求精确 ACK 的两种新包装反而更容易触发拒绝，因此保留原分片提示，只在回复明确确认“已记住／已接收”后推进检查点。明确拒绝客户端工具协议时首次熔断；普通漏调仍保留一次纠正。
+
 首次大上下文集成暴露“先登记工具，再登记长规范”会使上游无法稳定使用工具定义。实现改为先登记上下文，在执行前提供可容纳的完整 schema。只有单个请求放不下的工具表才完整分段登记；每轮仍提示合法工具名，参数纠正时重新提供相关工具的完整定义。原始失败记录保留在本次验证报告中。
 
 真实 Claude Code 2.1.195 使用 JSON Schema 2020-12，已用实际工具定义修复方言校验，并完成 12 项长 JSON 的实际 Read→Write 文件复制验证。完成判断要求文件存在、正文逐字一致及客户端 Write 成功反馈，不能只看助手自述。
@@ -16,7 +18,7 @@
 
 1. 请求通过项目现有认证中间件后，进入独立主控路径；`pro/max/conservative` 的既有行为仍由原路由负责。
 2. 按调用者凭证摘要隔离任务，使用代理生成的唯一工具 ID 查找持久化检查点。工具映射缺失时，只允许从历史指纹恢复唯一任务，并要求该任务的 `pending` 精确包含当前 `tool_use_id`；恢复后补写映射。归属冲突、过期结果和已处理结果返回 400，不再用 409 触发客户端无效重试。Claude Code 无需回传自定义会话头。
-3. 首轮把 system、历史和当前需求完整发送。大内容按已验证的真实 `cid + parent_message_id` 分段登记，禁止截断 schema 或用模型摘要替代原始规范。
+3. 首轮把 system、历史和当前需求完整发送。大内容按已验证的真实 `cid + parent_message_id` 分段登记，禁止截断 schema 或用模型摘要替代原始规范。分片只有在模型明确确认已记住或已接收后才写入上传检查点；拒答或无关回复会立即停止后续分片。
 4. 续轮只发送最新助手之后的用户输入与工具结果，保留结果 ID、错误标记及内容；不会因为旧历史长就提前转给 GLM。
 5. Sider 每轮输出最多一个文本工具意图。代理仅接受严格 JSON，并按客户端声明的工具名和 schema 校验，不转换类型、不删字段、不补默认值。
 6. 合法意图转成客户端工具块；实际操作完成后，结果回到同一个 Sider 会话。重试同一请求可重放持久化结果及原工具 ID。
@@ -79,6 +81,8 @@ Deno Deploy 必须关联可用的 Deno KV。主控状态存储失败会返回错
 
 本期经过验证的工具链路直接由本地转换完成，**不会调用 GLM 重做业务回合**。GLM 参数猜测、重写正文以及会话接管没有作为主控模式的回退功能启用。现有兼容后端配置保留，关闭主控模式时可继续使用原有 GLM 路由。
 
+强制工具回合若明确声称“提示注入、没有工具、无法访问文件系统”等，会直接返回协议拒绝错误，不再重复相同纠错。没有拒绝语义的普通漏调保留一次纠正；JSON、schema 和完整性错误仍保留原有纠正边界。
+
 Sider 额度耗尽按模型保存上游建议的恢复时间并返回 429，任务检查点保留。仅明确的建立连接失败允许一次有界重试；读取超时、SSE 业务失败及可能执行过服务端工具的请求不重试。
 
 ## 验证与边界
@@ -98,6 +102,11 @@ deno run --allow-net --allow-env --allow-read --allow-write deno/test/integratio
 
 # 实际Claude Code客户端；使用已安装的claude，或通过CLAUDE_CODE_BIN指定可执行文件。
 deno run --allow-net --allow-env --allow-read --allow-write=.runtime --allow-run deno/test/integration/claude-code-controller.ts
+
+# Sonnet 5.5 分片确认、损坏载荷和拒绝熔断探测；只产生文本，不执行文件工具。
+deno run --allow-net --allow-env --allow-read deno/tools/probe-sider-controller-refusal.ts claude-sonnet-5.5 guarded normal
+deno run --allow-net --allow-env --allow-read deno/tools/probe-sider-controller-refusal.ts claude-sonnet-5.5 guarded corrupt
+deno run --allow-net --allow-env --allow-read deno/tools/probe-sider-controller-refusal.ts claude-sonnet-5.5 breaker normal
 ```
 
 主控模式当前拒绝未证实可用的图片输入，不能假装 Sider 已看见图片。原生搜索是服务端工具，不能代替客户端 Read／Write／MCP；统一 `tool_call` 的协议解析已兼容，但主控工具循环默认不启用它，避免不可观察的服务端副作用。
@@ -105,5 +114,7 @@ deno run --allow-net --allow-env --allow-read --allow-write=.runtime --allow-run
 上下文每次最多登记 16 个分段，正文单项最多 512,000 字符；超限保留检查点并返回明确错误。本次大上下文通过不代表无限记忆或最高吞吐。上游模型标识是 Sider 返回的标识，不能独立证明底层权重身份。
 
 Sider 未提供真实 token 用量；报告和兼容 usage 采用字符估算，并汇总内部登记／保存／纠正轮次，不能当作真实计费或厂商思考预算。Deno 的调用遥测按上游尝试记录；Bun 保持现有遥测边界，另有请求完成统计及本地验证日志。
+
+主控遥测额外记录固定枚举的 `phase/outcome`、纠正次数，以及发送前字符数、UTF-8 字节数、字面问号数和 Unicode 替换字符数。这些字段不含消息正文，用于判断乱码是在代理发送前已经存在，还是出现在上游展示／导出阶段。
 
 Bun服务端空闲期限明确设置为255秒，主控SSE每5秒发ping，避免已实测的默认10秒期限与10秒心跳竞争。ping仅维持客户端连接，不延长上游空闲或总期限。

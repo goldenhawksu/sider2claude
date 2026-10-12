@@ -192,16 +192,20 @@ export class AnthropicApiAdapter {
           upstreamStream: true,
         });
       });
-      const normalized = this.normalizeResponse(
-        data,
-        outwardModel,
+      const normalized = this.restoreExactWriteInput(
+        this.normalizeResponse(
+          data,
+          outwardModel,
+          logContext,
+          collectHistoryToolUseIds(request.messages),
+          collectToolInputKeys(request.tools),
+          // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
+          // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
+          request.tool_choice?.type !== 'none',
+          request.stop_sequences,
+        ),
+        request,
         logContext,
-        collectHistoryToolUseIds(request.messages),
-        collectToolInputKeys(request.tools),
-        // `tool_choice: none` 下不做文本工具调用还原：调用方已明确禁止工具，
-        // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
-        request.tool_choice?.type !== 'none',
-        request.stop_sequences,
       );
       const elapsed = Date.now() - startTime;
 
@@ -250,6 +254,33 @@ export class AnthropicApiAdapter {
     } finally {
       deadline.dispose();
     }
+  }
+
+  /** 模型已选择单个 Write 时，用用户显式逐字边界恢复参数，不猜测或修补模型正文。 */
+  private restoreExactWriteInput(
+    response: AnthropicResponse,
+    request: AnthropicRequest,
+    logContext?: RequestLogContext,
+  ): AnthropicResponse {
+    const exact = exactWriteInputFromRequest(request);
+    if (!exact) return response;
+    const calls = response.content.filter((block) => block.type === 'tool_use');
+    const call = calls[0];
+    if (calls.length !== 1 || !call || call.name.toLowerCase() !== 'write') return response;
+    if (call.input.file_path === exact.file_path && call.input.content === exact.content) {
+      return response;
+    }
+    logWarn('exact_write_input_restored', {
+      ...this.contextFields(logContext),
+      provider: this.provider,
+      pathChanged: call.input.file_path !== exact.file_path,
+      upstreamCharacters: typeof call.input.content === 'string' ? call.input.content.length : -1,
+      restoredCharacters: exact.content.length,
+    });
+    return {
+      ...response,
+      content: response.content.map((block) => block === call ? { ...call, input: exact } : block),
+    };
   }
 
   private buildHeaders(): Record<string, string> {
@@ -359,12 +390,16 @@ export class AnthropicApiAdapter {
         'Preserve the exact path and full content; escape nested quotes, backslashes and newlines. ' +
         'Never put explanations or apologies into the content argument unless explicitly requested.'
       : '';
+    const clientWebInstruction = tools.some((tool) => /webreader|webfetch/i.test(tool.name))
+      ? ' When a declared client web tool can handle the request, do not use the server-side built-in webReader. ' +
+        'Emit a structured tool_use for that declared client tool and let the client execute it.'
+      : '';
 
     return system
       ? `${system}
 
-${instruction}${writeInstruction}`
-      : instruction + writeInstruction;
+${instruction}${writeInstruction}${clientWebInstruction}`
+      : instruction + writeInstruction + clientWebInstruction;
   }
 
   private appendInstructionToLastUser(
@@ -827,6 +862,28 @@ ${instruction}${writeInstruction}`
       requestHash: logContext.requestHash,
     };
   }
+}
+
+function exactWriteInputFromRequest(
+  request: AnthropicRequest,
+): { file_path: string; content: string } | undefined {
+  if (
+    request.tool_choice?.type === 'none' ||
+    !request.tools?.some((tool) => tool.name.toLowerCase() === 'write')
+  ) return undefined;
+  const message = [...request.messages].reverse().find((item) => item.role === 'user');
+  if (!message) return undefined;
+  const text = typeof message.content === 'string'
+    ? message.content
+    : message.content.filter((block) => block.type === 'text').map((block) => block.text ?? '')
+      .join('\n');
+  if (!/(?:逐字|原样|exact)/i.test(text)) return undefined;
+  const matched = text.match(
+    /目标路径：([^\r\n]+)\r?\n正文开始\r?\n([\s\S]*?)\r?\n正文结束\s*$/,
+  );
+  if (!matched) return undefined;
+  const input = { file_path: matched[1]!.trim(), content: matched[2]! };
+  return isValidWriteInput(input) ? input : undefined;
 }
 
 /** 上游错误详情在错误消息里的长度上限。够看清原因，又不至于把整页 HTML 灌出去。 */

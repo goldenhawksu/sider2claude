@@ -140,6 +140,58 @@ test('多行格式化的严格 JSON 长 Write 逐字还原', async () => {
   }
 });
 
+test('显式逐字边界从用户原文恢复Write路径和正文', async () => {
+  const originalFetch = globalThis.fetch;
+  const input = {
+    file_path: String.raw`d:\PPT_Test\projects\用户文档\images\image_prompts.json`,
+    content: '{\n  "prompt": "保持引号",\n  "items": 12\n}',
+  };
+  const adapter = new AnthropicApiAdapter({
+    enabled: true,
+    provider: 'anthropic-compatible',
+    baseUrl: 'https://write.example',
+    apiKey: 'test-key',
+    model: 'glm-5.3-flash',
+  });
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'tool_use',
+              id: 'exact_write_1',
+              name: 'Write',
+              input: {
+                file_path: 'd:\\wrong\\output.json',
+                content: '{\n  "prompt": "保持引号", broken\n}',
+              },
+            }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      )) as typeof fetch;
+    const response = await adapter.sendRequest({
+      model: 'claude-opus-5.5',
+      tools: [WRITE],
+      messages: [{
+        role: 'user',
+        content:
+          `只调用一次 Write，将下面内容逐字写入。目标路径：${input.file_path}\n正文开始\n${input.content}\n正文结束`,
+      }],
+    });
+    expect(response.content[0]).toEqual({
+      type: 'tool_use',
+      id: 'exact_write_1',
+      name: 'Write',
+      input,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('坏 Write 阻止整轮工具执行，不能先执行同轮其他调用', async () => {
   const originalFetch = globalThis.fetch;
   const adapter = new AnthropicApiAdapter({

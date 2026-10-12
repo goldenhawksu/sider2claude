@@ -133,6 +133,50 @@ Deno.test('Write：多行格式化的严格 JSON 长参数逐字还原', async (
   }
 });
 
+Deno.test('Write：显式逐字边界从用户原文恢复路径和正文，不执行模型改写版本', async () => {
+  const originalFetch = globalThis.fetch;
+  const input = {
+    file_path: String.raw`d:\PPT_Test\projects\用户文档\images\image_prompts.json`,
+    content: '{\n  "prompt": "保持引号",\n  "items": 12\n}',
+  };
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'tool_use',
+              id: 'exact_write_1',
+              name: 'Write',
+              input: {
+                file_path: 'd:\\wrong\\output.json',
+                content: '{\n  "prompt": "保持引号", broken\n}',
+              },
+            }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      )) as typeof fetch;
+    const response = await adapter().sendRequest({
+      model: 'claude-opus-5.5',
+      tools: [WRITE],
+      messages: [{
+        role: 'user',
+        content:
+          `只调用一次 Write，将下面内容逐字写入。目标路径：${input.file_path}\n正文开始\n${input.content}\n正文结束`,
+      }],
+    });
+    assert(response.content[0].type === 'tool_use', '必须保留模型选择的Write调用');
+    if (response.content[0].type === 'tool_use') {
+      assert(response.content[0].input.file_path === input.file_path, '路径取用户明确原文');
+      assert(response.content[0].input.content === input.content, '正文取用户明确边界');
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test('Write：坏文本和无效结构化参数明确阻止执行，不转成空输入', async () => {
   const originalFetch = globalThis.fetch;
   try {

@@ -17,6 +17,23 @@ export interface SiderTelemetryRecord {
   ms: number;
   hasTools: boolean;
   restoredToolUse: boolean;
+  /** 主控模式的处理阶段；其他策略可不填。 */
+  phase?: 'upstream' | 'context_upload' | 'tool_selection';
+  /** 不含正文的语义结果分类。 */
+  outcome?:
+    | 'connect_retry'
+    | 'upstream_error'
+    | 'context_accepted'
+    | 'context_unconfirmed'
+    | 'tool_protocol_refused'
+    | 'forced_tool_missing'
+    | 'invalid_tool_intent'
+    | 'tool_restored'
+    | 'text_answer';
+  correctionCount?: number;
+  payloadUtf8Bytes?: number;
+  questionMarks?: number;
+  replacementCharacters?: number;
 }
 
 /** Node 侧无 KV，遥测直接丢弃。 */

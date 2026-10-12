@@ -130,26 +130,44 @@ export const suite: Suite = {
           content:
             `先用mcp__web__fetchGithubReadme读取goldenhawksu/sider2claude。失败需改用mcp__web__webReader读取https://raw.githubusercontent.com/goldenhawksu/sider2claude/main/README_CN.md。读取后写入事实JSON到${path}，最后报告完成。`,
         }];
-        for (let round = 0; round < 4; round++) {
+        let writtenContent = '';
+        let verifiedReadback = false;
+        let completed = false;
+        for (let round = 0; round < 6; round++) {
+          const expected = ['mcp__web__fetchGithubReadme', 'mcp__web__webReader', 'Write'][round];
           const result = await api.post('/v1/messages', {
             model,
             tools,
+            tool_choice: round >= 3 ? { type: 'none' } : { type: 'tool', name: expected },
             messages,
             max_tokens: 4096,
           });
           assertStatus(result, 200);
           const call = toolUseOf(result.json);
-          if (round === 3) {
+          if (round >= 3 && call?.name === 'Read') {
+            assertEquals(call.input.file_path, path, '自动回读目标');
+            const display = writtenContent.split(/\r?\n/).map((line, index) =>
+              `${index + 1}\t${line}`
+            ).join('\n');
+            messages.push({ role: 'assistant', content: result.json.content }, {
+              role: 'user',
+              content: [{ type: 'tool_result', tool_use_id: call.id, content: display }],
+            });
+            verifiedReadback = true;
+            continue;
+          }
+          if (round >= 3) {
             assertEquals(result.json.stop_reason, 'end_turn');
             assertTrue(!call, '完成后不重复调用');
+            completed = true;
             break;
           }
-          const expected = ['mcp__web__fetchGithubReadme', 'mcp__web__webReader', 'Write'][round];
           assertEquals(call?.name, expected);
           if (round === 2) {
             assertEquals(call.input.file_path, path);
             assertTrue(call.input.content.includes(marker), '正文保留工具事实标记');
             JSON.parse(call.input.content);
+            writtenContent = call.input.content;
           }
           const content = round === 0
             ? 'README not found or repository does not exist'
@@ -166,7 +184,8 @@ export const suite: Suite = {
             }],
           });
         }
-        return '四轮主控流程收敛；合成工具结果明确标识，未执行用户文件操作';
+        assertTrue(completed, '工具流程在有限轮次内收敛');
+        return `主控流程收敛；合成工具结果明确标识；写后回读=${verifiedReadback}`;
       },
     })),
     ...models.map((model) => ({
@@ -227,6 +246,7 @@ export const suite: Suite = {
         const result = await api.post('/v1/messages', {
           model: models[0],
           tools: bigTools,
+          tool_choice: { type: 'tool', name: 'Read' },
           system,
           messages: [{ role: 'user', content: '请先读取规范规定的唯一技能文件路径，用Read调用。' }],
           max_tokens: 2048,

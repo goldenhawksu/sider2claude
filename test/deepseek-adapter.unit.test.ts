@@ -268,7 +268,7 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     expect(response.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_real' });
   });
 
-  test('有工具时注入防模仿提示词，点名实际在用的转录格式', async () => {
+  test('按工具能力注入稳定的协议提示词', async () => {
     const calls = stubUpstreamContent([{ type: 'text', text: 'ok' }]);
 
     await newAdapter().sendRequest({
@@ -284,6 +284,22 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
     expect(systemContent).toContain('Tool protocol:');
     expect(systemContent).toContain('[tool_use:Name]');
     expect(calls[0].body.messages[0].content as string).not.toContain('Tool protocol:');
+
+    await newAdapter().sendRequest({
+      model: 'claude-opus-4.6',
+      messages: [{ role: 'user', content: '读取网页' }],
+      max_tokens: 128,
+      tools: [{
+        name: 'mcp__webReader__read',
+        input_schema: {
+          type: 'object',
+          properties: { url: { type: 'string' } },
+          required: ['url'],
+        },
+      }],
+    } as unknown as AnthropicRequest);
+    expect(String(calls[1].body.system)).toContain('do not use the server-side built-in webReader');
+    expect(systemContent).not.toContain('server-side built-in webReader');
   });
 
   test('无工具时不注入提示词', async () => {

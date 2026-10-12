@@ -46,6 +46,23 @@ export interface SiderTelemetryRecord {
   hasTools: boolean;
   /** 是否从文本还原出了 tool_use（Max 策略下有意义）。 */
   restoredToolUse: boolean;
+  /** 主控模式的处理阶段；其他策略可不填。 */
+  phase?: 'upstream' | 'context_upload' | 'tool_selection';
+  /** 不含正文的语义结果分类。 */
+  outcome?:
+    | 'connect_retry'
+    | 'upstream_error'
+    | 'context_accepted'
+    | 'context_unconfirmed'
+    | 'tool_protocol_refused'
+    | 'forced_tool_missing'
+    | 'invalid_tool_intent'
+    | 'tool_restored'
+    | 'text_answer';
+  correctionCount?: number;
+  payloadUtf8Bytes?: number;
+  questionMarks?: number;
+  replacementCharacters?: number;
 }
 
 /** 当前小时的写入计数，进程内节流。 */

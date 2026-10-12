@@ -53,7 +53,17 @@ export const suite: Suite = {
       const tool = toolUseOf(response.json);
       assertEquals(tool?.name, 'Write', '客户端工具');
       assertEquals(tool.input.file_path, path, '目标路径必须完全相同');
-      const parsed = JSON.parse(tool.input.content);
+      let parsed: { project: string; items: unknown[] };
+      try {
+        parsed = JSON.parse(tool.input.content);
+      } catch (error) {
+        const preview = String(tool.input.content).replace(/\s+/g, ' ').slice(0, 500);
+        throw new Error(
+          `Write正文不是合法JSON（${String(tool.input.content).length}字符）：${
+            error instanceof Error ? error.message : String(error)
+          }；预览=${preview}`,
+        );
+      }
       assertEquals(
         JSON.stringify(parsed),
         JSON.stringify(JSON.parse(data)),

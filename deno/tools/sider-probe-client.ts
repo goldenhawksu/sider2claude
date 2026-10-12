@@ -43,10 +43,15 @@ export interface AskResult {
 
 let lastRequestAt = 0;
 
-function buildBody(text: string, cid: string, parent: string): Record<string, unknown> {
+function buildBody(
+  text: string,
+  cid: string,
+  parent: string,
+  model = probeModel,
+): Record<string, unknown> {
   const body: Record<string, unknown> = {
     cid,
-    model: probeModel,
+    model,
     from: 'chat',
     filter_search_history: false,
     chat_models: [],
@@ -65,8 +70,13 @@ function buildBody(text: string, cid: string, parent: string): Record<string, un
   return body;
 }
 
-async function sendOnce(text: string, cid: string, parent: string): Promise<AskResult> {
-  const body = buildBody(text, cid, parent);
+async function sendOnce(
+  text: string,
+  cid: string,
+  parent: string,
+  model = probeModel,
+): Promise<AskResult> {
+  const body = buildBody(text, cid, parent, model);
   const bytes = JSON.stringify(body).length;
   const started = Date.now();
 
@@ -170,17 +180,27 @@ async function sendOnce(text: string, cid: string, parent: string): Promise<AskR
 /** 带节流与 1135 冷却重试的请求。 */
 export async function askSider(
   text: string,
-  options: { cid?: string; parent?: string } = {},
+  options: { cid?: string; parent?: string; model?: string } = {},
 ): Promise<AskResult> {
   const since = Date.now() - lastRequestAt;
   if (lastRequestAt && since < paceMs) {
     await sleep(paceMs - since);
   }
 
-  let result = await sendOnce(text, options.cid ?? '', options.parent ?? '');
+  let result = await sendOnce(
+    text,
+    options.cid ?? '',
+    options.parent ?? '',
+    options.model ?? probeModel,
+  );
   for (let attempt = 0; attempt < maxRetries && result.kind === 'throttled'; attempt += 1) {
     await sleep(cooldownMs);
-    result = await sendOnce(text, options.cid ?? '', options.parent ?? '');
+    result = await sendOnce(
+      text,
+      options.cid ?? '',
+      options.parent ?? '',
+      options.model ?? probeModel,
+    );
   }
 
   lastRequestAt = Date.now();
