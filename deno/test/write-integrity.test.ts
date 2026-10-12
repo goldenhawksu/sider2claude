@@ -1,5 +1,46 @@
 import { AnthropicApiAdapter, AnthropicBackendError } from '../src/adapters/anthropic-adapter.ts';
 import { parseTextualToolUseLine } from '../src/utils/textual-tool-use.ts';
+import {
+  runWriteRecoveryCase,
+  runWriteStreamRecoveryCase,
+  WRITE_RECOVERY_CASES,
+} from './fixtures/write-recovery.ts';
+import { Hono } from 'hono';
+
+for (const corrected of [true, false]) {
+  Deno.test(`Write HTTP/SSE：纠错${corrected ? '成功' : '失败'}的客户端执行边界`, async () => {
+    const vars = {
+      S2C_DISABLE_DOTENV: 'true',
+      AUTH_TOKEN: 'test-token-12345',
+      DEEPSEEK_API_KEY: 'test-key',
+      DEEPSEEK_BASE_URL: 'https://write.example',
+      DEEPSEEK_MODEL: 'glm-5.3-flash',
+      DEFAULT_BACKEND: 'deepseek',
+      SIDER_AUTH_TOKEN: '',
+      SIDER_CONTROLLER: 'false',
+    };
+    const previous = new Map(Object.keys(vars).map((key) => [key, Deno.env.get(key)]));
+    try {
+      for (const [key, value] of Object.entries(vars)) Deno.env.set(key, value);
+      const { hybridMessagesRouter } = await import(
+        `../src/routes/messages-hybrid.ts?write=${crypto.randomUUID()}`
+      );
+      const app = new Hono();
+      app.route('/v1/messages', hybridMessagesRouter);
+      await runWriteStreamRecoveryCase((request) =>
+        app.request('/v1/messages', {
+          method: 'POST',
+          headers: { authorization: 'Bearer test-token-12345', 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        }), corrected);
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) Deno.env.delete(key);
+        else Deno.env.set(key, value);
+      }
+    }
+  });
+}
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new Error(message);
@@ -21,6 +62,10 @@ const adapter = () =>
     apiKey: 'test-key',
     model: 'glm-5.3-flash',
   });
+
+for (const sample of WRITE_RECOVERY_CASES) {
+  Deno.test(`Write 纠错边界：${sample.name}`, () => runWriteRecoveryCase(adapter(), sample));
+}
 
 Deno.test('Write：嵌套 file_path/content 的引号错误不能被猜测修补', () => {
   for (

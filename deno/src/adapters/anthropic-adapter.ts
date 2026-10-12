@@ -25,9 +25,11 @@ import { getEnv } from '../utils/env.ts';
 import {
   collectHistoryToolUseIds,
   collectToolInputKeys,
+  hasBareWriteToolUse,
   isValidWriteInput,
   normalizeTextualToolUseBlocks,
 } from '../utils/textual-tool-use.ts';
+import { validDeclaredToolInput } from '../utils/tool-input-validation.ts';
 import { applyStopSequences } from '../utils/stop-sequences.ts';
 import { toClientContent } from '../utils/client-content.ts';
 import {
@@ -58,7 +60,9 @@ export class AnthropicBackendError extends Error {
   }
 }
 
-class InvalidWriteToolInputError extends AnthropicBackendError {}
+class InvalidWriteToolInputError extends AnthropicBackendError {
+  response?: Record<string, unknown>;
+}
 
 export class AnthropicApiAdapter {
   private baseUrl: string;
@@ -103,7 +107,7 @@ export class AnthropicApiAdapter {
       first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront);
     } catch (error) {
       const retryRequest = error instanceof InvalidWriteToolInputError
-        ? this.buildWriteRetryRequest(request)
+        ? this.buildWriteRetryRequest(request, error.response)
         : undefined;
       if (!retryRequest) throw error;
 
@@ -114,7 +118,7 @@ export class AnthropicApiAdapter {
       }, 'Retrying invalid Write as one forced structured tool call');
       effectiveRequest = retryRequest;
       try {
-        first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront);
+        first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront, true);
       } catch (retryError) {
         if (retryError instanceof InvalidWriteToolInputError) {
           logError('invalid_write_tool_input_retry_failed', {
@@ -160,12 +164,21 @@ export class AnthropicApiAdapter {
     }
   }
 
-  private buildWriteRetryRequest(request: AnthropicRequest): AnthropicRequest | undefined {
+  private buildWriteRetryRequest(
+    request: AnthropicRequest,
+    response?: Record<string, unknown>,
+  ): AnthropicRequest | undefined {
     const write = request.tools?.find((tool) => tool.name.toLowerCase() === 'write');
+    const content = Array.isArray(response?.content) ? response.content : [];
     if (
       !write || request.tool_choice?.type === 'none' ||
       (request.tool_choice?.type === 'tool' &&
-        request.tool_choice.name.toLowerCase() !== write.name.toLowerCase())
+        request.tool_choice.name.toLowerCase() !== write.name.toLowerCase()) ||
+      // 服务端工具可能已经产生副作用，不能为纠正 Write 重放整轮上游执行。
+      content.some((block) =>
+        block && typeof block === 'object' &&
+        (block.type === 'server_tool_use' || 'tool_use_id' in block)
+      )
     ) return undefined;
 
     const instruction =
@@ -176,14 +189,50 @@ export class AnthropicApiAdapter {
     return {
       ...request,
       system: request.system ? `${request.system}\n\n${instruction}` : instruction,
+      tools: [write],
+      messages: [...request.messages, {
+        role: 'assistant',
+        content: 'Rejected response; no client tool was executed:\n' +
+          JSON.stringify(
+            content.filter((block) => block?.type === 'text' || block?.type === 'tool_use'),
+          ),
+      }, { role: 'user', content: instruction }],
       tool_choice: { type: 'tool', name: write.name },
     };
+  }
+
+  /** 纠错轮必须返回单个新的原生 Write，不能把自述完成或文本转录当成写入成功。 */
+  private validateWriteRetryResponse(data: unknown, request: AnthropicRequest): void {
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+    const content = Array.isArray(raw.content) ? raw.content : [];
+    const calls = content.filter((block) => block?.type === 'tool_use');
+    const call = calls[0];
+    if (
+      calls.length !== 1 || request.tool_choice?.type !== 'tool' ||
+      call?.name !== request.tool_choice.name ||
+      typeof call?.id !== 'string' || !call.id.trim() ||
+      collectHistoryToolUseIds(request.messages).has(call.id) ||
+      !isValidWriteInput(call.input) ||
+      !validDeclaredToolInput(request.tools, call.name, call.input) ||
+      (raw.stop_reason !== 'end_turn' && raw.stop_reason !== 'tool_use') ||
+      content.some((block) =>
+        block && typeof block === 'object' &&
+        (block.type === 'server_tool_use' || 'tool_use_id' in block)
+      )
+    ) {
+      throw new InvalidWriteToolInputError(
+        '上游 Write 纠错仍未返回单个新的完整结构化调用，已阻止执行。',
+        502,
+        this.provider,
+      );
+    }
   }
 
   private async sendOnce(
     request: AnthropicRequest,
     logContext: RequestLogContext | undefined,
     disableThinking: boolean,
+    requireStructuredWrite = false,
   ): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
@@ -239,6 +288,7 @@ export class AnthropicApiAdapter {
           upstreamStream: true,
         });
       });
+      if (requireStructuredWrite) this.validateWriteRetryResponse(data, request);
       const normalized = this.restoreExactWriteInput(
         this.normalizeResponse(
           data,
@@ -250,6 +300,8 @@ export class AnthropicApiAdapter {
           // 上游若仍吐出转录格式的一行，那是它没听指令，还原它等于替上游把禁令推翻。
           request.tool_choice?.type !== 'none',
           request.stop_sequences,
+          request.tool_choice?.type !== 'tool' ||
+            request.tool_choice.name.toLowerCase() === 'write',
         ),
         request,
         logContext,
@@ -624,6 +676,7 @@ export class AnthropicApiAdapter {
     toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
     allowTextualToolUse = true,
     stopSequences?: string[],
+    allowBareWrite = true,
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -638,13 +691,41 @@ export class AnthropicApiAdapter {
       throw new Error(`${this.provider} API error: ${message}`);
     }
 
-    const content = this.normalizeContent(
-      raw.content,
-      logContext,
-      historyToolUseIds,
-      toolInputKeys,
-      allowTextualToolUse,
-    );
+    let content: AnthropicResponseContent[];
+    try {
+      if (
+        allowBareWrite && allowTextualToolUse && toolInputKeys?.has('Write') &&
+        Array.isArray(raw.content) &&
+        !raw.content.some((block) =>
+          block?.type === 'tool_use' && typeof block.name === 'string' &&
+          block.name.toLowerCase() === 'write'
+        ) &&
+        raw.content.some((block) =>
+          block?.type === 'text' && typeof block.text === 'string' &&
+          hasBareWriteToolUse(block.text)
+        )
+      ) {
+        logWarn('unstructured_write_tool_input', {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+        });
+        throw new InvalidWriteToolInputError(
+          '上游 Write 写入意图以普通文本返回，尚未执行；需要原生结构化调用。',
+          502,
+          this.provider,
+        );
+      }
+      content = this.normalizeContent(
+        raw.content,
+        logContext,
+        historyToolUseIds,
+        toolInputKeys,
+        allowTextualToolUse,
+      );
+    } catch (error) {
+      if (error instanceof InvalidWriteToolInputError) error.response = raw;
+      throw error;
+    }
     const usage = this.normalizeUsage(raw.usage);
     const stopReason = this.normalizeStopReason(raw.stop_reason);
 

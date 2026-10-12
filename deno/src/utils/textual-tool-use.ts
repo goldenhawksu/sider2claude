@@ -407,6 +407,37 @@ function looksLikeWindowsPath(body: string): boolean {
 export const TEXTUAL_TOOL_LINE_SHAPE =
   /^(Previous assistant tool (?:request|run):\s*name=\S+\s+id=\S+\s+input_json=\{|\[tool_use:[^\]]+\]\s+id=\S+\s+input=\{)/;
 
+/** 裸 Write 仅作为纠错信号，绝不直接从无标识的普通文本创建可执行调用。 */
+export function hasBareWriteToolUse(text: string): boolean {
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    // 跳过代码围栏、行内代码及引用字符串，避免把文档示例当作写入意图。
+    if (char === '`' || (char === '~' && text.startsWith('~~~', index))) {
+      let end = index + 1;
+      while (text[end] === char) end += 1;
+      const delimiter = text.slice(index, end);
+      const close = text.indexOf(delimiter, end);
+      if (close === -1) return false;
+      index = close + delimiter.length - 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      let end = index + 1;
+      for (; end < text.length; end += 1) {
+        if (text[end] === '\\') end += 1;
+        else if (text[end] === char) break;
+      }
+      if (end < text.length) index = end;
+      continue;
+    }
+    if (
+      (index === 0 || /\s/.test(text[index - 1]!)) &&
+      /^Write\s*\{\s*"(?:file_path|content|content_truncated)"\s*:/.test(text.slice(index))
+    ) return true;
+  }
+  return false;
+}
+
 /**
  * 采集各工具 `input_schema` 声明的合法键。
  *
