@@ -41,6 +41,27 @@ Deno.test('Write：嵌套 file_path/content 的引号错误不能被猜测修补
   }
 });
 
+Deno.test('Write：可确定恢复 SVG/XML 裸属性引号、Windows 路径和换行', () => {
+  const actual = parseTextualToolUseLine(
+    String
+      .raw`[tool_use:Write] id=svg_1 input={"file_path":"D:\AI_Coder\slides\01_cover.svg","content":"<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"></svg>"}`,
+    KEYS,
+  );
+  assert(actual?.type === 'tool_use', 'SVG Write 必须恢复为工具调用');
+  if (actual?.type === 'tool_use') {
+    assert(actual.id === 'svg_1' && actual.name === 'Write', '工具标识必须保持');
+    assert(
+      actual.input.file_path === String.raw`D:\AI_Coder\slides\01_cover.svg`,
+      'Windows 路径必须逐字恢复',
+    );
+    assert(
+      actual.input.content ===
+        '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"></svg>',
+      'SVG 属性引号和换行必须逐字恢复',
+    );
+  }
+});
+
 Deno.test('Write：结构化和严格文本长参数逐字保留，12 项 manifest 可解析', async () => {
   const originalFetch = globalThis.fetch;
   const input = {
@@ -172,6 +193,118 @@ Deno.test('Write：显式逐字边界从用户原文恢复路径和正文，不�
       assert(response.content[0].input.file_path === input.file_path, '路径取用户明确原文');
       assert(response.content[0].input.content === input.content, '正文取用户明确边界');
     }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('Write：参数截断或带额外字段时只纠错一次并返回完整结构化调用', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: any[] = [];
+  const expected = { file_path: 'D:/slides/design.md', content: '# 完整设计说明\n正文' };
+  try {
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const input = requests.length === 1
+        ? { file_path: expected.file_path, content: '# 不完整', content_truncated: true }
+        : expected;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{ type: 'tool_use', id: `write_${requests.length}`, name: 'Write', input }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+
+    const response = await adapter().sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [WRITE],
+      messages: [{ role: 'user', content: '写设计说明' }],
+    });
+    assert(requests.length === 2, '无效 Write 只能重试一次');
+    assert(String(requests[1].system).includes('Write correction:'), '重试必须携带纠错契约');
+    assert(
+      String(requests[1].messages.at(-1).content).includes('Tool choice requirement:'),
+      '重试必须强制选择 Write',
+    );
+    const actual = response.content[0];
+    assert(actual.type === 'tool_use', '重试必须返回结构化 Write');
+    if (actual.type === 'tool_use') {
+      assert(actual.id === 'write_2' && actual.name === 'Write', '必须采用第二次完整调用');
+      assert(
+        actual.input.file_path === expected.file_path && actual.input.content === expected.content,
+        '重试后的路径和正文必须完整',
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test('Write：纠错仍无效时停止重试，非 Write 失败不触发纠错', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    let writeCalls = 0;
+    globalThis.fetch = (() => {
+      writeCalls += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'tool_use',
+              id: `bad_${writeCalls}`,
+              name: 'Write',
+              input: { file_path: 'D:/slides/design.md', content_truncated: '# 不完整' },
+            }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+    let writeError: unknown;
+    try {
+      await adapter().sendRequest({
+        model: 'claude-sonnet-5.5',
+        tools: [WRITE],
+        messages: [{ role: 'user', content: '写设计说明' }],
+      });
+    } catch (error) {
+      writeError = error;
+    }
+    assert(writeError instanceof AnthropicBackendError, '第二次无效 Write 必须明确失败');
+    assert(writeCalls === 2, 'Write 纠错失败后不能继续重试');
+
+    let readCalls = 0;
+    globalThis.fetch = (() => {
+      readCalls += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{ type: 'text', text: '[tool_use:Read] id=read_1 input={"file_path":' }],
+            stop_reason: 'end_turn',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+    const response = await adapter().sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [{
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path'],
+        },
+      }],
+      messages: [{ role: 'user', content: '读取文件' }],
+    });
+    assert(readCalls === 1, '非 Write 失败不得触发纠错重试');
+    assert(response.stop_reason === 'end_turn', '非 Write 行为必须保持原样');
   } finally {
     globalThis.fetch = originalFetch;
   }

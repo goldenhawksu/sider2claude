@@ -30,6 +30,24 @@ test('Write 非严格 JSON 中的嵌套字段不得覆盖路径或截断正文',
   }
 });
 
+test('Write 可确定恢复 SVG/XML 裸属性引号、Windows 路径和换行', () => {
+  const actual = parseTextualToolUseLine(
+    String
+      .raw`[tool_use:Write] id=svg_1 input={"file_path":"D:\AI_Coder\slides\01_cover.svg","content":"<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"></svg>"}`,
+    KEYS,
+  );
+  expect(actual).toEqual({
+    type: 'tool_use',
+    id: 'svg_1',
+    name: 'Write',
+    input: {
+      file_path: String.raw`D:\AI_Coder\slides\01_cover.svg`,
+      content:
+        '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720"></svg>',
+    },
+  });
+});
+
 test('合法长 Write 的路径和正文完全保留，包括同名字段、引号、反斜杠、中文和换行', async () => {
   const originalFetch = globalThis.fetch;
   const file_path = String.raw`d:\AI_Coder\ppt-master\projects\用户文档\images\image_prompts.json`;
@@ -187,6 +205,127 @@ test('显式逐字边界从用户原文恢复Write路径和正文', async () => 
       name: 'Write',
       input,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Write 参数截断或带额外字段时只纠错一次并返回完整结构化调用', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: any[] = [];
+  const expected = { file_path: 'D:/slides/design.md', content: '# 完整设计说明\n正文' };
+  try {
+    globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)));
+      const input = requests.length === 1
+        ? { file_path: expected.file_path, content: '# 不完整', content_truncated: true }
+        : expected;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{ type: 'tool_use', id: `write_${requests.length}`, name: 'Write', input }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+
+    const response = await new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'anthropic-compatible',
+      baseUrl: 'https://write.example',
+      apiKey: 'test-key',
+      model: 'glm-5.3-flash',
+    }).sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [WRITE],
+      messages: [{ role: 'user', content: '写设计说明' }],
+    });
+
+    expect(requests).toHaveLength(2);
+    expect(String(requests[1].system)).toContain('Write correction:');
+    expect(String(requests[1].messages.at(-1).content)).toContain('Tool choice requirement:');
+    expect(response.content[0]).toEqual({
+      type: 'tool_use',
+      id: 'write_2',
+      name: 'Write',
+      input: expected,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Write 纠错仍无效时停止重试，非 Write 失败不触发纠错', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    let writeCalls = 0;
+    globalThis.fetch = (() => {
+      writeCalls += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{
+              type: 'tool_use',
+              id: `bad_${writeCalls}`,
+              name: 'Write',
+              input: { file_path: 'D:/slides/design.md', content_truncated: '# 不完整' },
+            }],
+            stop_reason: 'tool_use',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+    await expect(
+      new AnthropicApiAdapter({
+        enabled: true,
+        provider: 'anthropic-compatible',
+        baseUrl: 'https://write.example',
+        apiKey: 'test-key',
+        model: 'glm-5.3-flash',
+      }).sendRequest({
+        model: 'claude-sonnet-5.5',
+        tools: [WRITE],
+        messages: [{ role: 'user', content: '写设计说明' }],
+      }),
+    ).rejects.toBeInstanceOf(AnthropicBackendError);
+    expect(writeCalls).toBe(2);
+
+    let readCalls = 0;
+    globalThis.fetch = (() => {
+      readCalls += 1;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            content: [{ type: 'text', text: '[tool_use:Read] id=read_1 input={"file_path":' }],
+            stop_reason: 'end_turn',
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        ),
+      );
+    }) as typeof fetch;
+    const response = await new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'anthropic-compatible',
+      baseUrl: 'https://write.example',
+      apiKey: 'test-key',
+      model: 'glm-5.3-flash',
+    }).sendRequest({
+      model: 'claude-sonnet-5.5',
+      tools: [{
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path'],
+        },
+      }],
+      messages: [{ role: 'user', content: '读取文件' }],
+    });
+    expect(readCalls).toBe(1);
+    expect(response.stop_reason).toBe('end_turn');
   } finally {
     globalThis.fetch = originalFetch;
   }

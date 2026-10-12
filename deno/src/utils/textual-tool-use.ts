@@ -588,9 +588,8 @@ export function parseTextualToolUseLine(
   }
 
   try {
-    // Write 的正文可能包含同名字段，猜测引号边界会覆盖路径或截断正文。
     const input = name.toLowerCase() === 'write'
-      ? JSON.parse(inputText)
+      ? parseWriteToolInputJson(inputText)
       : parseLooseToolInputJson(inputText, toolInputKeys?.get(name));
     if (name.toLowerCase() === 'write' && !isValidWriteInput(input)) return undefined;
     if (!input) {
@@ -602,6 +601,67 @@ export function parseTextualToolUseLine(
       name,
       input: asRecord(input),
     };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write 先走严格 JSON；仅对 `file_path` 在前、`content` 在末的双字段对象恢复裸引号。
+ * 该顺序让正文边界由对象末尾唯一确定；出现疑似额外 JSON 字段时仍拒绝，避免覆盖路径或截断正文。
+ */
+function parseWriteToolInputJson(inputText: string): unknown {
+  try {
+    return JSON.parse(inputText);
+  } catch {
+    // SVG/XML 属性引号经文本转录后可能失去转义，继续尝试 Write 专属恢复。
+  }
+
+  const match = inputText.match(
+    /^\{\s*"file_path"\s*:\s*"((?:\\[\s\S]|[^"\\])*)"\s*,\s*"content"\s*:\s*"([\s\S]*)"\s*\}\s*$/,
+  );
+  if (!match || hasAmbiguousWriteFieldBoundary(match[2] ?? '')) return undefined;
+
+  const filePath = decodeWriteStringBody(match[1] ?? '', false);
+  const content = decodeWriteStringBody(match[2] ?? '', true);
+  if (filePath === undefined || content === undefined) return undefined;
+  return { file_path: filePath, content };
+}
+
+/** 裸正文中出现 `","key":` 形状时无法区分正文与额外顶层字段，保持阻断。 */
+function hasAmbiguousWriteFieldBoundary(body: string): boolean {
+  for (let index = 0; index < body.length; index += 1) {
+    if (body[index] !== '"') continue;
+    let slashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && body[cursor] === '\\'; cursor -= 1) slashes += 1;
+    if (slashes % 2 === 1) continue;
+    if (/^"\s*,\s*"[A-Za-z_][\w-]*"\s*:/.test(body.slice(index))) return true;
+  }
+  return false;
+}
+
+function decodeWriteStringBody(body: string, allowRawQuotes: boolean): string | undefined {
+  let escaped = '';
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index]!;
+    if (char === '\\') {
+      escaped += char + (body[index + 1] ?? '');
+      index += 1;
+    } else if (allowRawQuotes && char === '"') {
+      escaped += '\\"';
+    } else if (char === '\n') {
+      escaped += '\\n';
+    } else if (char === '\r') {
+      escaped += '\\r';
+    } else if (char === '\t') {
+      escaped += '\\t';
+    } else {
+      escaped += char;
+    }
+  }
+  try {
+    const value = JSON.parse(repairJsonBackslashes(`"${escaped}"`));
+    return typeof value === 'string' ? value : undefined;
   } catch {
     return undefined;
   }
@@ -619,7 +679,9 @@ export function asRecord(value: unknown): Record<string, unknown> {
 export function isValidWriteInput(input: unknown): boolean {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return false;
   const args = input as Record<string, unknown>;
-  return typeof args.file_path === 'string' && args.file_path.trim().length > 0 &&
+  const keys = Object.keys(args);
+  return keys.length === 2 && keys.includes('file_path') && keys.includes('content') &&
+    typeof args.file_path === 'string' && args.file_path.trim().length > 0 &&
     typeof args.content === 'string' &&
     !(/^[A-Za-z]:/.test(args.file_path) && /[\x00-\x1f]/.test(args.file_path));
 }

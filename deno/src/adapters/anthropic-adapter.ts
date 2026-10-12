@@ -58,6 +58,8 @@ export class AnthropicBackendError extends Error {
   }
 }
 
+class InvalidWriteToolInputError extends AnthropicBackendError {}
+
 export class AnthropicApiAdapter {
   private baseUrl: string;
   private apiKey: string;
@@ -95,7 +97,35 @@ export class AnthropicApiAdapter {
     const disabledUpFront = request.thinking?.type === 'disabled' ||
       (!callerWantsThinking && shouldDisableThinking(key, request.max_tokens));
 
-    const first = await this.sendOnce(request, logContext, disabledUpFront);
+    let effectiveRequest = request;
+    let first: AnthropicResponse;
+    try {
+      first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront);
+    } catch (error) {
+      const retryRequest = error instanceof InvalidWriteToolInputError
+        ? this.buildWriteRetryRequest(request)
+        : undefined;
+      if (!retryRequest) throw error;
+
+      logWarn('invalid_write_tool_input_retry', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        upstreamModel: this.upstreamModel,
+      }, 'Retrying invalid Write as one forced structured tool call');
+      effectiveRequest = retryRequest;
+      try {
+        first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront);
+      } catch (retryError) {
+        if (retryError instanceof InvalidWriteToolInputError) {
+          logError('invalid_write_tool_input_retry_failed', {
+            ...this.contextFields(logContext),
+            provider: this.provider,
+            upstreamModel: this.upstreamModel,
+          });
+        }
+        throw retryError;
+      }
+    }
 
     // 已经关过 thinking 还命中，说明不是这个缺陷；调用方自己要的推理也不动；
     // 上游明确拒绝过 disabled 的，重试只会再吃一个 400。
@@ -115,7 +145,7 @@ export class AnthropicApiAdapter {
     }, 'Upstream spent the whole token budget on thinking; retrying with thinking disabled');
 
     try {
-      return await this.sendOnce(request, logContext, true);
+      return await this.sendOnce(effectiveRequest, logContext, true);
     } catch (error) {
       // 上游不认这个参数（或重试本身失败）——把原响应交回去，至少不比不重试更糟。
       if (error instanceof AnthropicBackendError && error.statusCode === 400) {
@@ -128,6 +158,26 @@ export class AnthropicApiAdapter {
       }, 'Retry with thinking disabled failed; returning the original response');
       return first;
     }
+  }
+
+  private buildWriteRetryRequest(request: AnthropicRequest): AnthropicRequest | undefined {
+    const write = request.tools?.find((tool) => tool.name.toLowerCase() === 'write');
+    if (
+      !write || request.tool_choice?.type === 'none' ||
+      (request.tool_choice?.type === 'tool' &&
+        request.tool_choice.name.toLowerCase() !== write.name.toLowerCase())
+    ) return undefined;
+
+    const instruction =
+      'Write correction: the previous Write arguments were invalid and were not executed. ' +
+      'Retry exactly once using one native structured tool_use for the declared Write tool. ' +
+      'Its input must contain exactly two complete JSON string fields: file_path and content. ' +
+      'Do not emit a textual tool transcript, content_truncated, extra fields, or explanatory text.';
+    return {
+      ...request,
+      system: request.system ? `${request.system}\n\n${instruction}` : instruction,
+      tool_choice: { type: 'tool', name: write.name },
+    };
   }
 
   private async sendOnce(
@@ -692,7 +742,7 @@ export class AnthropicApiAdapter {
           typeof item.name === 'string' && item.name.toLowerCase() === 'write' &&
           !isValidWriteInput(item.input)
         ) {
-          throw new AnthropicBackendError(
+          throw new InvalidWriteToolInputError(
             '上游 Write 参数无效，已阻止写入；file_path 和 content 必须为完整字符串。',
             502,
             this.provider,
@@ -732,7 +782,7 @@ export class AnthropicApiAdapter {
         provider: this.provider,
         count: converted.unparsedWriteCount,
       });
-      throw new AnthropicBackendError(
+      throw new InvalidWriteToolInputError(
         '上游文本 Write 参数不是严格 JSON 或不完整，已阻止本轮工具执行；请重新生成结构化 Write 调用。',
         502,
         this.provider,
