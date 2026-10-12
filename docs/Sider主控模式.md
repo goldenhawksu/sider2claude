@@ -62,10 +62,14 @@ Claude Code 客户端模板：`config/claude-code.sider-controller.json.example`
 | SIDER_CONTROLLER | `true` 启用独立主控模式；未设则维持现有路由 |
 | SIDER_CONTROLLER_STORAGE | Deno 使用 `kv`，Bun 使用 `sqlite`；`memory` 仅用于隔离测试 |
 | SIDER_CONTROLLER_KV_PATH | Deno 本地可指定 `.runtime` 内数据库；Deploy 留空连接关联的 Deno KV |
-| SIDER_CONTROLLER_MAX_INPUT_CHARS | 默认 `6000`，限制实际单次新增输入；更长内容完整分段登记 |
+| SIDER_CONTROLLER_MAX_INPUT_CHARS | Deno 默认 `6000`、Bun 默认 `14000`，限制实际单次新增输入；更长内容完整分段登记 |
 | SIDER_CONTROLLER_PACE_MS | 默认 `12000`，上游流结束后的账号级间隔，来自本次成功探测节奏 |
 | SIDER_REQUEST_TIMEOUT_MS | 默认 `300000`，Sider 上游真实字节的空闲期限 |
 | SIDER_TOTAL_TIMEOUT_MS | 默认 `600000`，独立总期限；客户端 ping 不刷新它 |
+
+Deno 主控默认接管非流式；接管流式还需 `SIDER_CONTROLLER_STREAMING=true`。Bun 主控开启后接管两种格式，未实现单独流式开关。
+
+Deno 存储仅对 `memory` 作测试例外，其余使用 KV。Bun 除 `memory` 外使用固定路径 SQLite，不读取 `SIDER_CONTROLLER_KV_PATH`。统计 `STATS_KV` 与主控存储独立。
 
 Deno Deploy 必须关联可用的 Deno KV。主控状态存储失败会返回错误，不能静默降级为内存并丢失会话。Bun 使用运行目录的 `.runtime/controller.sqlite`，需要可写目录；多个本地进程可共享此数据库。
 

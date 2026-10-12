@@ -1,295 +1,161 @@
-# Sider2Claude
+# Sider2Claude 项目说明
 
-Sider2Claude 是一个面向 Claude Code 的 Anthropic API 兼容代理。当前落地方案是：
+本文按 2026-10-12 的代码提交 `451a4f2` 核对。首次使用请看[用户使用指南](docs/用户使用指南.md)，接口详情见[API 参考](docs/API参考.md)。
 
-- 主模型普通对话由 Sider 提供，模型仍以 Claude/Anthropic 名称对外暴露。
-- 非流式 Controller 可用 Sider 5.5 文本工具契约；流式 Claude Code 工具请求在 SSE 开始前由
-  混合路由交给 Anthropic 兼容能力端，避免不可回退的半截响应。
-- DeepSeek 上游模型固定默认为 `deepseek-v4-flash`，对外响应仍保留客户端请求的 Claude 模型名。
-- DeepSeek 返回的 `thinking` / `redacted_thinking` / `tool_use` 内容块会按 Anthropic Messages
-  结构透传。
-- 转发到 DeepSeek 前会删除顶层 `thinking` 参数，并把历史 `thinking` / `redacted_thinking` /
-  `tool_use` / `tool_result` 内容块转录为普通文本，避免 DeepSeek 在工具续轮中要求完整 thinking
-  passback 而返回 400。
+Sider2Claude 将客户端请求转换为 Sider 文本通道或原生 Anthropic 兼容请求，再输出 Claude Code 可识别的响应。服务支持 Bun 本地运行、Deno 本地运行与 Deno Deploy 部署；Node.js 用于 npm 和 TypeScript 构建工具。
 
-## 当前能力结论
+## 架构与路由
 
-最新 Sider probe 结果：
-
-- Sider 能提供普通文本对话事件：`text`。
-- Sider think 模型能提供推理事件：`reasoning_content`。
-- `claude-opus-5.5`、`claude-sonnet-5.5`、`claude-haiku-5.5` 均通过严格文本工具契约与
-  tool_result 续轮探测，并可完整输出约 9K 文本。
-- Sider 直接输入约 7.7K 中文会返回 603；Controller 使用 6K 安全分段。流式工具请求默认在
-  SSE 开始前走混合路由，非流式 Controller 工具流可用开关单独验证。
-- Controller 工具映射缺失时可从历史指纹与精确 `pending tool_use_id` 自愈检查点，无法安全恢复的
-  工具结果返回 400，避免 409 重试风暴。
-- `StoreContent -> WriteFromRef` 与较长的直接 `Write` 支持写后 Read 回读、字符数与 SHA-256
-  校验；校验失败会在同一 Sider 会话自动使用原正文引用重写，不要求人工新建会话。
-
-相关脚本：
-
-```bash
-deno task probe:sider
+```mermaid
+flowchart TD
+    A["Claude Code / VS Code / cc-switch / API 客户端"] --> B["鉴权与请求规范化"]
+    B --> C{"无工具 XML 安全分类？"}
+    C -->|"是，兼容后端已配置"| D["原生 Anthropic 兼容后端"]
+    C -->|"否"| E{"本运行时的主控开关接管此请求？"}
+    E -->|"是"| F["KV / SQLite 检查点与正文引用"]
+    F --> G["Sider 原模型名与文本工具契约"]
+    E -->|"否"| H["混合路由：conservative / pro / max"]
+    H --> G
+    H --> D
+    G --> I["响应与工具参数校验"]
+    D --> I
+    I --> J["text / thinking / redacted_thinking / tool_use"]
+    J --> K["客户端执行工具，tool_result 续轮"]
 ```
 
-可选筛选：
+两种运行模式：
 
-```bash
-# 只探测一个模型的普通对话
-$env:SIDER_PROBE_MODEL="claude-sonnet-5.5"
-$env:SIDER_PROBE_CASES="simple_chat"
-deno task probe:sider
-```
+| 模式 | 适用行为 |
+| --- | --- |
+| 混合路由，`SIDER_CONTROLLER` 未设或为 `false` | 普通对话优先 Sider；`conservative/pro` 的客户端工具请求走兼容后端；`max` 可先尝试 Sider 文本契约；视觉、长文等按路由能力处理 |
+| Sider 主控，`SIDER_CONTROLLER=true` | 使用严格单行 JSON 工具契约、持久化任务、账号租约、完整上下文分段和正文引用；业务回合由 Sider 处理 |
+| XML 安全分类 | 无工具且 system 同时声明分类用途及 `<block>`／`<severity>` 时，优先使用已配置的原生兼容后端，主控模式也适用；不回退 Sider |
 
-## 架构
+兼容后端统一由 `DEEPSEEK_BASE_URL`、`DEEPSEEK_API_KEY`、`DEEPSEEK_MODEL` 配置。默认入口为 `https://api.deepseek.com/anthropic`，默认模型为 `deepseek-v4-flash`；也可使用 Z.ai 的 `https://api.z.ai/api/anthropic` 与 `glm-5.3-flash`。日志中的后端名 `deepseek` 是内部标识，实际厂商由配置决定。
 
-```text
-Claude Code / Anthropic 客户端
-  |
-  | Anthropic Messages API
-  v
-Sider2Claude
-  |
-  |-- 普通对话 / 非流式 Controller -> Sider 5.5
-  |
-  |-- 流式工具/MCP/tool_use --------> Anthropic 兼容能力端
-```
+## 双运行时差异
 
-核心模块：
+| 项目 | Deno | Bun |
+| --- | --- | --- |
+| 未覆盖时的本地端口 | 8000 | 4141 |
+| 主控非流式请求 | `SIDER_CONTROLLER=true` 时接管 | `SIDER_CONTROLLER=true` 时接管 |
+| 主控流式请求 | 还须 `SIDER_CONTROLLER_STREAMING=true`，否则走混合路由 | 主控开启后直接接管；未实现该流式开关 |
+| 主控默认单次新增输入上限 | 6,000 字符 | 14,000 字符 |
+| 主控持久化 | Deno KV | `.runtime/controller.sqlite` |
+| 用量统计持久化 | 配置 `STATS_KV=kv` 后使用 Deno KV | 进程内统计 |
+| 策略切换与遥测 HTTP 接口 | 提供 `/stats/strategy`、`/stats/telemetry.json` | 当前入口未提供这两个接口 |
+| 普通流式响应 | 按路径使用真实 SSE 或校验后合成 SSE | 主要为完整响应校验后的合成 SSE |
 
-- `src/config/backends.ts` / `deno/src/config/backends.ts`：统一后端配置。
-- `src/config/models.ts` / `deno/src/config/models.ts`：106 个上游模型及 Claude 5.5 默认映射。
-- `src/routing/router-engine.ts` / `deno/src/routing/router-engine.ts`：路由决策。
-- `src/adapters/anthropic-adapter.ts` / `deno/src/adapters/anthropic-adapter.ts`：DeepSeek Anthropic
-  兼容适配器。
-- `src/utils/env.ts` / `deno/src/utils/env.ts`：运行时环境变量 + 根目录 `.env` 统一读取。
+Deno 主控流式是“先完整校验结果，再发内容块”，等待期间每 5 秒发送 ping。收到 `message_start` 或 ping 不代表上游已生成有效回答；成功结束要检查内容、`stop_reason` 和 `message_stop`，错误要检查流内 `error`。
 
-## DeepSeek 工具续轮兼容
+## 配置与启动
 
-DeepSeek 的 Anthropic 兼容端在 thinking 模式下会校验历史 `content[].thinking` 是否完整回传。Claude
-Code 的工具循环可能会压缩或重建历史推理块，导致带 `tool_use` / `tool_result` 的续轮请求被上游拒绝。
+配置优先级为：运行时环境变量 > 第一份存在的 dotenv 文件 > 默认值。两个运行时都先读取 `deno/.env`，不存在才读取根 `.env`；两份文件不会逐字段合并。修改配置后重启服务。
 
-本服务的处理策略是：
-
-- 新工具请求仍以 Anthropic `tools` 结构发给 DeepSeek，让 DeepSeek 原生产生 `tool_use`。
-- 历史工具交互转发前转录为文本，例如 `[tool_use:Bash] ...` 和
-  `[tool_result] ...`，保留上下文但不再触发 thinking passback 校验。
-- DeepSeek 响应中的 `thinking`、`redacted_thinking` 和 `tool_use` 仍保持结构化透传给 Claude Code。
-- `deno/test/deepseek-adapter.test.ts` 覆盖了该行为，提交前运行 `npm run test:regression`。
-
-## 环境配置
-
-根目录 `.env` 可直接作为本地开发配置源。运行时环境变量优先级高于 `.env`。
+在 `deno/.env` 填入自己的凭据，例如：
 
 ```env
 PORT=4141
 AUTH_TOKEN=your-client-token
-
-SIDER_API_URL=https://sider.ai/api/chat/v1/completions
 SIDER_AUTH_TOKEN=your-sider-jwt
-SIDER_CONTROLLER=true
-SIDER_CONTROLLER_STREAMING=false
+SIDER_API_URL=https://sider.ai/api/chat/v1/completions
 
 DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
-DEEPSEEK_API_KEY=your-deepseek-key
+DEEPSEEK_API_KEY=your-compatible-api-key
 DEEPSEEK_MODEL=deepseek-v4-flash
 
+SIDER_CONTROLLER=false
+SIDER_STRATEGY=conservative
 DEFAULT_BACKEND=sider
 AUTO_FALLBACK=true
 PREFER_SIDER_FOR_CHAT=true
 DEBUG_ROUTING=false
-REQUEST_TIMEOUT=30000
 ```
 
-Controller 默认处理非流式长上下文；流式请求由混合路由直接选择可用后端，避免 SSE
-开始后无法回退。只有在验证 Sider 文本工具契约时才设置 `SIDER_CONTROLLER_STREAMING=true`。
-
-兼容旧变量：
-
-- `DEFAULT_BACKEND=anthropic` 会被兼容映射为 `deepseek`。
-
-工具能力兜底上游统一走 `DEEPSEEK_*` 一套配置，**没有 `ANTHROPIC_BASE_URL` /
-`ANTHROPIC_API_KEY` 这两个环境变量**。`DEEPSEEK_BASE_URL` 可指向任意 Anthropic 兼容端：
-要用 Z.AI 的 GLM-5.3，只需把 `DEEPSEEK_BASE_URL` 改成 Z.AI 的 Anthropic 兼容入口、
-`DEEPSEEK_API_KEY` 改成 Z.AI 的 key、`DEEPSEEK_MODEL` 改成 GLM-5.3 的模型名，其余不用动。
-
-不要把真实 token 写入源码或文档。
-
-## 快速启动
-
-Bun 版本：
+从仓库根目录安装并启动；上述示例显式设置了端口，因此两种启动方式都使用 4141：
 
 ```bash
-npm install
+npm ci
 bun run dev
+# 或启动 Deno
+deno task start
 ```
 
-Deno 版本：
-
-```bash
-deno task dev
-```
-
-健康检查：
-
-```bash
-curl http://localhost:4141/health
-```
-
-## Claude Code 配置
-
-本地 Bun 服务：
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:4141
-export ANTHROPIC_AUTH_TOKEN=your-client-token
-export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5.5
-export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5.5
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5.5
-```
-
-Windows PowerShell：
+Windows 健康检查：
 
 ```powershell
-$env:ANTHROPIC_BASE_URL="http://localhost:4141"
-$env:ANTHROPIC_AUTH_TOKEN="your-client-token"
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5.5"
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5.5"
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5.5"
+Invoke-RestMethod http://localhost:4141/health
 ```
 
-`ANTHROPIC_AUTH_TOKEN` 应填写本服务的 `AUTH_TOKEN`，不是 Sider token，也不是 DeepSeek key。
+开启主控时按运行时选择配置模板：
 
-## 支持模型
+- [Deno 主控模板](config/sider-controller.deno.env.example)：Deploy 需关联 Deno KV；本地路径变量在 Deploy 保持未设。
+- [Bun 主控模板](config/sider-controller.bun.env.example)：运行目录必须可写，多个进程可共享同一 SQLite 文件。
+- [Claude Code 客户端模板](config/claude-code.sider-controller.json.example)：客户端 token 填服务端 `AUTH_TOKEN`。
 
-当前对外暴露 106 个 Sider 上游模型；Claude Code 默认使用以下三款：
+主控模板关闭业务自动回退，但 XML 分类仍使用已配置的兼容后端。更多存储与配额配置见[Sider 主控模式](docs/Sider主控模式.md)。
 
-- `claude-opus-5.5`
-- `claude-sonnet-5.5`
-- `claude-haiku-5.5`
+## Claude Code、cc-switch 与 1M 标签
 
-以下旧 Claude 名称仍保留兼容：
+客户端可以直接连接服务，也可以经 cc-switch 代理连接。客户端的 `ANTHROPIC_BASE_URL` 指向 Sider2Claude 地址或 cc-switch 本地代理地址；服务端的上游配置使用 `DEEPSEEK_*`，两者用途不同。
 
-- `claude-3.7-sonnet`
-- `claude-3-7-sonnet`
-- `claude-4-sonnet`
-- `claude-4-sonnet-think`
-- `claude-4.1-opus`
-- `claude-4.1-opus-think`
-- `claude-opus-4.5`
-- `claude-opus-4.5-think`
-- `claude-opus-4.6`
-- `claude-opus-4.6-think`
-- `claude-4.5-sonnet`
-- `claude-4.5-sonnet-think`
-- `claude-sonnet-4.6`
-- `claude-sonnet-4.6-think`
-- `claude-haiku-4.5`
-- `claude-haiku-4.5-think`
-- `claude-3-sonnet`
-- `claude-sonnet`
+```powershell
+$env:ANTHROPIC_BASE_URL='http://localhost:4141'
+$env:ANTHROPIC_AUTH_TOKEN='your-client-token'
+$env:ANTHROPIC_MODEL='claude-sonnet-5.5'
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-5.5'
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-5.5'
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-haiku-5.5'
+```
 
-注意：Sider 账号配额可能让部分 Opus 模型临时返回用量限制，这不影响路由策略本身。
+在 cc-switch 中选择 Claude 的 Anthropic 兼容 provider，填写服务地址、`AUTH_TOKEN` 和模型原名。若开启 1M 声明使请求名变为 `claude-sonnet-5.5[1m]`：
 
-## 测试
+- 发给 Sider 的 `model` 和 `chat_models` 去掉数字 K/M 标签并规范化大小写。
+- 对外响应保留客户端本次请求名。
+- 主控任务、历史、请求重放及限流按基础名共享；只切换窗口标签不会重复派发工具或丢失新版本检查点。
+- 窗口声明不扩大 Sider 的实际输入容量、分段数量或配额。
 
-确定性回归测试：
+修改 provider 后重新启动插件会话，确认请求实际访问所选服务。完整步骤及排障见[用户使用指南](docs/用户使用指南.md)。
+
+## 模型与能力边界
+
+`GET /v1/models` 当前返回 106 个模型，覆盖 Claude、GPT、Gemini、DeepSeek 等家族。以该接口和两份 `config/models.ts` 为准。
+
+模型查找支持 `[1m]`、`[200k]` 等末尾数字窗口标签；这些标签不会新增模型目录条目。混合路由对未知 Claude 名称可按家族映射；主控要求目录中明确登记的模型，否则返回 400。移除的别名可能仍触发混合路由家族映射，但不代表它们是目录条目。
+
+- Sider 原生返回文本、推理及部分服务端工具事件；客户端工具调用由文本契约还原或由兼容后端提供。
+- 主控拒绝图片输入；混合路由将视觉请求优先交给已配置的兼容后端，实际模型需支持视觉。
+- Sider 的 Anthropic token 预算与 thinking 参数没有完整兑现保证；主控 usage 使用字符估算。
+- XML 安全分类保留模型实际判定及错误。它不会替代客户端权限控制，也不会伪造允许结果。
+- `tool_use` 由客户端执行；服务端工具结果则转成客户端可识别的文本记录。
+
+## Write 与 PPT 工作流
+
+合法 Write 参数保留完整路径和正文，包括中文、换行、引号、反斜杠及正文内同名字段。坏 Write JSON 或无效路径不会被猜测修补，并阻止该轮工具下发。
+
+主控可使用内部 `StoreContent → WriteFromRef` 保存并引用完整正文；代理最终装配为客户端 Write。声明 Read 且正文在回读边界内时，写入成功后会继续 Read，比较字符数和 SHA-256；不匹配则保留原引用并要求重写。
+
+兼容适配器还支持显式“逐字／原样／exact”请求中的“目标路径／正文开始／正文结束”边界恢复，但要求模型已经选择可解析的单个 Write，参数仍需通过校验。不能把助手的“已完成”自述当成写入证据。
+
+ppt-master 的模板解析、素材处理、SVG 质量检查和 PPT 导出属于客户端工作流。本项目的集成验证覆盖资料抓取换工具、Write 和工具续轮；完整 PPT 是否生成，应检查客户端产物和质量报告。
+
+## 测试与维护
 
 ```bash
 npm run test:regression
+deno check deno/test/integration/run.ts
+npm run build
+git diff --check
 ```
 
-等价拆分：
+真实集成入口为 `deno/test/integration/run.ts`：默认基础套件 01–13；`E2E_CONTROLLER=true` 时加入 14 和 15。发布门禁设置 `E2E_REQUIRE_ALL_PASS=true`，要求通过数等于执行总数，失败及上游受限都为 0。
 
-```bash
-deno task test
-deno task check
-deno check deno/tools/probe-sider-capabilities.ts
-npm run typecheck
+```powershell
+$env:E2E_BASE_URL='http://localhost:4141'
+$env:E2E_REQUIRE_ALL_PASS='true'
+deno task test:e2e
 ```
 
-服务级黑盒集成测试需要先启动服务：
+主控套件须指向已开启主控的实例，详见[测试指南](test/TEST-README.md)。本次代码基线的证据是 Deno 352/352、Bun 49/49、基础真实集成 88/88、窗口／分类真实集成 3/3；原主控其他实测记录见[主控报告](docs/Sider主控开发与集成回归报告-20261008.md)。这些不同范围的结果不合并冒充一次全套运行。
 
-```bash
-# 终端 1
-bun run dev
-
-# 终端 2
-npm run test:integration
-```
-
-切换测试环境：
-
-```bash
-$env:TEST_ENV="deno-local"
-$env:TEST_API_BASE_URL="http://localhost:8000"
-npm run test:integration
-```
-
-更多说明见 `test/TEST-README.md`。
-
-当前真实外部集成结论：
-
-- `01-health-check`、`02-basic-messages`、`04-streaming`、`05-token-counting` 已在本地 Bun 服务 +
-  真实 Sider/DeepSeek 配置下通过。
-- `03-session-persistence` 中的会话创建与会话统计接口通过；多轮语义断言依赖 Sider
-  上游是否在第二轮按测试提示复述上下文，可能受模型行为与 Sider 会话语义影响而波动。
-
-## API
-
-主要端点：
-
-- `GET /health`
-- `GET /v1/models`
-- `POST /v1/messages`
-- `POST /v1/messages/count_tokens`
-- `GET /v1/messages/backends/status`
-- `GET /v1/messages/conversations`
-- `GET /v1/messages/sider-sessions`
-- `POST /v1/complete`（legacy）
-
-普通消息示例：
-
-```bash
-curl -X POST http://localhost:4141/v1/messages \
-  -H "Authorization: Bearer your-client-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-5.5",
-    "messages": [{"role": "user", "content": "你好"}],
-    "max_tokens": 200
-  }'
-```
-
-以下流式工具请求默认由混合路由选择 Anthropic 兼容能力端；设置
-`SIDER_CONTROLLER_STREAMING=true` 可实验性地改由 Sider Controller 处理：
-
-```bash
-curl -X POST http://localhost:4141/v1/messages \
-  -H "Authorization: Bearer your-client-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-5.5",
-    "messages": [{"role": "user", "content": "运行 pwd"}],
-    "tools": [{
-      "name": "Bash",
-      "description": "Run shell command",
-      "input_schema": {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"]
-      }
-    }],
-    "max_tokens": 200
-  }'
-```
-
-## 维护原则
-
-- 配置统一走 `getEnv()`，避免各模块分别读取 `.env`。
-- 新增模型必须同步 Deno 与 Node/Bun 两套 `models.ts`，并补测试。
-- 涉及工具能力的改动必须覆盖 DeepSeek adapter 与路由测试。
-- DeepSeek adapter 必须兼容响应侧 `text`、`thinking`、`redacted_thinking`、`tool_use`
-  内容块；请求侧历史工具块必须转录为文本以规避 thinking passback 400。
-- 线上 probe 结果可作为报告证据，但真实 token 和临时 JSON 不应提交。
+业务代码位于 `src/` 与 `deno/src/`；核心行为保持同步，运行时入口和存储差异按上表处理。新增模型同步两份目录及相关测试；源码、示例与报告均不提交真实凭据或私有生产地址。

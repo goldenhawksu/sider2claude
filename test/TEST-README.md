@@ -1,138 +1,144 @@
-# 测试套件使用指南
+# 测试使用指南
 
-本目录保留服务级黑盒集成测试；Deno 确定性单测位于 `deno/test`。
+所有命令从仓库根目录运行。当前代码核对基线为 2026-10-12、`451a4f2`。
 
 ## 测试分层
 
-| 层级 | 命令 | 是否需要服务 | 消耗上游 | 说明 |
-| --- | --- | --- | --- | --- |
-| Deno 单测 | `deno task test` | 否 | 否 | 路由、模型映射、DeepSeek adapter |
-| Deno 检查 | `deno task check` | 否 | 否 | Deno 主入口类型检查 |
-| Probe 检查 | `deno check deno/tools/probe-sider-capabilities.ts` | 否 | 否 | probe 脚本类型检查 |
-| Node/Bun 类型检查 | `npm run typecheck` | 否 | 否 | `src/` TypeScript 检查 |
-| 完整确定性回归 | `npm run test:regression` | 否 | 否 | 以上四项串联 |
-| 冒烟测试 | `npm run test:smoke` | 是 | **否** | 零上游消耗快速验证 |
-| 服务级集成 | `npm run test:integration` | 是 | 是 | 调用已启动的 HTTP 服务 |
+| 入口 | 是否需服务 | 上游消耗 | 范围 |
+| --- | --- | --- | --- |
+| `npm run test:regression` | 否 | 无真实上游 | Deno 全量、主入口／probe 检查、TypeScript、Bun 单测 |
+| `npm run test:smoke` | 是 | 无生成调用 | 健康、模型、CORS、鉴权、请求校验 |
+| `deno task test:e2e` | 是 | 是 | 真实 HTTP 与协议／工具／主控套件 |
+| `npm run test:integration` | 是 | 是 | Bun HTTP runner，自动发现 `test/01–07` 文件 |
+| `deno task probe:sider` | 否，直连上游 | 是 | 按需探测 Sider 能力 |
 
-### CI/CD 工作流
+`test:regression` 最后的 Bun 单测包括 adapter、request-converter、server-tools、upstream-timeout、write-integrity、sider-controller 六个文件。它们通过 mock fetch 验证协议和异常边界；“真实 HTTP”单测可使用本地环回服务，但不会消耗真实上游。
 
-| 工作流 | 触发条件 | 内容 |
-|--------|---------|------|
-| `ci.yml` | push/PR 到 main | 确定性回归 (Deno 单测 + 类型检查) |
-| `production-verify.yml` | CI 通过后自动 / 手动触发 | 冒烟 + 可选集成回归 |
-
-### 冒烟测试
-
-零上游消耗，只验证服务基础可用性：
+## 确定性回归
 
 ```bash
-# 默认测试 Bun 本地服务
-bun run test/smoke-test.ts
-
-# 测试远端部署
-$env:TEST_ENV="deno-deploy"
-$env:TEST_API_BASE_URL="https://your-url"
-bun run test/smoke-test.ts
+npm run test:regression
+deno check deno/test/integration/run.ts
+npm run build
 ```
 
-覆盖：健康检查、CORS、模型列表格式、认证 401、请求校验 400、404 处理、Token 计数端点。
+当前代码基线验证结果为 Deno 352/352、Bun 49/49。新增测试后以本次输出为准，不把这些数量当成永久固定断言。
 
-## 服务级集成测试
+模型标签、分类与长请求的重点测试：
 
-先启动服务：
+- `deno/test/model-context-window.test.ts`：发送边界、限流与 161 消息／27 工具。
+- `deno/test/model-exposure.test.ts`：目录及普通 HTTP／SSE。
+- `deno/test/safety-classifier.test.ts`：大 system 分类旁路、disabled、真实判定、停止序列及错误。
+- `deno/test/sider-controller.test.ts` 与 `test/sider-controller.unit.test.ts`：检查点、重放、正文与双运行时行为。
 
-```bash
-# Bun，默认 http://localhost:4141
-bun run dev
-```
+## 配置优先级
 
-再运行：
+两个测试入口都优先用运行时环境；dotenv 从 `deno/.env` 读取，不存在才读根 `.env`，两份不合并。测试必须与服务使用匹配的 `AUTH_TOKEN`。
 
-```bash
-npm run test:integration
-```
-
-Deno 本地服务：
-
-```bash
-# 终端 1
-deno task dev
-
-# 终端 2
-$env:TEST_ENV="deno-local"
-$env:TEST_API_BASE_URL="http://localhost:8000"
-npm run test:integration
-```
-
-## 环境配置
-
-测试配置读取优先级：
-
-1. 运行时环境变量
-2. 根目录 `.env`
-3. 测试默认值
-
-常用变量：
-
-| 变量 | 说明 |
+| 变量 | Deno 真实集成入口 |
 | --- | --- |
-| `TEST_ENV` | `bun-local`、`deno-local`、`deno-deploy` |
-| `TEST_API_BASE_URL` | 覆盖 API 地址 |
-| `TEST_AUTH_TOKEN` | 覆盖测试请求 token |
-| `AUTH_TOKEN` | 未设置 `TEST_AUTH_TOKEN` 时作为测试 token |
+| `E2E_BASE_URL` | 目标地址；其次 `TEST_API_BASE_URL`，最后 localhost 的 `PORT`／8000 |
+| `E2E_AUTH_TOKEN` | 认证；其次 `TEST_AUTH_TOKEN`、`AUTH_TOKEN` |
+| `E2E_TIMEOUT_MS` | 单请求超时，默认 120000 毫秒；长分段可显式放宽 |
+| `E2E_LIVE_MODEL` | 默认 `claude-haiku-4.5` |
+| `E2E_CC_SONNET_MODEL`、`E2E_CC_OPUS_MODEL` | 套件 06 默认 `claude-sonnet-4.6`、`claude-opus-4.8` |
+| `E2E_REQUIRE_ALL_PASS` | 发布时设 `true`，upstream 也使退出码非零 |
+| `E2E_CONTROLLER` | 为 true 时注册 14／15；不修改服务端开关 |
+| `E2E_CONTROLLER_SECOND_URL` | 共享存储的第二独立主控实例 |
+| `E2E_CASE_PATTERN` | 用例名正则筛选，忽略大小写；没有匹配时退出码为 2 |
+| `E2E_REPORT_DIR` | 默认 `deno/test/integration/reports` |
 
-测试日志只输出 token 掩码。
+基础路由套件和主控套件须分别指向适配模式的服务器。`E2E_CONTROLLER=true` 且不指定套件时，会注册并选择 01–15，不代表这些路由断言都适用于同一个主控实例。
 
-## 测试文件
+## Deno 真实集成套件
 
-| 文件 | 覆盖内容 |
+| 套件 | 范围 |
 | --- | --- |
-| `01-health-check.test.ts` | 健康检查、CORS |
-| `02-basic-messages.test.ts` | 模型列表、基础消息、认证、无效请求 |
-| `03-session-persistence.test.ts` | 会话创建、多轮对话、会话端点 |
-| `04-streaming.test.ts` | Anthropic SSE 流式响应 |
-| `05-token-counting.test.ts` | `/v1/messages/count_tokens` |
+| 01 | 基础设施、用量、会话接口 |
+| 02 | 模型目录及发现 |
+| 03 | 非流式对话、system、历史和模型映射 |
+| 04 | SSE 事件、正文、结束与错误 |
+| 05 | 工具调用及路由 |
+| 06 | Sonnet／Opus 多轮 agent 循环 |
+| 07 | OpenAI Chat／Responses |
+| 08 | Gemini 生成／流式 |
+| 09 | Legacy complete／token 计数 |
+| 10 | 鉴权及错误格式 |
+| 11 | 客户端内容块、搜索与 PPT 资料工具循环 |
+| 12 | 51 消息／18 工具的长历史 |
+| 13 | 12 项长 JSON Write 完整性 |
+| 14 | Sider 主控循环、长正文、分段、缓存与跨实例 |
+| 15 | cc-switch 窗口切换、重放／续轮与 XML 分类 |
 
-`03-session-persistence.test.ts` 的多轮语义断言会检查 Sider 上游是否在第二轮复述测试上下文。即使服务端已拿到会话 ID 且 `sider-sessions` 记录了多条消息，上游模型仍可能不按测试预期回答；报告中应单独标注这类外部语义波动。
+默认基础套件 01–13 当前共 88 项。套件 14 通常 10 项，设置第二实例时增加一项；套件 15 共 3 项。实际数量以 runner 输出为准。
 
-统一 runner：
+混合实例先设置服务端 `SIDER_CONTROLLER=false` 并启动，然后：
 
-```bash
-bun run test/run-all-tests.ts
+```powershell
+$env:E2E_BASE_URL='http://localhost:8000'
+$env:E2E_CONTROLLER='false'
+$env:E2E_REQUIRE_ALL_PASS='true'
+$env:E2E_TIMEOUT_MS='600000'
+deno task test:e2e
+# 也可指定套件
+deno task test:e2e 11 12 13
 ```
 
-只跑指定文件：
+主控测试服务须配置 `SIDER_CONTROLLER=true`。Deno 流式用例另需 `SIDER_CONTROLLER_STREAMING=true`；Bun 主控没有此开关。两实例共享对应存储，按账号串行并保持节奏；不要混用 Deno KV 与 Bun SQLite 验证跨实例恢复。
+
+```powershell
+$env:E2E_BASE_URL='http://localhost:18001'
+$env:E2E_CONTROLLER_SECOND_URL='http://localhost:18002'
+$env:E2E_CONTROLLER='true'
+$env:E2E_REQUIRE_ALL_PASS='true'
+$env:E2E_TIMEOUT_MS='1200000'
+deno task test:e2e 14 15
+```
+
+套件 15 的分类用例需要真实兼容后端配置。所有工具执行结果由测试模拟，真实上游生成工具意图；它不等于实际运行 VS Code 或完整 ppt-master 导出。
+
+按配额拆分执行时，可显式设置筛选：
+
+```powershell
+$env:E2E_CASE_PATTERN='XML分类'
+deno task test:e2e 15
+Remove-Item Env:E2E_CASE_PATTERN
+```
+
+记录筛选条件、执行集合及所有结果；不能将未运行或受限的用例算作通过。
+
+## 严格通过与报告
+
+结果为 pass、fail、upstream。未开启严格门禁时，upstream 可以不影响退出码；发布必须设置 `E2E_REQUIRE_ALL_PASS=true` 并确认通过数等于执行总数、失败和受限都为 0。429 在不同用例中也可能记为 fail，需读取具体错误，而非只看分类计数。
+
+报告在 `deno/test/integration/reports/` 自动生成；目标地址会出现在原始报告和终端中，因此只留本地。提交摘要去掉私有地址、凭据及正文。
+
+代码 `451a4f2` 的证据为基础 88/88、新套件 15 为 3/3，两次均无失败或受限；这 91 项不包含当次未重跑的主控套件 14。详见[修复报告](../docs/cc-switch上下文窗口兼容修复_20261012.md)。
+
+## Bun HTTP runner 与冒烟
+
+Bun 默认目标为 `http://localhost:4141`；Deno 目标用运行时覆盖：
+
+```powershell
+$env:TEST_ENV='deno-local'
+$env:TEST_API_BASE_URL='http://localhost:8000'
+# TEST_AUTH_TOKEN 未设时读取 AUTH_TOKEN
+npm.cmd run test:smoke
+npm.cmd run test:integration
+```
+
+可用 `TEST_ENV`：bun-local、deno-local、deno-deploy。远端地址由 `TEST_API_BASE_URL` 或 `DENO_DEPLOY_URL` 注入。
+
+HTTP runner 自动发现带序号的文件，当前 01–07 包含健康、基础消息、会话、SSE、token、provider 准备度及多协议兼容。只选文件：
 
 ```bash
 bun run test/run-all-tests.ts 01-health-check.test.ts 05-token-counting.test.ts
 ```
 
-## 批处理入口
+报告在 `test/reports/integration-*.md`。此 runner 与 Deno 真实集成库是不同入口，不要混用配置变量或结果统计。
 
-Windows：
+## CI 与生产
 
-```bat
-test\run-tests.bat
-test\run-tests-bun.bat
-test\run-tests-deno-local.bat
-test\run-tests-deno-deploy.bat
-```
+[CI](../.github/workflows/ci.yml)覆盖确定性测试及入口类型检查。[生产验证](../.github/workflows/production-verify.yml)在 CI 成功后自动做冒烟，手动触发可选 Bun HTTP 集成；它不自动执行 Deno 主控／窗口套件，也不比较部署 ID。
 
-Linux/macOS：
-
-```bash
-test/run-tests.sh
-test/run-tests-bun.sh
-test/run-tests-deno-local.sh
-test/run-tests-deno-deploy.sh
-```
-
-## 常见失败原因
-
-- 服务未启动：`ECONNREFUSED`。
-- `AUTH_TOKEN` 不一致：返回 401。
-- Sider 配额不足：普通对话可能返回空文本或用量限制。
-- DeepSeek key 未配置或不是官方 DeepSeek key：工具请求会失败或无法补齐 `tool_use`。
-- DeepSeek 返回 `thinking` 内容块：当前 adapter 已支持响应侧透传。
-- DeepSeek 工具续轮返回 `content[].thinking` passback 400：确认请求侧历史 `thinking` / `tool_use` / `tool_result` 已转录为文本，并运行 `deno/test/deepseek-adapter.test.ts`。
-- 远端部署地址未设置：请用 `TEST_API_BASE_URL` 或 `DENO_DEPLOY_URL` 指定。
+推送后的部署确认、生产定向用例与报告要求见[发布 SOP](../docs/开发测试发布SOP.md)。

@@ -9,17 +9,23 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 当前落地方案：
 
 1. 普通 Claude 对话由 Sider 提供。
-2. Claude Code 工具、MCP 工具、自定义 `tool_use` 等 Sider 不支持或不稳定支持的能力由 DeepSeek Anthropic 兼容端补齐。
-3. DeepSeek 默认上游模型为 `deepseek-v4-flash`。
+2. 混合路由的 conservative/pro 将客户端工具交给原生 Anthropic 兼容端；max 可先尝试 Sider 文本契约。主控开启后由 Sider 规划和选型，客户端执行。
+3. 兼容后端默认模型为 `deepseek-v4-flash`，由 `DEEPSEEK_*` 配置，也可使用 GLM 等兼容模型。
 4. 对外始终保留客户端请求中的 Claude 模型名。
 5. DeepSeek 返回的 `thinking`、`redacted_thinking`、`tool_use` 内容块必须按 Anthropic Messages 结构透传。
 6. 发往 DeepSeek 的历史工具轮必须先转录为文本，避免上游在 thinking 模式下要求完整 `content[].thinking` passback。
+7. cc-switch 的数字窗口标签在 Sider 查找和发送时剥离，主控历史、任务、重放及限流共享基础名；对外保留请求名。
+8. 明确的无工具 XML 安全分类在配置兼容后端时优先走该后端，不被主控抢占、不回退 Sider。显式 thinking disabled 在 JSON 和 Deno 真流式路径兑现。
+
+当前指南：[项目说明](README_CN.md)、[用户指南](docs/用户使用指南.md)、[API 参考](docs/API参考.md)、[文档目录](docs/README.md)。带日期的探测只说明当时环境，不替代当前源码行为。
 
 ## 开发命令
 
 ### Sider 主控模式（2026-10-08 实证开发）
 
 - `SIDER_CONTROLLER=true` 优先于下文的普通 `pro/max/conservative` 路由，Sider 保持规划、创作和工具选型权；工具由 Claude Code/MCP 执行，不把业务回合整体交给 GLM。
+- Deno 主控默认接管非流式，流式另需 `SIDER_CONTROLLER_STREAMING=true`；Bun 主控接管两种格式，没有该开关。新增输入上限默认 Deno 6000、Bun 14000 字符。
+- 分类旁路识别 system 中明确的分类用途与 `<block>`／`<severity>`，且请求不含工具。保留完整 system、实际判定和错误，不伪造允许；回归是套件15和 `safety-classifier.test.ts`。
 - 入口是两套 `utils/sider-controller.ts` 和 `controller-http.ts`；Deno KV、Bun SQLite 保存任务、父消息、工具关联、正文引用和账号租约。参数不能靠宽松 JSON 修补；完整工具结果必须续轮回到同一 Sider 会话。
 - Opus 5.5 和 Sonnet 5.5 已实测工具契约、多轮失败恢复、长 Write 及 StoreContent→WriteFromRef。旧版 Opus 的历史额度数据不能作为硬排除 Opus 5.5 的依据。推理事件存在不等于 Anthropic thinking 预算参数已被兑现。
 - 真实 Claude Code 2.1.195 使用 JSON Schema 2020-12，校验器必须支持该方言。模型“已完成”自述不算验收；文件复制必须检查实际 Write 成功反馈、文件存在、JSON 项数和字节完整性。
@@ -132,9 +138,10 @@ SIDER_STRATEGY=conservative
   |
   v
 RouterEngine
-  |-- simple_chat -> Sider
-  |-- Claude Code tools -> DeepSeek
-  |-- MCP/custom tools -> DeepSeek
+  |-- XML 分类 -> 已配置的原生兼容后端
+  |-- 主控适用请求 -> KV/SQLite + Sider 文本契约
+  |-- 混合普通对话 -> Sider（受配置与能力限制）
+  |-- 混合工具 -> 兼容后端；max 可先尝试 Sider
   |-- tool_result -> 上一回合后端
   v
 响应标准化为 Anthropic Messages
@@ -158,11 +165,11 @@ RouterEngine
 - **成本前提**：Sider 是包年订阅（边际成本 0），DeepSeek 按量付费。因此策略是
   「能用 Sider 完成的就不要用 DeepSeek，DeepSeek 只做能力补齐与兜底」。
 - 普通对话优先 Sider。
-- 出现 Claude Code 内置工具（如 `Bash`、`Read`、`Write`、`Edit`、`Task`）必须走 DeepSeek。
-- 出现 `mcp__...` 或未知自定义工具必须走 DeepSeek。
+- 以下普通路由规则适用于未被主控接管的请求；明确 XML 分类优先匹配 `rule_0_safety_classifier`。
+- conservative/pro 下，Claude Code 内置工具（如 `Bash`、`Read`、`Write`、`Edit`、`Task`）、MCP 和未知工具由已配置的兼容后端处理；max 可先试 Sider 文本契约。
 - `tool_result` 回合优先延续上一回合后端，避免工具调用上下文断裂。
   但延续规则带能力守卫：本轮若含 Claude Code 工具或 MCP/自定义工具
-  （`hasClaudeCodeTools || hasMcpTools`）而记录的后端是 Sider，必须跳过延续、
+  （`hasClaudeCodeTools || hasMcpTools`）、策略不支持 Sider 文本工具而记录的后端是 Sider，必须跳过延续、
   交给工具规则走 DeepSeek。原因是没有显式 `X-Conversation-ID` 的请求共用
   `continuous-conversation` 这一个会话槽位，上一回合很可能是另一段纯对话。
   改动 `rule_1_tool_result_continuity` 时不要把这个守卫去掉。
@@ -171,7 +178,7 @@ RouterEngine
 - Sider 续轮通过真实 `cid + parent_message_id` 关联历史；即使客户端只发送
   一条新的 user 消息，也必须使用会话中已保存的助手消息 ID 作为父消息。
   不要用 `messages.length > 1` 限制本地父消息的读取，Node/Bun 与 Deno 均须覆盖此场景。
-- 普通对话允许 fallback；工具请求不应 fallback 到 Sider，因为 Sider probe 未证明其支持 Anthropic `tool_use`。
+- 普通混合对话的 fallback 受配置和规则控制；兼容工具请求不盲目改投 Sider。max 与主控按各自已测文本契约处理。
 - **Sider 有两道硬约束，路由必须提前避让**（数字均来自实测，见「Sider Probe」一节）：
   1. 单请求体量：约 32,000 字符通过、44,000 字符被 `code 603: Too many words in
      the query` 硬拒。
@@ -284,7 +291,7 @@ RouterEngine
   像样的编码对话里这两类词都必然出现，实测最后一轮只说「请继续」也会被判成
   长文生成而路由去 DeepSeek。改这里时不要把输入换回全文。
 - Sider 用 `HTTP 200 + SSE 内 code != 0` 表达业务失败（如 1135 用量超限）。
-  这类失败必须转成 `SiderUpstreamError` 上抛（1135 -> 429，其余 -> 502），
+  这类失败必须转成 `SiderUpstreamError` 上抛（1135 -> 429、603 -> 413，其余 -> 502），
   非流式据此触发 fallback。
   判定保守：仅当收到非 0 code 且完全没拿到文本时才判失败。
 - **流式的 Sider 失败会先尝试无感切到 DeepSeek**，切不了才发 Anthropic `error`
@@ -471,7 +478,7 @@ thinking 吃光小预算。
 
 模型清单严格同步参考仓库
 [`goldenhawksu/sider2api` 的 `deno_pro.ts`](https://github.com/goldenhawksu/sider2api/blob/main/deno_pro.ts)
-中的 `MODEL_MAPPING`。2026-10-07 同步结果为 105 个模型，后续数量以当次参考映射为准。
+中的 `MODEL_MAPPING`。当前目录为 106 个模型（2026-10-12），后续以参考映射和源码为准。
 新增、删除或改映射时，必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`
 与 `deno/test/model-exposure.test.ts` 里的计数与 id 断言。
 
@@ -481,9 +488,11 @@ thinking 吃光小预算。
 
 未知 Claude 模型按家族保守映射：
 
-- Opus -> `claude-opus-4.8`
-- Haiku -> `claude-haiku-4.5`
-- Sonnet -> `claude-sonnet-4.6`
+- 普通 Opus -> `claude-opus-5.5`；thinking -> `claude-opus-4.8-think`
+- 普通 Haiku -> `claude-haiku-5.5`；thinking -> `claude-haiku-4.5-think`
+- 普通 Sonnet -> `claude-sonnet-5.5`；thinking -> `claude-sonnet-5-think`
+
+主控要求明确登记的基础模型，不使用家族兜底。窗口后缀不增加目录项；实际发送和状态归一到基础名，响应保留请求名。回归见 `model-context-window.test.ts`、`model-exposure.test.ts` 和两套主控测试。
 
 ### 更新模型映射：标准操作流程
 
@@ -563,10 +572,9 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 - Sider **服务端保存会话**（`cid + parent_message_id`）：首轮 24KB 之后，
   续轮只需发几百字节即可准确召回，因此 603 限制只约束**单轮新增内容**；
 - 真正的瓶颈是**吞吐与额度**，不是能力：约 6 次/分钟，且 opus 档单窗口仅 2~3 次、
-  200 秒不恢复。**opus 档无法承载 agent 循环**，sonnet 档可以。
+  200 秒不恢复。这是旧 Opus 的吞吐观察，不能否定当前 Opus 5.5 已验证的主控循环。
 
-因此第 2 期（给 Sider 通道注入工具契约）若要做，**必须只对 sonnet / haiku 开，
-opus 档硬排除**——否则每次都白撞一次限速。
+当时第 2 期曾建议仅对 Sonnet／Haiku 启用契约；当前实现不按家族硬排除 Opus，按实际模型配额和检查点处理。后续调整依据新探测，不能把历史建议当成当前限制。
 
 ## 用量统计
 
@@ -705,7 +713,8 @@ Provision 一个 Deno KV 数据库并关联本应用，再在应用环境变量�
 `utils/sider-telemetry.ts`（Deno 侧，Node 侧为 no-op）把每次 Sider 调用记进
 `['tele', hourBucket, ts]`，`GET /stats/telemetry.json` 导出，供离线分析优化调度。
 白名单字段：`ts` / `model` / `strategy` / `payloadChars` / `ok` / `siderCode` /
-`ms` / `hasTools` / `restoredToolUse`——**不含任何消息内容**。
+`ms` / `hasTools` / `restoredToolUse`；主控另记 `phase/outcome/correctionCount`、
+`payloadUtf8Bytes/questionMarks/replacementCharacters`——**不含任何消息内容**。
 
 - **零竞争写**：键用时间戳，天然唯一，`kv.set` 不需要 CAS、不需要串行队列。
   遥测是允许有损的旁路数据，一旦为了「精确条数」去读改写，就把写路径拖回了
@@ -781,15 +790,16 @@ Node/Bun 侧适配器单元测试（mock fetch，不需要起服务）：
 
 Deno 集成回归测试库（打真实实例，`deno task test:e2e`）：
 
-- 入口 `deno/test/integration/run.ts`，10 个套件，可传套件号只跑其中几个。
+- 入口 `deno/test/integration/run.ts`，默认基础01–13；`E2E_CONTROLLER=true` 注册14／15，可用套件号筛选。
 - 目标地址用 `E2E_BASE_URL` 覆盖，默认 `http://localhost:$PORT`。
 - 套件 06 模拟 Claude Code 的真实调用形态，对一个 Sonnet 与一个 Opus
   各跑一遍完整 agent 循环，验证持续对话与连续工具调用。
 - 报告写入 `deno/test/integration/reports/`（已 gitignore）。
+- 主控测试明确选择14／15，指向正确开关与共享存储的实例；`E2E_CONTROLLER` 不修改服务端模式，不能将基础混合路由断言套在主控实例上。
 
-结果分三态：`pass` / `fail` / `upstream`。上游受限（Sider 配额、DeepSeek
-网络抖动）归入 `upstream`，单独列出且不计入失败、不影响退出码——这样上游
-波动不会把回归门禁刷红。退出码只看 `fail`。
+结果分三态：`pass` / `fail` / `upstream`。默认退出码只按 fail 判定，但发布必须设
+`E2E_REQUIRE_ALL_PASS=true`，fail 或 upstream 非零均不能通过。按配额使用
+`E2E_CASE_PATTERN` 时记录执行集合，不能将部分用例冒充全套。
 
 确定性测试里**不要用固定 `setTimeout` 等 KV 落库**。写入是 fire-and-forget，
 `['live']` 还要排队串行提交，耗时随机器负载浮动；实测与 `deno fmt` 并发时

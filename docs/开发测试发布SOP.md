@@ -1,276 +1,147 @@
-# Sider2Claude 开发、测试、发布标准操作流程 (SOP)
+# Sider2Claude 开发、测试、发布 SOP
 
-基于 2026-06-29 本地开发验证，作为后续迭代的标准工作流。
+按 2026-10-12 代码提交 `451a4f2` 核对。接口和使用说明见[文档目录](README.md)，具体测试说明见[测试指南](../test/TEST-README.md)。
 
-参考上游仓库 `goldenhawksu/sider2api` 的 SOP 模式适配本项目 TypeScript/Bun/Deno 技术栈。
+## 1. 准备环境
 
----
-
-## 角色与核心原则
-
-- **本地优先**：所有开发、单元测试、集成回归必须本地通过后才能推送。
-- **推送需授权**：推送到 main 分支或远端必须经用户明确同意，推送即触发远端部署验证。
-- **诚实报告**：测试失败必须贴实际错误输出；跳过的步骤必须注明；禁止伪造通过结果。
-- **不破坏 API**：任何修改不能破坏 Anthropic Messages API 响应结构。
-
----
-
-## 1. 一次性环境搭建
-
-### 运行环境
-
-| 运行时 | 安装方式 | 验证命令 |
-|--------|---------|---------|
-| **Bun** | `npm install -g bun` 或官网安装脚本 | `bun --version` |
-| **Deno** | `irm https://deno.land/install.ps1 \| iex` (Windows PowerShell) | `deno --version` |
-| **Node.js** | 通过 nvm / fnm 或官网安装 | `node --version` |
-
-仓库根目录安装依赖：
+从仓库根目录运行所有命令。CI 当前固定到 Bun 1.3.x、Deno 2.9.x 次版本；本地同时需要 npm／TypeScript 构建环境。
 
 ```bash
-bun install
+npm ci
+bun --version
+deno --version
+node --version
 ```
 
-### 凭证配置 (`.env`)
+服务和两套测试读取同一优先级：运行时变量 > `deno/.env`（不存在才读取根 `.env`）> 默认值。真实凭据与生产地址只存在于本地配置、部署环境或 CI secrets。
 
-`.env` 已 gitignore，绝不能提交。关键变量：
+客户端 token 是 `AUTH_TOKEN`；Sider 凭据是 `SIDER_AUTH_TOKEN`；原生兼容后端使用 `DEEPSEEK_*`。后端名 deepseek 不代表实际 provider 一定是 DeepSeek。
 
-```env
-AUTH_TOKEN=your-client-token          # 客户端认证 token
-SIDER_AUTH_TOKEN=your-sider-jwt       # Sider 上游 JWT
-SIDER_API_URL=https://sider.ai/api/chat/v1/completions
+## 2. 确定变更与验证范围
 
-DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
-DEEPSEEK_API_KEY=your-deepseek-key
-DEEPSEEK_MODEL=deepseek-v4-flash
+- 核对工作区、当前提交、两套运行时与相关测试。
+- 先用失败测试或真实探测确认问题，再最小修改。
+- 模型目录、路由与适配器核心行为同步修改 `src/` 和 `deno/src/`。
+- 用文件存在、完整参数、内容哈希或工具反馈等证据验收，不以助手自述代替。
+- 原始失败、重跑原因、环境与测试范围一起保留；上游受限不算通过。
 
-DEFAULT_BACKEND=sider
-AUTO_FALLBACK=true
-PREFER_SIDER_FOR_CHAT=true
-DEBUG_ROUTING=false
-```
+当前主控重点见[Sider 主控模式](Sider主控模式.md)：Deno 流式接管需要两个开关，Bun 主控接管全部请求格式；XML 分类在配置了原生兼容后端时走独立路由。
 
-本地开发默认端口：
-- Bun 服务：`http://localhost:4141`
-- Deno 服务：`http://localhost:8000`（可用 `PORT` 环境变量覆盖）
-
-### 验证环境
+## 3. 本地静态与确定性回归
 
 ```bash
-# 静态检查
-deno task check          # Deno 主入口类型检查
-npm run typecheck        # Node/Bun TypeScript 检查
-
-# 确定性回归（无需启动服务、不访问外部）
 npm run test:regression
-
-# 启动本地服务
-bun run dev              # Bun 服务，端口 4141
-# 或
-deno task dev            # Deno 服务，端口 8000
+deno check deno/test/integration/run.ts
+npm run build
+git diff --check
 ```
 
----
+`test:regression` 包含 Deno 全量单测、入口与能力探针检查、TypeScript、Bun 6 个单元测试文件。期望退出码全部为 0。
 
-## 2. 敏捷迭代循环
+新增探针也需单独 `deno check`。格式和 lint 使用本轮文件范围；仓库全量 ESLint 当前有历史配置／依赖问题，不能宣称 `npm run lint` 已通过，也不在无关变更中自动升级依赖。
 
-完整流程：*用户需求 → 本地开发 → 静态检查 → 本地启动 → 分层测试 → 报告 → (用户审批) → 推送 → 远端部署 → 远端验证*
+## 4. 启动与零上游冒烟
 
-### 第一步：本地开发
-
-根据需求编辑相关源文件。核心文件：
-
-| 文件 | 用途 |
-|------|------|
-| `src/routes/messages-hybrid.ts` | Bun 混合路由入口 |
-| `deno/src/routes/messages-hybrid.ts` | Deno 混合路由入口 |
-| `src/routing/router-engine.ts` | 路由引擎 |
-| `deno/src/routing/router-engine.ts` | Deno 路由引擎 |
-| `src/adapters/anthropic-adapter.ts` | Anthropic 格式适配器 |
-| `deno/src/adapters/anthropic-adapter.ts` | Deno Anthropic 适配器 |
-| `src/config/models.ts` | 模型清单 (Bun) |
-| `deno/src/config/models.ts` | 模型清单 (Deno) |
-
-修改模型清单时必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`。
-
-### 第二步：静态类型检查（提交前必须）
+先核对端口归属；不要直接停止未知进程。服务未加载新配置或启动到旧实例时，健康与鉴权检查可能与预期不符。
 
 ```bash
-# 全部确定性回归（推荐）
-npm run test:regression
-
-# 或分步执行
-deno task test           # Deno 单元测试
-deno task check          # Deno 类型检查
-deno check deno/tools/probe-sider-capabilities.ts  # 探针脚本检查
-npm run typecheck        # Bun/Node TypeScript 检查
-```
-
-期望：所有命令零错误退出。
-
-### 第三步：启动本地服务器
-
-**先杀掉旧进程**——僵尸进程占用端口但 token 未加载会导致所有请求返回 "Invalid Token"。
-
-```bash
-# Windows PowerShell - 杀掉占用端口的进程
-Get-Process -Id (Get-NetTCPConnection -LocalPort 4141 -ErrorAction SilentlyContinue).OwningProcess -ErrorAction SilentlyContinue | Stop-Process -Force
-
-# 启动 Bun 服务
 bun run dev
+# 或另一个终端中使用 Deno
+deno task start
 ```
 
-确认服务启动：
-```bash
-curl http://localhost:4141/health
+未被 `PORT` 覆盖时，Bun 为 4141、Deno 为 8000。PowerShell 示例：
+
+```powershell
+Invoke-RestMethod http://localhost:8000/health
+$env:TEST_ENV='deno-local'
+$env:TEST_API_BASE_URL='http://localhost:8000'
+npm.cmd run test:smoke
 ```
 
-### 第四步：分层测试
+冒烟验证健康、模型、鉴权、CORS 等基础接口，不发生成请求。
 
-#### A. 冒烟测试（零上游成本）
+## 5. 真实集成门禁
 
-验证服务基本可用性，不消耗上游配额：
+真实回归会消耗上游配额，保持限流，按模型和用例安排执行。所有适用用例要求 `pass == total`、`fail == 0`、`upstream == 0`，不能只看退出码或 HTTP 200。
 
-```bash
-bun run test/smoke-test.ts
+混合路由实例（服务端 `SIDER_CONTROLLER=false`）运行基础套件 01–13：
+
+```powershell
+$env:E2E_BASE_URL='http://localhost:8000'
+$env:E2E_CONTROLLER='false'
+$env:E2E_REQUIRE_ALL_PASS='true'
+$env:E2E_TIMEOUT_MS='600000'
+deno task test:e2e
 ```
 
-覆盖：健康检查、CORS、模型列表格式、认证 401、无效请求 400。
+主控实例需先在服务端设置 `SIDER_CONTROLLER=true`；Deno 流式用例还需 `SIDER_CONTROLLER_STREAMING=true`。两个独立实例共享对应 KV／SQLite 才能验证跨实例恢复。
 
-#### B. 服务级集成测试（消耗上游配额）
-
-确保本地服务正在运行，然后：
-
-```bash
-# 默认测试 Bun 本地服务
-npm run test:integration
-
-# 或指定 Deno 本地服务
-$env:TEST_ENV="deno-local"
-npm run test:integration
+```powershell
+$env:E2E_BASE_URL='http://localhost:18001'
+$env:E2E_CONTROLLER_SECOND_URL='http://localhost:18002'
+$env:E2E_CONTROLLER='true'
+$env:E2E_REQUIRE_ALL_PASS='true'
+$env:E2E_TIMEOUT_MS='1200000'
+deno task test:e2e 14 15
 ```
 
-覆盖：模型列表、基础消息、多轮会话、流式 SSE、Token 计数。
+`E2E_CONTROLLER` 只注册套件，不修改服务器配置；注册后不传套件号会同时包含基础套件，不能把混合路由断言直接套在主控实例上。
 
-#### C. Sider 上游能力探针（按需）
+上游不足时分析错误与恢复时间，等待后重跑。可以用 `E2E_CASE_PATTERN` 正则选择用例拆分执行；记录实际执行集合及其全绿证据，不能把过滤后的少量用例表述为一次全套通过。
 
-仅在需要确认上游能力变化时运行：
+Deno 原始报告写入 `deno/test/integration/reports/`；Bun HTTP runner 报告写入 `test/reports/`。原始报告可能包含目标地址，只保留本地；提交的摘要必须移除生产地址、凭据和正文。
 
-```bash
-deno task probe:sider
-```
+## 6. 提交与推送
 
-常用筛选：
-```bash
-$env:SIDER_PROBE_MODEL="claude-sonnet-4.6"
-$env:SIDER_PROBE_CASES="simple_chat,anthropic_tool_shape"
-deno task probe:sider
-```
-
-#### D. 生产环境验证（推送后）
-
-见下方「第七步」。
-
-### 第五步：生成报告
-
-测试完成后将结果写入 `test/reports/`：
+用户授权推送后，完成验证和具体变更审查再提交；已获授权的本次范围无需重复确认。
 
 ```bash
-# 集成测试报告自动生成在 test/reports/integration-YYYYMMDD-HHMMSS.md
-npm run test:integration
-```
-
-手动补充本地测试报告：
-
-```bash
-# 报告模板见 test/reports/本地测试报告_模板.md
-```
-
-报告内容：环境信息、静态检查结果、分层测试矩阵、失败排查、结论/待办。
-
-### 第六步：推送（需要用户明确同意）
-
-```bash
-# 推送前最终检查
-git status                     # 确认无 .env
-git diff --stat origin/main    # 审查变更范围
-npm run test:regression        # 最后一次确定性回归
-
-# 推送（需用户批准）
+git status --short --branch
+git diff --check
+git diff --stat
+git diff --cached --check
+git commit -m "描述最终变更"
 git push origin main
 ```
 
-> ⚠️ 推送 main 分支会触发 CI 流水线（如有配置）。
+暂存前核对范围，不纳入 `.env`、`.runtime/`、运行报告或个人客户端配置。推送后读取远程 main 引用并确认与本地提交一致。
 
-### 第七步：远端部署后验证
+## 7. 部署与生产复验
 
-等待部署完成（通常 30 秒 ~ 2 分钟，取决于部署平台），然后运行生产验证：
+本项目 main 推送已配置 Deno 自动部署，但 Git 推送成功不等于新部署已上线。通常约一分钟后就绪；按约 15 秒间隔轮询，给部署和冷启动留出至少三分钟窗口。
 
-```bash
-# 设置生产环境
-$env:TEST_ENV="deno-deploy"
-$env:TEST_API_BASE_URL="https://your-deployed-url"
+生产地址通过未跟踪环境或 `DEPLOY_URL` secret 注入。检查：
 
-# 运行冒烟测试
-bun run test/smoke-test.ts
+1. `/health` 返回 200，Deno `version` 的 deployment ID 片段发生变化。
+2. 部署平台记录与本次 Git 提交一致；该片段不是 Git 哈希。
+3. 健康、模型、鉴权、CORS 冒烟通过。
+4. 本次功能的生产定向用例通过；涉及路由／工具／会话／协议时扩展相应范围。
+5. 保存不含地址和凭据的验证摘要；失败则继续定位、修复与验证。
 
-# 运行完整集成测试
-npm run test:integration
+```powershell
+# TEST_API_BASE_URL 与 TEST_AUTH_TOKEN 在本地或 CI 安全注入
+$env:TEST_ENV='deno-deploy'
+npm.cmd run test:smoke
 ```
 
----
+如需真实生产套件，配置 `E2E_BASE_URL`、`E2E_AUTH_TOKEN` 和严格门禁后，按部署的实际模式选择用例。runner 会输出目标地址，终端原始输出不应提交或公开。
 
-## 3. 测试后清理
+## 8. CI 的实际范围
 
-```bash
-# 杀掉本地服务进程
-# Windows: 任务管理器或 Get-Process | Stop-Process
+| 工作流 | 当前行为 |
+| --- | --- |
+| [ci.yml](../.github/workflows/ci.yml) | main push／PR；Deno 类型、单测、集成及真实客户端入口检查；Bun 类型与单测 |
+| [production-verify.yml](../.github/workflows/production-verify.yml) | CI 成功后自动做健康、模型、鉴权和 CORS 冒烟；手动触发可选 Bun HTTP 集成 |
 
-# 确认状态
-git status                     # 无意外修改
-git status --porcelain | findstr ".env"  # 确认 .env 未暂存
+生产工作流需要 `DEPLOY_URL` secret；可选集成另需 `AUTH_TOKEN`。自动冒烟只等待服务返回 200，并不比较部署 ID，也不自动运行 Deno 套件 14／15；不能把它作为全部生产功能已验证的证据。
 
-# 清理临时文件
-Remove-Item server.log -ErrorAction SilentlyContinue
-```
+## 9. 必检行为
 
----
-
-## 4. 快速排障指南
-
-| 症状 | 根因 | 解决方案 |
-|------|------|---------|
-| 所有请求返回 401 | 僵尸进程占用端口或 token 无效 | 杀掉旧进程，重启服务 |
-| `ECONNREFUSED` | 服务未启动 | 启动 `bun run dev` |
-| DeepSeek 工具请求 400 | thinking passback 校验失败 | 确认历史 tool_use 已转录；运行 `deno test --allow-env deno/test/deepseek-adapter.test.ts` |
-| Sider 对话返回空文本 | Sider 配额不足 | 检查 Sider 账户状态 |
-| 模型返回 "not supported" | 模型映射不存在 | 检查 `src/config/models.ts` 和 `deno/src/config/models.ts` |
-| Deno check 报告 unknown type | 非阻塞警告 | 使用 `error instanceof Error ? error.message : String(error)` 模式 |
-| 中文字符输出乱码 | 控制台编码问题 | 设置 `PYTHONIOENCODING=utf-8`（如用 Python 辅助脚本） |
-
----
-
-## 5. 每次回归必检项 (Invariants)
-
-- [ ] `GET /v1/models` 返回模型列表，`data` 数组非空，每个模型含 `id`、`object: "model"`
-- [ ] `POST /v1/messages` 非流式返回 `{id, model, content, usage}` 符合 Anthropic Messages 结构
-- [ ] `POST /v1/messages` 流式 (`stream: true`) 返回 `text/event-stream`，以 `data: [DONE]` 结束
-- [ ] `POST /v1/messages/count_tokens` 返回 `{input_tokens: number}`
-- [ ] 缺少 `Authorization` header 时返回 401
-- [ ] 无效请求（缺少 `model`）返回 400
-- [ ] 多轮对话通过 `cid` query 参数或 session header 保持上下文
-- [ ] Claude Code 工具请求（含 `Bash`、`Read`、`Write` 等）正确路由到 DeepSeek
-- [ ] DeepSeek 返回的 `thinking` / `tool_use` 内容块按 Anthropic 结构透传
-- [ ] 上游错误返回结构化错误（HTTP 4xx/5xx），不崩溃
-
----
-
-## 附录：环境矩阵速查
-
-| 环境 | 运行时 | 地址 | 用途 |
-|------|--------|------|------|
-| 本地开发/测试 (Bun) | `bun run dev` | `http://localhost:4141` | 功能开发、集成测试 |
-| 本地开发/测试 (Deno) | `deno task dev` | `http://localhost:8000` | Deno 运行时验证 |
-| 远端部署 | 部署平台 | 按 `TEST_API_BASE_URL` 配置 | 功能/性能验证 |
-
-两个本地环境均可指向同样的上游 Sider + DeepSeek，调用消耗真实额度。
+- Anthropic Messages 保留请求模型名；Sider 发送基础名，数字窗口标签共享主控与限流状态。
+- Anthropic SSE 正常以 `message_stop` 结束；流内 error 是失败，`message_start`／ping 是连接事件。
+- 客户端工具块由客户端执行，id 与参数完整保留；成功工具结果续轮回到正确任务。
+- XML 分类保留模型真实判定、显式 disabled、停止序列及错误，不伪造允许结果。
+- Write 保持严格 JSON、schema、路径与正文校验；回读不匹配不能报告已验证。
+- 413 是输入／容量问题，429 按恢复时间退避；错误不能变成空回复或伪造成功。
+- 清理只停止本轮创建且已核对归属的进程；`git status` 不包含意外文件。
