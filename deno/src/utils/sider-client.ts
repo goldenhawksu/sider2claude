@@ -8,11 +8,12 @@ import {
   createAccumulatorCallbacks,
   maskId,
   type SiderStreamCallbacks,
-  streamSiderSSE,
   siderUpstreamError,
+  streamSiderSSE,
 } from './sse-line-reader.ts';
 import { getEnv } from './env.ts';
 import { fetchSiderResponse } from './sider-transport.ts';
+import { normalizeModelId } from '../config/models.ts';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -38,28 +39,46 @@ export class SiderClient {
   /**
    * 发起 Sider API 请求并校验为 SSE 响应。流式与累积两条路径共用。
    */
-  private async doFetch(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<Response> {
-    const response = await fetchSiderResponse(this.baseURL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authToken}`,
-        'Origin': 'chrome-extension://dhoenijjpgpeimemopealfcbiecgceod',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
-        'X-Time-Zone': 'Asia/Shanghai',
-        'X-App-Version': '5.13.0',
-        'X-App-Name': 'ChitChat_Edge_Ext',
+  private async doFetch(
+    request: SiderRequest,
+    authToken: string,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    const response = await fetchSiderResponse(
+      this.baseURL,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+          'Origin': 'chrome-extension://dhoenijjpgpeimemopealfcbiecgceod',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0',
+          'X-Time-Zone': 'Asia/Shanghai',
+          'X-App-Version': '5.13.0',
+          'X-App-Name': 'ChitChat_Edge_Ext',
+        },
+        // cc-switch 的上下文窗口标签属于客户端配置，不能进入 Sider 模型参数。
+        body: JSON.stringify({
+          ...request,
+          model: normalizeModelId(request.model),
+          ...(request.chat_models
+            ? { chat_models: request.chat_models.map(normalizeModelId) }
+            : {}),
+        }),
+        signal,
       },
-      body: JSON.stringify(request),
-      signal,
-    }, this.timeout, this.totalTimeout);
+      this.timeout,
+      this.totalTimeout,
+    );
 
     if (!response.ok) {
       const raw = await response.text();
       try {
         const body = JSON.parse(raw);
-        if (typeof body.code === 'number' && body.code !== 0) throw siderUpstreamError(body.code, String(body.msg ?? ''));
+        if (typeof body.code === 'number' && body.code !== 0) {
+          throw siderUpstreamError(body.code, String(body.msg ?? ''));
+        }
       } catch (error) {
         if (error instanceof Error && error.name === 'SiderUpstreamError') throw error;
       }
@@ -79,7 +98,11 @@ export class SiderClient {
   /**
    * 调用 Sider API 并把 SSE 响应累积为完整结果（非流式路径）。
    */
-  async chat(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<SiderParsedResponse> {
+  async chat(
+    request: SiderRequest,
+    authToken: string,
+    signal?: AbortSignal,
+  ): Promise<SiderParsedResponse> {
     console.log('Calling Sider API:', {
       model: request.model,
       contentLength: request.multi_content[0]?.text?.length || 0,

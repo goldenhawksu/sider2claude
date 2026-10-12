@@ -9,6 +9,136 @@ import { fetchSiderResponse } from '../src/utils/sider-transport';
 import { SiderClient } from '../src/utils/sider-client';
 import { controllerResponse } from '../src/utils/controller-http';
 import { createRequestLogContext } from '../src/utils/request-observability';
+import { runSiderController, controllerHash } from '../src/utils/sider-controller';
+import { getControllerStore } from '../src/utils/controller-storage';
+import { isSiderCooling, recordSiderQuotaExhausted, resetSiderAvailability } from '../src/utils/sider-availability';
+import { canUseSider, consumeSiderSlot, resetSiderThrottle } from '../src/utils/sider-throttle';
+import { isSafetyClassifierRequest } from '../src/utils/request-analyzer';
+import { RouterEngine } from '../src/routing/router-engine';
+import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
+
+test('Bun：XML分类使用兼容后端，保留显式disabled及真实阻止判定', async () => {
+  const original = globalThis.fetch;
+  const request = { model: 'claude-sonnet-5.5[1M]', max_tokens: 64,
+    system: 'Safety classifier. Classification format: <block>yes</block> or <block>no</block>.',
+    thinking: { type: 'disabled' as const }, stop_sequences: ['</block>'],
+    messages: [{ role: 'user' as const, content: '评估命令，不执行' }] };
+  const config = { sider: { enabled: true, apiUrl: 'https://sider.ai/api/chat/v1/completions', authToken: 'test' },
+    deepseek: { enabled: true, provider: 'anthropic-compatible' as const, baseUrl: 'https://classifier.example',
+      apiKey: 'test', model: 'glm-5.3-flash' },
+    routing: { defaultBackend: 'sider' as const, autoFallback: true, preferSiderForSimpleChat: true,
+      debugMode: false, siderStrategy: 'max' as const } };
+  try {
+    expect(isSafetyClassifierRequest(request)).toBe(true);
+    expect(isSafetyClassifierRequest({ ...request, system: undefined })).toBe(false);
+    expect(isSafetyClassifierRequest({ ...request, tools: [{ name: 'Bash', input_schema: { type: 'object', properties: {} } }] })).toBe(false);
+    const decision = new RouterEngine(config).decide(request);
+    expect(decision.backend).toBe('deepseek');
+    expect(decision.allowFallback).toBe(false);
+    globalThis.fetch = ((_url, init) => {
+      expect(String(_url)).toBe('https://classifier.example/v1/messages');
+      const body = JSON.parse(String(init?.body));
+      expect(body.thinking).toEqual({ type: 'disabled' });
+      expect(body.model).toBe('glm-5.3-flash');
+      expect(body.system).toBe(request.system);
+      return Promise.resolve(new Response(JSON.stringify({ id: 'classifier-bun', type: 'message',
+        role: 'assistant', model: body.model, content: [{ type: 'text', text: '<block>yes</block>' }],
+        stop_reason: 'end_turn', usage: { input_tokens: 10, output_tokens: 8 } }),
+        { headers: { 'content-type': 'application/json' } }));
+    }) as typeof fetch;
+    const result = await new AnthropicApiAdapter(config.deepseek).sendRequest(request);
+    expect(result.model).toBe(request.model);
+    expect(result.content).toEqual([{ type: 'text', text: '<block>yes' }]);
+    expect(result.stop_reason).toBe('stop_sequence');
+  } finally { globalThis.fetch = original; resetSiderThrottle(); }
+});
+
+test('Bun：1M标签与原名共享限流状态，发送边界只传原名', async () => {
+  const original = globalThis.fetch;
+  try {
+    const model = 'claude-sonnet-5.5';
+    recordSiderQuotaExhausted(model + '[1M]', 1000, 60_000);
+    expect(isSiderCooling(model, 1000)).toBe(true);
+    expect(isSiderCooling('claude-opus-5.5', 1000)).toBe(false);
+    for (let i = 0; i < 12; i++) consumeSiderSlot(model + '[1m]', 1000);
+    expect(canUseSider(model, 100, 1000).ok).toBe(false);
+    globalThis.fetch = ((_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(body.model).toBe(model);
+      expect(body.chat_models).toEqual(['claude-opus-5.5']);
+      return Promise.resolve(new Response('data: ' + JSON.stringify({ code: 0, msg: 'ok',
+        data: { type: 'text', model, text: '验证通过' } }) + '\n\n',
+        { headers: { 'content-type': 'text/event-stream' } }));
+    }) as typeof fetch;
+    const req = { ...convertAnthropicToSiderSync({ model,
+      messages: [{ role: 'user', content: '模型边界测试' }] }),
+      model: model + '[1M]', chat_models: ['claude-opus-5.5[1m]'] };
+    const result = await new SiderClient().chat(req, 'test');
+    expect(result.model).toBe(model);
+    expect(req.model).toBe(model + '[1M]');
+  } finally {
+    globalThis.fetch = original;
+    resetSiderAvailability();
+    resetSiderThrottle();
+  }
+});
+
+test('Bun：1M切换保持主控重放、历史恢复与冷却，真正换模型仍拒绝', async () => {
+  const original = globalThis.fetch;
+  const previous = { token: process.env.SIDER_AUTH_TOKEN, storage: process.env.SIDER_CONTROLLER_STORAGE,
+    pace: process.env.SIDER_CONTROLLER_PACE_MS };
+  process.env.SIDER_AUTH_TOKEN = 'window-controller-test';
+  process.env.SIDER_CONTROLLER_STORAGE = 'memory';
+  process.env.SIDER_CONTROLLER_PACE_MS = '0';
+  const owner = 'window-owner-' + crypto.randomUUID();
+  const model = 'claude-sonnet-5.5';
+  let calls = 0;
+  const store = await getControllerStore();
+  const cooldownKey = `cooldown:${await controllerHash('window-controller-test')}:${model}`;
+  try {
+    globalThis.fetch = ((_url, init) => {
+      calls++;
+      const body = JSON.parse(String(init?.body));
+      expect(body.model).toBe(model);
+      if (calls === 2) {
+        expect(body.cid).toBe('window-bun-cid');
+        expect(body.parent_message_id).toBe('window-bun-parent-1');
+      }
+      return Promise.resolve(new Response([
+        { code: 0, msg: 'ok', data: { type: 'message_start', model,
+          message_start: { cid: 'window-bun-cid', user_message_id: 'u',
+            assistant_message_id: `window-bun-parent-${calls}` } } },
+        { code: 0, msg: 'ok', data: { type: 'text', model, text: '已记住42' } },
+      ].map((e) => `data: ${JSON.stringify(e)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } }));
+    }) as typeof fetch;
+    const request = { model: model + '[1M]', messages: [{ role: 'user' as const, content: crypto.randomUUID() }] };
+    const first = await runSiderController(request, owner);
+    const replay = await runSiderController({ ...request, model }, owner);
+    expect(replay.id).toBe(first.id);
+    expect(replay.model).toBe(model);
+    expect(calls).toBe(1);
+    const next = await runSiderController({ model: model + '[200k]',
+      messages: [...request.messages, { role: 'assistant', content: first.content },
+        { role: 'user', content: '继续' }] }, owner);
+    expect(next.sider_session?.conversation_id).toBe(first.sider_session?.conversation_id);
+    expect(next.model).toBe(model + '[200k]');
+    await expect(runSiderController({ ...request, model: 'claude-opus-5.5' }, owner,
+      undefined, first.sider_session?.conversation_id)).rejects.toThrow('切换模型');
+    await store.write(cooldownKey, Date.now() + 60_000, 60_000);
+    await expect(runSiderController({ ...request, model: model + '[200k]',
+      messages: [{ role: 'user', content: crypto.randomUUID() }] }, owner)).rejects.toThrow('冷却');
+    expect(calls).toBe(2);
+  } finally {
+    globalThis.fetch = original;
+    await store.write(cooldownKey, 0, -1);
+    for (const [key, value] of [['SIDER_AUTH_TOKEN', previous.token],
+      ['SIDER_CONTROLLER_STORAGE', previous.storage], ['SIDER_CONTROLLER_PACE_MS', previous.pace]]) {
+      if (value === undefined) delete process.env[key!];
+      else process.env[key!] = value;
+    }
+  }
+});
 
 const tools: any[]=[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}},required:['file_path']}}];
 test('Bun续轮保留纯工具结果和错误标记',()=>{

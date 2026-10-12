@@ -77,9 +77,13 @@ Deno Deploy 必须关联可用的 Deno KV。主控状态存储失败会返回错
 
 主控模式要求使用模型目录中明确登记的名称。当前实际验证重点是 `claude-opus-5.5` 和 `claude-sonnet-5.5`，不会猜造 Opus 5.5 的 `-think` 别名，也不会静默改名为旧版 Opus。
 
+cc-switch／Claude Code 的 `[1M]`、`[200k]` 等窗口标签只保留在对外响应中。上游发送、主控历史指纹、任务模型、请求重放及限流状态统一使用基础模型名；切换窗口标签不会新建工具或丢失检查点，切换为另一模型仍会拒绝恢复原任务。窗口声明不代表 Sider 已支持相应容量，现有输入和分段上限仍生效。
+
 两个模型已在未显式传入 thinking 参数时返回推理事件。不能把 Anthropic 的同名 thinking 参数或展示思考块的开关理解为已验证的 Sider 思考预算控制。
 
 本期经过验证的工具链路直接由本地转换完成，**不会调用 GLM 重做业务回合**。GLM 参数猜测、重写正文以及会话接管没有作为主控模式的回退功能启用。现有兼容后端配置保留，关闭主控模式时可继续使用原有 GLM 路由。
+
+Claude Code 的无工具 XML 安全分类是独立请求：system 同时声明分类用途与 `<block>`／`<severity>` 协议时，配置的 `DEEPSEEK_*` 原生兼容后端负责分类，即使主控模式开启也如此。真实探测表明 Sider 文本通道可能把分类 system 视为改变自身规则而拒答；分类失败不会再回退到该通道。代理保留模型实际判定、停止序列与错误，不执行待评估命令。该功能依赖已配置的兼容后端，普通业务请求仍按原主控流程处理。
 
 强制工具回合若明确声称“提示注入、没有工具、无法访问文件系统”等，会直接返回协议拒绝错误，不再重复相同纠错。没有拒绝语义的普通漏调保留一次纠正；JSON、schema 和完整性错误仍保留原有纠正边界。
 
@@ -99,6 +103,9 @@ $env:E2E_CONTROLLER='true'
 $env:E2E_CONTROLLER_SECOND_URL='http://localhost:18002'
 $env:E2E_TIMEOUT_MS='600000'
 deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts 14
+
+# cc-switch窗口标签切换、跨实例续轮及XML安全分类。
+deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts 15
 
 # 实际Claude Code客户端；使用已安装的claude，或通过CLAUDE_CODE_BIN指定可执行文件。
 deno run --allow-net --allow-env --allow-read --allow-write=.runtime --allow-run deno/test/integration/claude-code-controller.ts

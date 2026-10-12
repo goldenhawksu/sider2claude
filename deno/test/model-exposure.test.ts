@@ -179,6 +179,64 @@ Deno.test('Claude Code上下文窗口标签不影响严格模型查找与映射'
   assertEquals(getModelById('claude-sonnet-5.5[beta]'), undefined);
 });
 
+Deno.test('cc-switch普通HTTP及SSE：1M标签和beta头不进入Sider请求', async () => {
+  const original = globalThis.fetch;
+  let count = 0;
+  try {
+    await withEnv({
+      AUTH_TOKEN: 'window-route-token',
+      SIDER_AUTH_TOKEN: 'sider-token',
+      SIDER_CONTROLLER: 'false',
+      DEFAULT_BACKEND: 'sider',
+      PREFER_SIDER_FOR_CHAT: 'true',
+      DEEPSEEK_API_KEY: undefined,
+      SIDER_STRATEGY: 'conservative',
+    }, async () => {
+      globalThis.fetch = ((_url, init) => {
+        count++;
+        const body = JSON.parse(String(init?.body));
+        assertEquals(body.model, 'claude-sonnet-5.5');
+        assertEquals(new Headers(init?.headers).has('anthropic-beta'), false);
+        return Promise.resolve(siderStreamResponse(body.model));
+      }) as typeof fetch;
+      const routes = await import(`../src/routes/messages-hybrid.ts?window=${crypto.randomUUID()}`);
+      const app = new Hono();
+      app.route('/v1/messages', routes.hybridMessagesRouter);
+      for (const stream of [false, true]) {
+        const model = stream ? 'claude-sonnet-5.5[1M]' : 'claude-sonnet-5.5[1m]';
+        const response = await app.request('/v1/messages?beta=true', {
+          method: 'POST',
+          headers: {
+            'x-api-key': 'window-route-token',
+            'content-type': 'application/json',
+            'anthropic-beta': 'context-1m-2025-08-07,prompt-caching-2024-07-31',
+          },
+          body: JSON.stringify({
+            model,
+            stream,
+            max_tokens: 128,
+            messages: [{ role: 'user', content: '只回答OK-' + crypto.randomUUID() }],
+          }),
+        });
+        assertEquals(response.status, 200);
+        if (stream) {
+          const raw = await response.text();
+          const events = raw.split(/\r?\n/).filter((line) => line.startsWith('data: '))
+            .map((line) => JSON.parse(line.slice(6)));
+          assertEquals(events.find((e) => e.type === 'message_start')?.message.model, model);
+          assertEquals(events.at(-1)?.type, 'message_stop');
+          assertEquals(events.some((e) => e.type === 'error'), false);
+        } else {
+          assertEquals((await response.json()).model, model);
+        }
+      }
+      assertEquals(count, 2);
+    });
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 Deno.test('Gemini model discovery exposes every upstream model', async () => {
   await withEnv({
     AUTH_TOKEN: 'test-token-12345',

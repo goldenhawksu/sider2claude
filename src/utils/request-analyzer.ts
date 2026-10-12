@@ -8,6 +8,13 @@ import { consola } from 'consola';
 
 export type RequestType = 'simple_chat' | 'tool_call' | 'tool_result_feedback';
 
+/** Claude Code 的无工具 XML 安全分类需要原生 system 角色，不能转为 Sider 用户文本。 */
+export function isSafetyClassifierRequest(request: AnthropicRequest): boolean {
+  return !request.tools?.length && typeof request.system === 'string' &&
+    /\b(?:classifier|classification)\b|安全分类/i.test(request.system) &&
+    /<(?:block|severity)>/i.test(request.system);
+}
+
 export interface RequestAnalysis {
   type: RequestType;
   hasClaudeCodeTools: boolean;

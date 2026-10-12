@@ -20,6 +20,8 @@
  * 该兜底还是兜底。
  */
 
+import { normalizeModelId } from '../config/models.ts';
+
 /** opus 档配额是小时/天级窗口，短冷却没有意义。 */
 const OPUS_COOLDOWN_MS = 60 * 60_000;
 /** 其余模型按上游自己的提示：约 1 分钟。 */
@@ -73,11 +75,12 @@ export function recordSiderQuotaExhausted(
   now = Date.now(),
   retryAfterMs?: number,
 ): void {
-  cooldownUntil.set(model, now + resolveSiderCooldownMs(model, retryAfterMs));
+  cooldownUntil.set(normalizeModelId(model), now + resolveSiderCooldownMs(model, retryAfterMs));
 }
 
 /** 该模型当前是否处于熔断期。 */
 export function isSiderCooling(model: string, now = Date.now()): boolean {
+  model = normalizeModelId(model);
   const until = cooldownUntil.get(model);
   if (until === undefined) {
     return false;
@@ -91,7 +94,7 @@ export function isSiderCooling(model: string, now = Date.now()): boolean {
 
 /** 剩余熔断时长（毫秒）；未熔断返回 0。仅用于日志与看板展示。 */
 export function siderCooldownRemainingMs(model: string, now = Date.now()): number {
-  const until = cooldownUntil.get(model);
+  const until = cooldownUntil.get(normalizeModelId(model));
   return until && until > now ? until - now : 0;
 }
 

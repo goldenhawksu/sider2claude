@@ -92,8 +92,8 @@ export class AnthropicApiAdapter {
     const key = upstreamKey(this.baseUrl, this.upstreamModel);
     // 调用方显式要了 extended thinking 就别替它做主：预算怎么分是它自己的选择。
     const callerWantsThinking = request.thinking?.type === 'enabled';
-    const disabledUpFront = !callerWantsThinking &&
-      shouldDisableThinking(key, request.max_tokens);
+    const disabledUpFront = request.thinking?.type === 'disabled' ||
+      (!callerWantsThinking && shouldDisableThinking(key, request.max_tokens));
 
     const first = await this.sendOnce(request, logContext, disabledUpFront);
 
@@ -817,7 +817,11 @@ export class AnthropicApiAdapter {
     logContext?: RequestLogContext,
   ): Promise<void> {
     const outwardModel = request.model;
-    const upstreamRequest = this.buildUpstreamRequest(request, true);
+    const upstreamRequest = this.buildUpstreamRequest(
+      request,
+      true,
+      request.thinking?.type === 'disabled',
+    );
     const deadline = createUpstreamDeadline(this.requestTimeoutMs);
 
     try {

@@ -226,12 +226,12 @@ export function getAllModels(): ModelInfo[] {
 }
 
 /** Claude Code 会给模型名附加 `[1m]` 等上下文窗口标签；上游查找只认基础名。 */
-function normalizeModelLookupId(id: string): string {
-  return id.trim().replace(/\[(?:\d+(?:\.\d+)?[km])\]$/i, '');
+export function normalizeModelId(id: string): string {
+  return id.trim().replace(/\[(?:\d+(?:\.\d+)?[km])\]$/i, '').toLowerCase();
 }
 
 export function getModelById(id: string): ModelInfo | undefined {
-  const normalized = normalizeModelLookupId(id).toLowerCase();
+  const normalized = normalizeModelId(id);
   return SUPPORTED_MODELS.find((modelInfo) => modelInfo.id.toLowerCase() === normalized);
 }
 
@@ -249,7 +249,7 @@ export function getFullModelMapping(): Record<string, string> {
  * 未显式登记的 Claude 族模型按模型家族保守映射到已探测过的 Sider 模型。
  */
 export function mapModelName(anthropicModel: string): string {
-  const normalizedModel = normalizeModelLookupId(anthropicModel).toLowerCase();
+  const normalizedModel = normalizeModelId(anthropicModel);
 
   const mapped = MODEL_MAP[normalizedModel];
   if (mapped) {

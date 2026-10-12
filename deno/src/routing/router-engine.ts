@@ -13,7 +13,7 @@ import {
   usesAdaptiveThrottle,
 } from '../config/backends.ts';
 import type { RequestAnalysis } from '../utils/request-analyzer.ts';
-import { RequestAnalyzer } from '../utils/request-analyzer.ts';
+import { isSafetyClassifierRequest, RequestAnalyzer } from '../utils/request-analyzer.ts';
 import { isSiderCooling, siderCooldownRemainingMs } from '../utils/sider-availability.ts';
 import { canUseSider, consumeSiderSlot } from '../utils/sider-throttle.ts';
 import { getEnv } from '../utils/env.ts';
@@ -56,7 +56,16 @@ export class RouterEngine {
     const analysis = this.analyzer.analyze(request);
     this.analyzer.logAnalysis(analysis, this.config.routing.debugMode);
 
-    const decision = this.applyRoutingRules(analysis, request.model, conversationId);
+    const decision: RoutingDecision =
+      isSafetyClassifierRequest(request) && this.config.deepseek.enabled
+        ? {
+          backend: 'deepseek',
+          reason: 'Safety classification requires native system and XML output support.',
+          confidence: 1,
+          allowFallback: false,
+          ruleId: 'rule_0_safety_classifier',
+        }
+        : this.applyRoutingRules(analysis, request.model, conversationId);
 
     // 决策定下来之后才扣令牌：applyRoutingRules 开头的可用性判断必须是只读的，
     // 因为那一刻还不知道工具规则会不会把决策覆盖成 DeepSeek。若检查即扣费，

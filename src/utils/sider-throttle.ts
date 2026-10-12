@@ -28,6 +28,8 @@
  * 测试，制造顺序相关的偶发失败。
  */
 
+import { normalizeModelId } from '../config/models.js';
+
 /** 频次：初始速率取 probe 实测（约 6 次/分）的 2 倍，主动上探而非保守起步。 */
 const INITIAL_RATE_PER_MIN = 12;
 const RATE_MIN_PER_MIN = 1;
@@ -139,6 +141,7 @@ function isOpusTier(model: string): boolean {
 }
 
 function stateFor(model: string, now: number): ModelThrottleState {
+  model = normalizeModelId(model);
   let state = states.get(model);
   if (!state) {
     state = {

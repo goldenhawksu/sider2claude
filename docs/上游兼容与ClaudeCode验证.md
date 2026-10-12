@@ -13,6 +13,13 @@ DeepSeek 对照来自项目此前官方入口的 `deepseek-v4-flash`／`deepseek
 `claude-sonnet-5.5[1m]` 形式的模型名。代理现仅在查找上游时剥离末尾 `[1m]`／`[200k]`
 数字窗口标签，主控与普通路由统一映射到基础模型；对外响应仍保留客户端原始名称。
 
+同日补修 cc-switch 的 1M 开关场景：Sider 最终发送边界也规范化 `model` 和 `chat_models`，
+检查点、历史、重放和两种限流状态不再把带标签与无标签名称当作不同模型。
+Claude Code 2.1.291 的 auto 分类使用 XML `<block>`／`<severity>` 协议；真实 Sider
+拒答复现后，明确的无工具 XML 分类统一选择配置的原生兼容后端，不受主控抢占或
+业务会话后端记忆影响。显式 `thinking: disabled` 在 JSON 和流式路径都被兑现，
+避免小预算分类被上游推理占满。模型判定和失败直接交回客户端，不伪造允许结果。
+
 同轮还确认 Z.ai 内置 `webReader` 对含中文路径的 GitHub URL（包括百分号编码 raw URL）
 可能返回 MCP -400。真实 raw SSE 证明：声明客户端 `webReader`／`WebFetch` 工具时，
 条件 system 指令可直接得到客户端 `tool_use`，避开两次无效的内置工具尝试。因此该提示

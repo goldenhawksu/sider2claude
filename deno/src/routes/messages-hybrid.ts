@@ -9,6 +9,7 @@
 import { Hono } from 'hono';
 import { controllerEnabled, controllerHandlesRequest } from '../utils/sider-controller.ts';
 import { controllerResponse } from '../utils/controller-http.ts';
+import { isSafetyClassifierRequest } from '../utils/request-analyzer.ts';
 import type { Context } from 'hono';
 import { getAuthInfo, requireAuth } from '../middleware/auth.ts';
 import type { AnthropicError, AnthropicRequest, AnthropicResponse } from '../types/anthropic.ts';
@@ -126,7 +127,10 @@ messagesRouter.post('/', async (c: Context) => {
 
     validateAnthropicRequest(anthropicRequest);
 
-    if (controllerHandlesRequest(anthropicRequest)) {
+    if (
+      controllerHandlesRequest(anthropicRequest) &&
+      !(capabilityAdapter && isSafetyClassifierRequest(anthropicRequest))
+    ) {
       return await controllerResponse(
         anthropicRequest,
         auth.token,

@@ -11,6 +11,7 @@ import { saveSiderSession, getOrCreateContinuousSession } from './sider-session-
 import { cancelUpstreamReader } from './stream-cancel.js';
 import { getEnv } from './env';
 import { fetchSiderResponse } from './sider-transport.js';
+import { normalizeModelId } from '../config/models.js';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -125,7 +126,14 @@ export class SiderClient {
           'X-App-Version': '5.13.0',
           'X-App-Name': 'ChitChat_Edge_Ext',
         },
-        body: JSON.stringify(request),
+        // cc-switch 的上下文窗口标签属于客户端配置，不能进入 Sider 模型参数。
+        body: JSON.stringify({
+          ...request,
+          model: normalizeModelId(request.model),
+          ...(request.chat_models
+            ? { chat_models: request.chat_models.map(normalizeModelId) }
+            : {}),
+        }),
         ...(signal ? { signal } : {}),
       }, this.timeout, this.totalTimeout);
 

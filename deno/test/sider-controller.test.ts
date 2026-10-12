@@ -187,6 +187,130 @@ Deno.test('主控HTTP：上下文窗口标签只用于对外展示，上游使�
     equal(body.content[0].text, '模型标签兼容');
   });
 });
+
+Deno.test('主控HTTP：1M开关切换不重复调用工具，续轮保持同一检查点', async () => {
+  let count = 0;
+  const request: AnthropicRequest = {
+    model: 'claude-sonnet-5.5[1m]',
+    tools,
+    messages: [{ role: 'user', content: '读取配置-' + crypto.randomUUID() }],
+  };
+  await appWithMock((body) => {
+    equal(body.model, 'claude-sonnet-5.5');
+    count++;
+    if (count === 1) {
+      return sse(
+        '[tool_use:Read] id=read_window input={"file_path":"config.json"}',
+        'window-cid',
+        'window-parent-1',
+        body.model,
+      );
+    }
+    equal(body.cid, 'window-cid');
+    equal(body.parent_message_id, 'window-parent-1');
+    return sse('端口18765', 'window-cid', 'window-parent-2', body.model);
+  }, async (app) => {
+    const first = await (await send(app, request)).json();
+    const replay = await (await send(app, { ...request, model: 'claude-sonnet-5.5' })).json();
+    equal(replay.model, 'claude-sonnet-5.5');
+    equal(replay.content, first.content);
+    equal(count, 1);
+    // 模拟升级前以带标签模型名保存的检查点。
+    const store = await getControllerStore();
+    const key = `${await controllerHash(
+      'controller-test-token',
+    )}:task:${first.sider_session.conversation_id}`;
+    const task = await store.read<Record<string, unknown>>(key);
+    await store.write(key, { ...task, model: request.model }, 60_000);
+    const next = await send(app, {
+      ...request,
+      model: 'claude-sonnet-5.5[200k]',
+      messages: [...request.messages, { role: 'assistant', content: first.content }, {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: first.content[0].id,
+          content: '{"port":18765}',
+        }],
+      }],
+    });
+    equal(next.status, 200);
+    const result = await next.json();
+    equal(result.model, 'claude-sonnet-5.5[200k]');
+    equal(result.sider_session.conversation_id, first.sider_session.conversation_id);
+    equal(result.content[0].text, '端口18765');
+    equal(count, 2);
+  });
+});
+
+Deno.test('主控HTTP：无cid纯对话切换1M标签后通过历史恢复，真正换模型仍拒绝', async () => {
+  let count = 0;
+  const request: AnthropicRequest = {
+    model: 'claude-sonnet-5.5',
+    messages: [{ role: 'user', content: '记住标记-' + crypto.randomUUID() }],
+  };
+  await appWithMock((body) => {
+    count++;
+    equal(body.model, 'claude-sonnet-5.5');
+    if (count === 2) {
+      equal(body.cid, 'history-window-cid');
+      equal(body.parent_message_id, 'history-window-parent-1');
+    }
+    return sse('已记住', 'history-window-cid', `history-window-parent-${count}`, body.model);
+  }, async (app) => {
+    const first = await (await send(app, request)).json();
+    const messages: AnthropicRequest['messages'] = [...request.messages, {
+      role: 'assistant',
+      content: first.content,
+    }, { role: 'user', content: '继续回答' }];
+    const next = await send(app, { ...request, model: 'claude-sonnet-5.5[1M]', messages });
+    equal(next.status, 200);
+    const result = await next.json();
+    equal(result.model, 'claude-sonnet-5.5[1M]');
+    equal(result.sider_session.conversation_id, first.sider_session.conversation_id);
+    const wrong = await app.request('/v1/messages?cid=' + first.sider_session.conversation_id, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...request, model: 'claude-opus-5.5' }),
+    });
+    equal(wrong.status, 400);
+    equal(count, 2);
+  });
+});
+
+Deno.test('主控HTTP：1M标签和原名共享冷却，不通过改名重试上游', async () => {
+  let count = 0;
+  const store = await getControllerStore();
+  const key = `cooldown:${await controllerHash('controller-sider-token')}:claude-sonnet-5.5`;
+  const decoratedKey = key + '[1m]';
+  try {
+    await appWithMock(() => {
+      count++;
+      return new Response(
+        'data: ' +
+          JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.', data: null }) +
+          '\n\n',
+        { headers: { 'content-type': 'text/event-stream' } },
+      );
+    }, async (app) => {
+      for (
+        const model of ['claude-sonnet-5.5[1m]', 'claude-sonnet-5.5', 'claude-sonnet-5.5[200k]']
+      ) {
+        const result = await send(app, {
+          model,
+          messages: [{ role: 'user', content: crypto.randomUUID() }],
+        });
+        equal(result.status, 429);
+        equal(Number(result.headers.get('retry-after')) > 0, true);
+      }
+      equal(count, 1);
+    });
+  } finally {
+    await store.write(key, 0, -1);
+    await store.write(decoratedKey, 0, -1);
+    await store.write(key + '[200k]', 0, -1);
+  }
+});
 Deno.test('主控HTTP：tool映射丢失时从history唯一任务自愈并补回映射', async () => {
   let count = 0;
   const request: AnthropicRequest = {

@@ -5,7 +5,7 @@ import type {
   AnthropicToolUse,
 } from '../types/anthropic.ts';
 import { getEnv } from './env.ts';
-import { getModelById } from '../config/models.ts';
+import { getModelById, normalizeModelId } from '../config/models.ts';
 import { siderClient } from './sider-client.ts';
 import { SiderUpstreamError } from './sse-line-reader.ts';
 import { buildSiderMessageText, contentToText } from './message-format.ts';
@@ -209,7 +209,11 @@ async function historyKey(request: AnthropicRequest, messages = request.messages
       : message.content.filter((block) => !['thinking', 'redacted_thinking'].includes(block.type)),
   }));
   return await controllerHash(
-    JSON.stringify({ model: request.model, system: request.system, messages: normalized }),
+    JSON.stringify({
+      model: normalizeModelId(request.model),
+      system: request.system,
+      messages: normalized,
+    }),
   );
 }
 async function resolveTask(
@@ -247,7 +251,8 @@ async function resolveTask(
   id ??= historyId;
   const task = id ? await store.read<Task>(`${owner}:task:${id}`) : null;
   if (id && !task) throw new ControllerError('主控检查点已过期', 400);
-  if (task && task.model !== request.model) {
+  const model = getModelById(request.model)!.siderModel;
+  if (task && getModelById(task.model)?.siderModel !== model) {
     throw new ControllerError('恢复主控会话时不能静默切换模型', 400);
   }
   if (results.length) {
@@ -260,8 +265,9 @@ async function resolveTask(
       if (!await store.read<string>(key)) await store.write(key, task.id, RETENTION_MS);
     }
   }
+  if (task) task.model = model;
   return task ??
-    { id: crypto.randomUUID(), model: request.model, cid: '', parent: '', refs: [], pending: [] };
+    { id: crypto.randomUUID(), model, cid: '', parent: '', refs: [], pending: [] };
 }
 function pendingUserMessages(request: AnthropicRequest) {
   let lastAssistant = -1;
@@ -388,7 +394,8 @@ export async function runSiderController(
   signal?: AbortSignal,
   session?: string,
 ): Promise<AnthropicResponse> {
-  if (!getModelById(request.model)) {
+  const model = getModelById(request.model);
+  if (!model) {
     throw new ControllerError('主控模式要求明确登记的上游模型名', 400);
   }
   if (request.messages.some((m) => containsImage(m.content))) {
@@ -412,12 +419,20 @@ export async function runSiderController(
     totalMs,
     async () => {
       const replayKey = `${owner}:response:${await controllerHash(
-        JSON.stringify({ session: session ?? null, request: { ...request, stream: undefined } }),
+        JSON.stringify({
+          session: session ?? null,
+          request: { ...request, model: model.siderModel, stream: undefined },
+        }),
       )}`;
       const cached = await store.read<{ responseKey: string }>(replayKey);
-      if (cached) return JSON.parse(await readControllerText(store, cached.responseKey));
+      if (cached) {
+        return {
+          ...JSON.parse(await readControllerText(store, cached.responseKey)),
+          model: request.model,
+        };
+      }
       const cooldown = await store.read<number>(
-        `cooldown:${await controllerHash(siderToken)}:${request.model}`,
+        `cooldown:${await controllerHash(siderToken)}:${model.siderModel}`,
       );
       if (cooldown && cooldown > Date.now()) {
         throw new ControllerError(
@@ -612,7 +627,7 @@ export async function runSiderController(
           const body = {
             cid: task.cid,
             ...(task.parent ? { parent_message_id: task.parent } : {}),
-            model: getModelById(request.model)!.siderModel,
+            model: model.siderModel,
             from: 'chat',
             filter_search_history: false,
             multi_content: [{ type: 'text' as const, text: prompt, user_input_text: prompt }],
@@ -659,7 +674,7 @@ export async function runSiderController(
           if (error instanceof SiderUpstreamError && error.siderCode === 1135) {
             const wait = error.retryAfterMs ?? 60_000;
             await store.write(
-              `cooldown:${await controllerHash(siderToken)}:${request.model}`,
+              `cooldown:${await controllerHash(siderToken)}:${model.siderModel}`,
               Date.now() + wait,
               wait,
             );
@@ -672,7 +687,7 @@ export async function runSiderController(
             RETENTION_MS,
           );
         }
-        if (upstream.model !== getModelById(request.model)!.siderModel) {
+        if (upstream.model !== model.siderModel) {
           throw new ControllerError(
             'Sider返回模型标识与主控请求不一致',
           );
