@@ -409,6 +409,51 @@ export const TEXTUAL_TOOL_LINE_SHAPE =
 
 /** 裸 Write 仅作为纠错信号，绝不直接从无标识的普通文本创建可执行调用。 */
 export function hasBareWriteToolUse(text: string): boolean {
+  return findBareToolUse(text, /^Write\s*\{\s*"(?:file_path|content|content_truncated)"\s*:/) !==
+    undefined;
+}
+
+/** 裸 Bash 只触发协议纠错，客户端执行仍须等待上游原生调用。 */
+export function hasBareBashToolUse(text: string): boolean {
+  return findBareToolUse(
+    text,
+    /^Bash\s*\{\s*"(?:command|description|timeout|run_in_background)"\s*:/,
+  ) !== undefined;
+}
+
+/** 只提取单个严格 JSON 的完整参数，作为纠错前后的逐字比较依据。 */
+export function bareBashInputFromText(text: string): Record<string, unknown> | undefined {
+  const index = findBareToolUse(
+    text,
+    /^Bash\s*\{\s*"(?:command|description|timeout|run_in_background)"\s*:/,
+  );
+  if (index === undefined) return undefined;
+  const start = text.indexOf('{', index);
+  let depth = 0, quoted = false;
+  for (let cursor = start; cursor < text.length; cursor += 1) {
+    const char = text[cursor];
+    if (quoted) {
+      if (char === '\\') cursor += 1;
+      else if (char === '"') quoted = false;
+    } else if (char === '"') quoted = true;
+    else if (char === '{') depth += 1;
+    else if (char === '}' && --depth === 0) {
+      try {
+        const input = JSON.parse(text.slice(start, cursor + 1));
+        if (
+          typeof input.command !== 'string' || !input.command.trim() ||
+          hasBareBashToolUse(text.slice(cursor + 1))
+        ) return undefined;
+        return input;
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return undefined;
+}
+
+function findBareToolUse(text: string, pattern: RegExp): number | undefined {
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index]!;
     // 跳过代码围栏、行内代码及引用字符串，避免把文档示例当作写入意图。
@@ -417,7 +462,7 @@ export function hasBareWriteToolUse(text: string): boolean {
       while (text[end] === char) end += 1;
       const delimiter = text.slice(index, end);
       const close = text.indexOf(delimiter, end);
-      if (close === -1) return false;
+      if (close === -1) return undefined;
       index = close + delimiter.length - 1;
       continue;
     }
@@ -432,10 +477,10 @@ export function hasBareWriteToolUse(text: string): boolean {
     }
     if (
       (index === 0 || /\s/.test(text[index - 1]!)) &&
-      /^Write\s*\{\s*"(?:file_path|content|content_truncated)"\s*:/.test(text.slice(index))
-    ) return true;
+      pattern.test(text.slice(index))
+    ) return index;
   }
-  return false;
+  return undefined;
 }
 
 /**

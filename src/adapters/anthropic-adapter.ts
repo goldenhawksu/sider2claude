@@ -22,8 +22,10 @@ import {
   type RequestLogContext,
 } from '../utils/request-observability';
 import {
+  bareBashInputFromText,
   collectHistoryToolUseIds,
   collectToolInputKeys,
+  hasBareBashToolUse,
   hasBareWriteToolUse,
   isValidWriteInput,
   normalizeTextualToolUseBlocks,
@@ -59,6 +61,11 @@ export class AnthropicBackendError extends Error {
 
 class InvalidWriteToolInputError extends AnthropicBackendError {
   response?: Record<string, unknown>;
+}
+
+class InvalidBashToolInputError extends AnthropicBackendError {
+  response?: Record<string, unknown>;
+  input?: Record<string, unknown>;
 }
 
 export class AnthropicApiAdapter {
@@ -101,26 +108,49 @@ export class AnthropicApiAdapter {
     try {
       first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront);
     } catch (error) {
+      const bashError = error instanceof InvalidBashToolInputError ? error : undefined;
       const retryRequest = error instanceof InvalidWriteToolInputError
         ? this.buildWriteRetryRequest(request, error.response)
+        : bashError
+        ? this.buildBashRetryRequest(request, bashError.response, bashError.input)
         : undefined;
       if (!retryRequest) throw error;
 
-      logWarn('invalid_write_tool_input_retry', {
-        ...this.contextFields(logContext),
-        provider: this.provider,
-        upstreamModel: this.upstreamModel,
-      }, 'Retrying invalid Write as one forced structured tool call');
+      logWarn(
+        bashError ? 'invalid_bash_tool_input_retry' : 'invalid_write_tool_input_retry',
+        {
+          ...this.contextFields(logContext),
+          provider: this.provider,
+          upstreamModel: this.upstreamModel,
+        },
+        bashError
+          ? 'Bash 协议纠错：请求原命令的单个结构化调用'
+          : 'Retrying invalid Write as one forced structured tool call',
+      );
       effectiveRequest = retryRequest;
       try {
-        first = await this.sendOnce(effectiveRequest, logContext, disabledUpFront, true);
+        first = await this.sendOnce(
+          effectiveRequest,
+          logContext,
+          disabledUpFront,
+          !bashError,
+          bashError?.input,
+        );
       } catch (retryError) {
-        if (retryError instanceof InvalidWriteToolInputError) {
-          logError('invalid_write_tool_input_retry_failed', {
-            ...this.contextFields(logContext),
-            provider: this.provider,
-            upstreamModel: this.upstreamModel,
-          });
+        if (
+          retryError instanceof InvalidWriteToolInputError ||
+          retryError instanceof InvalidBashToolInputError
+        ) {
+          logError(
+            bashError
+              ? 'invalid_bash_tool_input_retry_failed'
+              : 'invalid_write_tool_input_retry_failed',
+            {
+              ...this.contextFields(logContext),
+              provider: this.provider,
+              upstreamModel: this.upstreamModel,
+            },
+          );
         }
         throw retryError;
       }
@@ -223,11 +253,79 @@ export class AnthropicApiAdapter {
     }
   }
 
+  private buildBashRetryRequest(
+    request: AnthropicRequest,
+    response?: Record<string, unknown>,
+    input?: Record<string, unknown>,
+  ): AnthropicRequest | undefined {
+    const bash = request.tools?.find((tool) => tool.name === 'Bash');
+    const content = Array.isArray(response?.content) ? response.content : [];
+    if (
+      !bash || !input || !validDeclaredToolInput(request.tools, bash.name, input) ||
+      request.tool_choice?.type === 'none' ||
+      (request.tool_choice?.type === 'tool' && request.tool_choice.name !== bash.name) ||
+      content.some((block) =>
+        block && typeof block === 'object' &&
+        (block.type === 'server_tool_use' || 'tool_use_id' in block)
+      )
+    ) return undefined;
+    const instruction =
+      'Bash correction: the previous response was text, and no client command was executed. ' +
+      'Convert the original Bash call to exactly one native structured tool_use with a new id. ' +
+      'Preserve every input field exactly, including command, quotes, backslashes, pipes, newlines, timeout and background options. ' +
+      'Do not change the command, run it server-side, claim completion, or emit another text transcript.';
+    return {
+      ...request,
+      tools: [bash],
+      system: request.system ? `${request.system}\n\n${instruction}` : instruction,
+      messages: [...request.messages, {
+        role: 'assistant',
+        content: 'Rejected response; no client tool was executed:\n' +
+          JSON.stringify(content.filter((block) => block?.type === 'text')),
+      }, { role: 'user', content: instruction }],
+      tool_choice: { type: 'tool', name: bash.name },
+    };
+  }
+
+  /** Bash 纠错只改变调用格式，任何命令或参数变化都必须阻断。 */
+  private validateBashRetryResponse(
+    data: unknown,
+    request: AnthropicRequest,
+    expected: Record<string, unknown>,
+  ): void {
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+    const content = Array.isArray(raw.content) ? raw.content : [];
+    const calls = content.filter((block) => block?.type === 'tool_use');
+    const call = calls[0];
+    if (
+      calls.length !== 1 || call?.name !== 'Bash' ||
+      typeof call.id !== 'string' || !call.id.trim() ||
+      collectHistoryToolUseIds(request.messages).has(call.id) ||
+      !validDeclaredToolInput(request.tools, call.name, call.input) ||
+      Object.keys(call.input).length !== Object.keys(expected).length ||
+      Object.keys(expected).some((key) =>
+        JSON.stringify(call.input[key]) !== JSON.stringify(expected[key])
+      ) ||
+      (raw.stop_reason !== 'end_turn' && raw.stop_reason !== 'tool_use') ||
+      content.some((block) =>
+        block && typeof block === 'object' &&
+        (block.type === 'server_tool_use' || 'tool_use_id' in block)
+      )
+    ) {
+      throw new InvalidBashToolInputError(
+        'Bash 纠错未返回单个新的原生调用，或改变了原命令参数；已阻止执行。',
+        502,
+        this.provider,
+      );
+    }
+  }
+
   private async sendOnce(
     request: AnthropicRequest,
     logContext: RequestLogContext | undefined,
     disableThinking: boolean,
     requireStructuredWrite = false,
+    expectedBashInput?: Record<string, unknown>,
   ): Promise<AnthropicResponse> {
     const startTime = Date.now();
     const outwardModel = request.model;
@@ -292,6 +390,7 @@ export class AnthropicApiAdapter {
         });
       });
       if (requireStructuredWrite) this.validateWriteRetryResponse(data, request);
+      if (expectedBashInput) this.validateBashRetryResponse(data, request, expectedBashInput);
       const normalized = this.restoreExactWriteInput(
         this.normalizeResponse(
           data,
@@ -305,6 +404,7 @@ export class AnthropicApiAdapter {
           request.stop_sequences,
           request.tool_choice?.type !== 'tool' ||
             request.tool_choice.name.toLowerCase() === 'write',
+          request.tool_choice?.type !== 'tool' || request.tool_choice.name === 'Bash',
         ),
         request,
         logContext,
@@ -689,6 +789,7 @@ ${instruction}${writeInstruction}${clientWebInstruction}`
     allowTextualToolUse = true,
     stopSequences?: string[],
     allowBareWrite = true,
+    allowBareBash = true,
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -727,6 +828,29 @@ ${instruction}${writeInstruction}${clientWebInstruction}`
           this.provider,
         );
       }
+      if (
+        allowBareBash && allowTextualToolUse && toolInputKeys?.has('Bash') &&
+        Array.isArray(raw.content) && !raw.content.some((block) => block?.type === 'tool_use')
+      ) {
+        const texts = raw.content.filter((block) =>
+          block?.type === 'text' &&
+          typeof block.text === 'string' && hasBareBashToolUse(block.text)
+        );
+        if (texts.length) {
+          logWarn('unstructured_bash_tool_input', {
+            ...this.contextFields(logContext),
+            provider: this.provider,
+          });
+          const error = new InvalidBashToolInputError(
+            '上游 Bash 以普通文本返回，尚未执行；需要单个完整原生调用，禁止猜测或改写命令。',
+            502,
+            this.provider,
+          );
+          const input = texts.length === 1 ? bareBashInputFromText(texts[0].text) : undefined;
+          if (input) error.input = input;
+          throw error;
+        }
+      }
       content = this.normalizeContent(
         raw.content,
         logContext,
@@ -735,7 +859,9 @@ ${instruction}${writeInstruction}${clientWebInstruction}`
         allowTextualToolUse,
       );
     } catch (error) {
-      if (error instanceof InvalidWriteToolInputError) error.response = raw;
+      if (
+        error instanceof InvalidWriteToolInputError || error instanceof InvalidBashToolInputError
+      ) error.response = raw;
       throw error;
     }
     const stopReason = this.normalizeStopReason(raw.stop_reason);
