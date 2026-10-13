@@ -707,7 +707,8 @@ export function parseTextualToolUseLine(
 
 /**
  * Write 先走严格 JSON；仅对 `file_path` 在前、`content` 在末的双字段对象恢复裸引号。
- * 该顺序让正文边界由对象末尾唯一确定；出现疑似额外 JSON 字段时仍拒绝，避免覆盖路径或截断正文。
+ * 该顺序让正文边界由对象末尾唯一确定；出现疑似额外 JSON 字段或未转义控制字符时仍拒绝，
+ * 避免把已经截断、拼接的正文误判为可安全恢复。
  */
 function parseWriteToolInputJson(inputText: string): unknown {
   try {
@@ -719,10 +720,17 @@ function parseWriteToolInputJson(inputText: string): unknown {
   const match = inputText.match(
     /^\{\s*"file_path"\s*:\s*"((?:\\[\s\S]|[^"\\])*)"\s*,\s*"content"\s*:\s*"([\s\S]*)"\s*\}\s*$/,
   );
-  if (!match || hasAmbiguousWriteFieldBoundary(match[2] ?? '')) return undefined;
+  if (!match) return undefined;
 
-  const filePath = decodeWriteStringBody(match[1] ?? '', false);
-  const content = decodeWriteStringBody(match[2] ?? '', true);
+  const filePathBody = match[1] ?? '';
+  const contentBody = match[2] ?? '';
+  if (
+    hasRawJsonControlCharacter(filePathBody) || hasRawJsonControlCharacter(contentBody) ||
+    hasAmbiguousWriteFieldBoundary(contentBody)
+  ) return undefined;
+
+  const filePath = decodeWriteStringBody(filePathBody, false);
+  const content = decodeWriteStringBody(contentBody, true);
   if (filePath === undefined || content === undefined) return undefined;
   return { file_path: filePath, content };
 }
@@ -739,6 +747,13 @@ function hasAmbiguousWriteFieldBoundary(body: string): boolean {
   return false;
 }
 
+function hasRawJsonControlCharacter(body: string): boolean {
+  for (let index = 0; index < body.length; index += 1) {
+    if (body.charCodeAt(index) <= 0x1f) return true;
+  }
+  return false;
+}
+
 function decodeWriteStringBody(body: string, allowRawQuotes: boolean): string | undefined {
   let escaped = '';
   for (let index = 0; index < body.length; index += 1) {
@@ -748,12 +763,6 @@ function decodeWriteStringBody(body: string, allowRawQuotes: boolean): string | 
       index += 1;
     } else if (allowRawQuotes && char === '"') {
       escaped += '\\"';
-    } else if (char === '\n') {
-      escaped += '\\n';
-    } else if (char === '\r') {
-      escaped += '\\r';
-    } else if (char === '\t') {
-      escaped += '\\t';
     } else {
       escaped += char;
     }

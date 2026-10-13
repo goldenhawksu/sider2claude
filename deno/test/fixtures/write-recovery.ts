@@ -20,6 +20,15 @@ const bad = {
   type: 'text',
   text: '[tool_use:Write] id=bad input={"file_path":"D:/slides/06_runtimes.svg","content":',
 };
+const corruptedPptSpec = {
+  type: 'text',
+  text: String
+    .raw`Previous assistant tool request: name=Write id=bad_ppt_spec input_json={"file_path":"D:\AI_Coder\ppt-master\projects\guide\spec_lock.md","content":"# Execution Lock\n\n## page_charts\n- P16: basic_table
+- Mixing icon libraries
+- rgba()
+- <style>, class, foreignObject Executor re-reads spec_lock.md before every page.
+..."}`,
+};
 
 interface RecoveryCase {
   name: string;
@@ -35,6 +44,13 @@ interface RecoveryCase {
 
 // 两个运行时共用故障样例和断言，确保同一输入具有相同结果。
 export const WRITE_RECOVERY_CASES: RecoveryCase[] = [
+  {
+    name: 'PPT spec：转义换行中途退化为原始换行时必须纠错',
+    first: [corruptedPptSpec],
+    second: [write],
+    retry: true,
+    write: true,
+  },
   {
     name: '附件格式：行内 Write 与 Bash 普通文本只纠正 Write',
     first: [{ type: 'thinking', thinking: '生成 P06' }, {
