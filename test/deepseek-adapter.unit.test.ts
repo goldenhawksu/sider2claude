@@ -10,6 +10,7 @@ import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
 import type { AnthropicRequest } from '../src/types/anthropic';
 import {
   BASH_RECOVERY_CASES,
+  runBashIdStabilityCase,
   runBashRecoveryCase,
   runBashStreamRecoveryCase,
 } from '../deno/test/fixtures/bash-recovery.ts';
@@ -30,6 +31,17 @@ for (const sample of BASH_RECOVERY_CASES) {
 }
 
 const originalFetch = globalThis.fetch;
+
+test('Bash 请求重试及明确重新执行的标识边界', () =>
+  runBashIdStabilityCase(
+    new AnthropicApiAdapter({
+      enabled: true,
+      provider: 'anthropic-compatible',
+      baseUrl: 'https://bash.example',
+      apiKey: 'test-key',
+      model: 'glm-5.3-flash',
+    }),
+  ));
 
 for (const corrected of [true, false]) {
   test(`Bash HTTP/SSE：纠错${corrected ? '成功' : '失败'}的下发边界`, async () => {

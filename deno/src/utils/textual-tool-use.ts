@@ -413,30 +413,53 @@ export function hasBareWriteToolUse(text: string): boolean {
     undefined;
 }
 
-/** 裸 Bash 只触发协议纠错，客户端执行仍须等待上游原生调用。 */
+/** 识别新提出的裸 Bash，代码示例、历史回顾和否定指令保持普通文本。 */
 export function hasBareBashToolUse(text: string): boolean {
-  return findBareToolUse(
-    text,
-    /^Bash\s*\{\s*"(?:command|description|timeout|run_in_background)"\s*:/,
-  ) !== undefined;
+  return findBareBashToolUse(text) !== undefined;
 }
 
-/** 只提取单个严格 JSON 的完整参数，作为纠错前后的逐字比较依据。 */
-export function bareBashInputFromText(text: string): Record<string, unknown> | undefined {
+function findBareBashToolUse(text: string): number | undefined {
   const index = findBareToolUse(
     text,
     /^Bash\s*\{\s*"(?:command|description|timeout|run_in_background)"\s*:/,
   );
   if (index === undefined) return undefined;
+  const prefix = text.slice(0, index).trimEnd();
+  if (
+    /(?:示例|例如|例子|回顾|历史记录|example|previous|不要执行.{0,16}|不能执行.{0,16}|不会执行.{0,16}|cannot execute.{0,16})\s*[:：]?$/i
+      .test(prefix)
+  ) return undefined;
+  return index;
+}
+
+/** 只提取单个完整的严格 JSON；重复字段不能覆盖原命令。 */
+export function bareBashInputFromText(text: string): Record<string, unknown> | undefined {
+  const index = findBareBashToolUse(text);
+  if (index === undefined) return undefined;
   const start = text.indexOf('{', index);
   let depth = 0, quoted = false;
+  const keys = new Set<string>();
   for (let cursor = start; cursor < text.length; cursor += 1) {
     const char = text[cursor];
     if (quoted) {
       if (char === '\\') cursor += 1;
       else if (char === '"') quoted = false;
-    } else if (char === '"') quoted = true;
-    else if (char === '{') depth += 1;
+    } else if (char === '"') {
+      if (depth === 1) {
+        const literal = readStringLiteral(text, cursor);
+        if (!literal) return undefined;
+        if (/^\s*:/.test(text.slice(literal.end))) {
+          try {
+            const key = JSON.parse('"' + literal.body + '"');
+            if (keys.has(key)) return undefined;
+            keys.add(key);
+          } catch {
+            return undefined;
+          }
+        }
+      }
+      quoted = true;
+    } else if (char === '{') depth += 1;
     else if (char === '}' && --depth === 0) {
       try {
         const input = JSON.parse(text.slice(start, cursor + 1));
