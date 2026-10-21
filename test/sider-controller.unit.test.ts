@@ -141,6 +141,98 @@ test('Bun：1M切换保持主控重放、历史恢复与冷却，真正换模型
 });
 
 const tools: any[]=[{name:'Read',input_schema:{type:'object',properties:{file_path:{type:'string'}},required:['file_path']}}];
+test('Bun：后台PowerShell历史恢复后继续查询，重试不重放且新工具续接原会话', async () => {
+  const original = globalThis.fetch;
+  const keys = ['SIDER_AUTH_TOKEN', 'SIDER_CONTROLLER_STORAGE', 'SIDER_CONTROLLER_PACE_MS'];
+  const previous = keys.map((key) => process.env[key]);
+  process.env.SIDER_AUTH_TOKEN = 'checkpoint-bun-test';
+  process.env.SIDER_CONTROLLER_STORAGE = 'memory';
+  process.env.SIDER_CONTROLLER_PACE_MS = '0';
+  const id = 'native_' + crypto.randomUUID();
+  const owner = 'checkpoint-owner-' + crypto.randomUUID();
+  const request = { model: 'claude-sonnet-5.5', tools: [{ name: 'TaskOutput', input_schema: {
+    type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'],
+  } }], messages: [
+    { role: 'user' as const, content: '根据生图后台任务输出继续完成，不要重新运行命令。' },
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id, name: 'PowerShell',
+      input: { command: 'python skills/ppt-master/scripts/image_gen.py --manifest images/image_prompts.json', timeout: 600000 } }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: id,
+      content: 'Command running in background with ID: blvuwvc0a. Output is being written to: C:/Temp/blvuwvc0a.output' }] },
+    { role: 'user' as const, content: '请继续完成' },
+  ] };
+  let calls = 0;
+  try {
+    globalThis.fetch = ((_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      calls++;
+      const text = body.multi_content[0].text;
+      if (calls === 1) {
+        expect(body.cid).toBe('');
+        for (const value of ['image_gen.py --manifest', 'blvuwvc0a.output', '请继续完成', `tool_use_id=${id}`]) {
+          expect(text.includes(value)).toBe(true);
+        }
+      } else {
+        expect(body.cid).toBe('checkpoint-bun-cid');
+        expect(body.parent_message_id).toBe('checkpoint-bun-parent-1');
+        expect(text.includes('tool_use_id=poll_1')).toBe(true);
+        expect(text.includes('图片已生成')).toBe(true);
+        expect(text.includes('image_gen.py')).toBe(false);
+      }
+      return Promise.resolve(new Response([
+        { code: 0, msg: 'ok', data: { type: 'message_start', model: request.model,
+          message_start: { cid: 'checkpoint-bun-cid', user_message_id: 'u', assistant_message_id: `checkpoint-bun-parent-${calls}` } } },
+        { code: 0, msg: 'ok', data: { type: 'text', model: request.model,
+          text: calls === 1 ? '[tool_use:TaskOutput] id=poll_1 input={"task_id":"blvuwvc0a"}' : '图片已生成，任务完成' } },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } }));
+    }) as typeof fetch;
+    const first = await runSiderController(request, owner);
+    const call = first.content.find((block) => block.type === 'tool_use')!;
+    expect(call.name).toBe('TaskOutput');
+    expect(call.input).toEqual({ task_id: 'blvuwvc0a' });
+    expect((await runSiderController(request, owner)).id).toBe(first.id);
+    expect(calls).toBe(1);
+    const store = await getControllerStore();
+    await store.write(`${await controllerHash(owner)}:tool:${call.id}`, 'expired', -1);
+    const next = await runSiderController({ ...request, messages: [...request.messages,
+      { role: 'assistant', content: first.content },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: '图片已生成' }] },
+      { role: 'user', content: '请继续完成' },
+    ] }, owner);
+    expect(next.stop_reason).toBe('end_turn');
+    expect(next.sider_session?.conversation_id).toBe(first.sider_session?.conversation_id);
+    expect(calls).toBe(2);
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
+
+test('Bun：无检查点的孤立、重复和缺失结果仍拒绝，不能请求上游', async () => {
+  const original = globalThis.fetch;
+  const previous = process.env.SIDER_AUTH_TOKEN;
+  process.env.SIDER_AUTH_TOKEN = 'invalid-checkpoint-bun';
+  const call = { type: 'tool_use' as const, id: crypto.randomUUID(), name: 'PowerShell', input: { command: 'echo ok' } };
+  const result = { type: 'tool_result' as const, tool_use_id: call.id, content: 'ok' };
+  try {
+    globalThis.fetch = (() => { throw new Error('无效历史不应请求上游'); }) as typeof fetch;
+    for (const messages of [
+      [{ role: 'user' as const, content: [result] }],
+      [{ role: 'assistant' as const, content: [call] }, { role: 'user' as const, content: [result, result] }],
+      [{ role: 'assistant' as const, content: [call, { ...call, id: 'missing-result' }] }, { role: 'user' as const, content: [result] }],
+    ]) {
+      await expect(runSiderController({ model: 'claude-sonnet-5.5', messages }, crypto.randomUUID())).rejects.toMatchObject({ statusCode: 400 });
+    }
+  } finally {
+    globalThis.fetch = original;
+    if (previous === undefined) delete process.env.SIDER_AUTH_TOKEN;
+    else process.env.SIDER_AUTH_TOKEN = previous;
+  }
+});
+
 test('Bun续轮保留纯工具结果和错误标记',()=>{
   const request:any={model:'claude-opus-5.5',messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'id',is_error:true,content:'端口8080'}]}]};
   const text=convertAnthropicToSiderSync(request,'real-cid').multi_content[0]!.text;

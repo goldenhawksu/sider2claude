@@ -216,9 +216,13 @@ async function resolveTask(
   session?: string,
 ): Promise<Task> {
   let id: string | null = session ? await store.read(`${owner}:session:${session}`) : null;
-  const historyId = request.messages.length > 1
+  let lastAssistant = -1;
+  request.messages.forEach((message, index) => {
+    if (message.role === 'assistant') lastAssistant = index;
+  });
+  const historyId = lastAssistant >= 0
     ? await store.read<string>(
-      `${owner}:history:${await historyKey(request, request.messages.slice(0, -1))}`,
+      `${owner}:history:${await historyKey(request, request.messages.slice(0, lastAssistant + 1))}`,
     )
     : null;
   const results = pendingUserMessages(request).flatMap((message) =>
@@ -227,6 +231,9 @@ async function resolveTask(
       : []
   );
   if (results.length) {
+    if (new Set(results.map((block) => block.tool_use_id)).size !== results.length) {
+      throw new ControllerError('工具结果重复，不能重复处理', 400);
+    }
     const ids = await Promise.all(
       results.map((block) => store.read<string>(`${owner}:tool:${block.tool_use_id}`)),
     );
@@ -242,12 +249,38 @@ async function resolveTask(
     id = mappedId ?? candidateId;
   }
   id ??= historyId;
-  const task = id ? await store.read<Task>(`${owner}:task:${id}`) : null;
-  if (id && !task) throw new ControllerError('主控检查点已过期', 400);
+  let task = id ? await store.read<Task>(`${owner}:task:${id}`) : null;
   const model = getModelById(request.model)!.siderModel;
   if (task && getModelById(task.model)?.siderModel !== model) {
     throw new ControllerError('恢复主控会话时不能静默切换模型', 400);
   }
+  if (!task && results.length) {
+    // 旧后端或过期实例可能没有检查点；只从最近助手轮的完整调用/结果配对重建。
+    const content = request.messages[lastAssistant]?.content;
+    const calls = Array.isArray(content)
+      ? content.filter((block) => block.type === 'tool_use')
+      : [];
+    if (
+      calls.length !== results.length ||
+      new Set(calls.map((call) => call.id)).size !== calls.length ||
+      calls.some((call) => !call.id || !call.name || !call.input ||
+        typeof call.input !== 'object' || Array.isArray(call.input)) ||
+      results.some((block) => !calls.some((call) => call.id === block.tool_use_id))
+    ) throw new ControllerError('工具结果缺少完整且唯一配对的历史调用，无法恢复主控任务', 400);
+    task = {
+      id: crypto.randomUUID(), model, cid: '', parent: '', refs: [],
+      pending: calls.map((call) => ({
+        id: call.id,
+        upstreamId: call.id,
+        name: call.name,
+        ...(call.name === 'Read' && call.input.limit === undefined &&
+            call.input.offset === undefined && typeof call.input.file_path === 'string'
+          ? { readPath: call.input.file_path }
+          : {}),
+      })),
+    };
+  }
+  if (id && !task) throw new ControllerError('主控检查点已过期', 400);
   if (results.length) {
     if (!task) throw new ControllerError('工具结果没有可恢复的主控检查点', 400);
     if (results.some((block) => !task.pending.some((p) => p.id === block.tool_use_id))) {
@@ -255,7 +288,7 @@ async function resolveTask(
     }
     for (const block of results) {
       const key = `${owner}:tool:${block.tool_use_id}`;
-      if (!await store.read<string>(key)) await store.write(key, task.id, RETENTION_MS);
+      if (await store.read<string>(key) !== task.id) await store.write(key, task.id, RETENTION_MS);
     }
   }
   if (task) task.model = model;
@@ -538,6 +571,9 @@ export async function runSiderController(
           `tool_use_id=${p.id}`,
           `tool_use_id=${p.upstreamId}`,
         );
+      }
+      if (!task.cid && task.pending.length) {
+        text += '\n\n代理检查点已从以上完整历史恢复。已有tool_result的工具已经执行，禁止重新执行；后台任务应按返回的任务ID或输出路径继续查询，不能把后台启动当作任务完成。';
       }
       if (task.refs.length) text += `\n代理可信正文引用：${JSON.stringify(task.refs)}`;
       if (task.copyRef) {

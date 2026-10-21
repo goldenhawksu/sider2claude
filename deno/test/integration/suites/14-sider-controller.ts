@@ -50,6 +50,85 @@ export const suite: Suite = {
   title: 'Sider主控真实工具循环、长正文及上下文登记',
   cases: [
     ...models.map((model) => ({
+      name: `${model}：无检查点后台PowerShell历史恢复，JSON及SSE续接不重放`,
+      async run({ api }: any) {
+        for (const stream of [false, true]) {
+          const marker = crypto.randomUUID();
+          const taskId = `bg_${marker}`;
+          const output = `C:/isolated/${marker}/image_gen.output`;
+          // 合成已执行的客户端历史；本用例不启动真实命令，也不生成图片。
+          const request = {
+            model,
+            stream,
+            max_tokens: 2048,
+            tool_choice: { type: 'none' },
+            messages: [
+              {
+                role: 'user',
+                content:
+                  '生图命令已启动。收到后台启动结果后只回复任务ID和输出路径，不能重新执行命令或声称图片已生成。',
+              },
+              {
+                role: 'assistant',
+                content: [{
+                  type: 'tool_use',
+                  id: `native_${marker}`,
+                  name: 'PowerShell',
+                  input: {
+                    command:
+                      'python skills/ppt-master/scripts/image_gen.py --manifest images/image_prompts.json --output images',
+                    description: 'Generate AI images from manifest',
+                    timeout: 600000,
+                  },
+                }],
+              },
+              {
+                role: 'user',
+                content: [{
+                  type: 'tool_result',
+                  tool_use_id: `native_${marker}`,
+                  content:
+                    `Command running in background with ID: ${taskId}. Output is being written to: ${output}`,
+                }],
+              },
+              { role: 'user', content: '请继续完成，只回复已有任务ID和输出路径。' },
+            ],
+          };
+          if (stream) {
+            const response = await api.sse('/v1/messages', request);
+            assertEquals(response.status, 200);
+            assertTrue(
+              !response.events.some((event: any) => event.type === 'error'),
+              '历史恢复无流内错误',
+            );
+            assertTrue(
+              response.text.includes(taskId) && response.text.includes(output),
+              '流式保留后台任务ID与输出路径',
+            );
+            assertTrue(
+              !response.events.some((event: any) => event.content_block?.type === 'tool_use'),
+              '不重新执行命令',
+            );
+            assertEquals(response.events.at(-1)?.type, 'message_stop');
+          } else {
+            const response = await api.post('/v1/messages', request);
+            assertStatus(response, 200);
+            assertAnthropicMessage(response.json, model);
+            assertEquals(response.json.stop_reason, 'end_turn');
+            assertTrue(!toolUseOf(response.json), '不重新执行命令');
+            assertTrue(
+              textOf(response.json).includes(taskId) && textOf(response.json).includes(output),
+              '保留后台任务ID与输出路径',
+            );
+            const replay = await api.post('/v1/messages', request);
+            assertStatus(replay, 200);
+            assertEquals(replay.json.id, response.json.id, '恢复后的相同请求直接重放响应');
+          }
+        }
+        return '完整PowerShell调用、后台工具结果及追加继续指令均可恢复；未执行命令，JSON/SSE通过';
+      },
+    })),
+    ...models.map((model) => ({
       name: `${model}：Read→纯结果续轮→结束及请求重放`,
       async run({ api }: any) {
         const path = `C:/isolated/${crypto.randomUUID()}/config.json`;

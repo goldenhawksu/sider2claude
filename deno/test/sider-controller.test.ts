@@ -343,13 +343,278 @@ Deno.test('主控HTTP：tool映射丢失时从history唯一任务自愈并补回
       messages: [...request.messages, { role: 'assistant', content: first.content }, {
         role: 'user',
         content: [{ type: 'tool_result', tool_use_id: toolUseId, content: '文件正文' }],
-      }],
+      }, { role: 'user', content: '请继续完成' }],
     });
 
     equal(response.status, 200);
     equal((await response.json()).content[0].text, '已从检查点继续');
     equal(await store.read(`${owner}:tool:${toolUseId}`), first.sider_session.conversation_id);
     equal(count, 2);
+  });
+});
+Deno.test('主控HTTP：无检查点的后台PowerShell结果从完整历史恢复，重试与后续工具不重放命令', async () => {
+  const id = `native_${crypto.randomUUID()}`;
+  const output = `C:/Temp/${id}.output`;
+  const request: AnthropicRequest = {
+    model: 'claude-opus-5.5',
+    tools: [{
+      name: 'TaskOutput',
+      input_schema: {
+        type: 'object',
+        properties: { task_id: { type: 'string' } },
+        required: ['task_id'],
+      },
+    }],
+    messages: [
+      { role: 'user', content: '根据生图后台任务输出继续完成，不要重新运行命令。' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id,
+          name: 'PowerShell',
+          input: {
+            command:
+              'python skills/ppt-master/scripts/image_gen.py --manifest projects/demo/images/image_prompts.json --output projects/demo/images',
+            description: 'Generate AI images from manifest',
+            timeout: 600000,
+          },
+        }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: id,
+          content:
+            `Command running in background with ID: blvuwvc0a. Output is being written to: ${output}`,
+        }],
+      },
+      { role: 'user', content: '请继续完成' },
+    ],
+  };
+  let count = 0;
+  await appWithMock((body) => {
+    count++;
+    const text = body.multi_content[0].text;
+    if (count === 1) {
+      equal(body.cid, '');
+      equal(body.parent_message_id, undefined);
+      for (
+        const value of [
+          'image_gen.py --manifest',
+          output,
+          'blvuwvc0a',
+          '请继续完成',
+          `tool_use_id=${id}`,
+        ]
+      ) {
+        equal(text.includes(value), true);
+      }
+      return sse(
+        '[tool_use:TaskOutput] id=poll_1 input={"task_id":"blvuwvc0a"}',
+        'recovered-cid',
+        'recovered-parent-1',
+      );
+    }
+    equal(body.cid, 'recovered-cid');
+    equal(body.parent_message_id, 'recovered-parent-1');
+    equal(text.includes('tool_use_id=poll_1'), true);
+    equal(text.includes('图片已生成'), true);
+    equal(text.includes('image_gen.py'), false);
+    return sse('图片已生成，任务完成', 'recovered-cid', 'recovered-parent-2');
+  }, async (app) => {
+    const response = await send(app, request);
+    equal(response.status, 200);
+    const first = await response.json();
+    equal(first.content[0].name, 'TaskOutput');
+    equal(first.content[0].input, { task_id: 'blvuwvc0a' });
+    const replay = await (await send(app, request)).json();
+    equal(replay.id, first.id);
+    equal(count, 1);
+    const next = await send(app, {
+      ...request,
+      messages: [...request.messages, { role: 'assistant', content: first.content }, {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: first.content[0].id, content: '图片已生成' }],
+      }],
+    });
+    equal(next.status, 200);
+    equal((await next.json()).stop_reason, 'end_turn');
+    equal(count, 2);
+  });
+});
+Deno.test('主控HTTP：过期检查点以配对历史恢复，错误结果与流式协议完整保留', async () => {
+  const id = `expired_${crypto.randomUUID()}`;
+  const owner = await controllerHash('controller-test-token');
+  const store = await getControllerStore();
+  await store.write(`${owner}:tool:${id}`, 'missing-task', 60_000);
+  await appWithMock((body) => {
+    equal(body.cid, '');
+    equal(body.multi_content[0].text.includes('is_error=true'), true);
+    equal(body.multi_content[0].text.includes('生图后端未配置'), true);
+    return sse('生图后端未配置，需要先配置后端', 'expired-recovered-cid');
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      stream: true,
+      messages: [
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            id,
+            name: 'PowerShell',
+            input: { command: 'python image_gen.py' },
+          }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: id,
+            is_error: true,
+            content: [{ type: 'text', text: '生图后端未配置' }],
+          }],
+        },
+      ],
+    });
+    const stream = await response.text();
+    equal(stream.includes('event: error'), false);
+    equal(stream.includes('生图后端未配置'), true);
+    equal(stream.includes('event: message_stop'), true);
+    equal(await store.read(`${owner}:tool:${id}`) !== 'missing-task', true);
+  });
+});
+Deno.test('主控HTTP：历史恢复拒绝孤立、错配、重复及缺失结果，不调用上游', async () => {
+  const call = {
+    type: 'tool_use' as const,
+    id: `invalid_${crypto.randomUUID()}`,
+    name: 'PowerShell',
+    input: { command: 'echo ok' },
+  };
+  const result = { type: 'tool_result' as const, tool_use_id: call.id, content: 'ok' };
+  const histories: AnthropicRequest['messages'][] = [
+    [{ role: 'user', content: [result] }],
+    [{ role: 'assistant', content: [call] }, {
+      role: 'user',
+      content: [{ ...result, tool_use_id: 'foreign' }],
+    }],
+    [{ role: 'assistant', content: [call] }, { role: 'user', content: [result, result] }],
+    [{ role: 'assistant', content: [call, call] }, { role: 'user', content: [result] }],
+    [{ role: 'assistant', content: [call, { ...call, id: 'missing-result' }] }, {
+      role: 'user',
+      content: [result],
+    }],
+    [{ role: 'assistant', content: [call] }, { role: 'user', content: [result] }, {
+      role: 'assistant',
+      content: '已处理',
+    }, { role: 'user', content: [result] }],
+  ];
+  await appWithMock(() => {
+    throw new Error('无效历史不应请求上游');
+  }, async (app) => {
+    for (const messages of histories) {
+      const response = await send(app, { model: 'claude-opus-5.5', messages });
+      equal(response.status, 400);
+    }
+  });
+});
+Deno.test('主控HTTP：历史恢复不能绕过已有任务的跨任务、会话冲突或已处理结果检查', async () => {
+  let count = 0;
+  await appWithMock(() => {
+    count++;
+    return sse(
+      count <= 2 ? '[tool_use:Read] id=read_1 input={"file_path":"resume.txt"}' : '已读取',
+      `guard-cid-${count}`,
+    );
+  }, async (app) => {
+    const request: AnthropicRequest = {
+      model: 'claude-opus-5.5',
+      tools,
+      messages: [{ role: 'user', content: '读取文件-' + crypto.randomUUID() }],
+    };
+    const first = await (await send(app, request)).json();
+    const other = await (await send(app, {
+      ...request,
+      messages: [{ role: 'user', content: '另一任务-' + crypto.randomUUID() }],
+    })).json();
+    const result = {
+      type: 'tool_result' as const,
+      tool_use_id: first.content[0].id,
+      content: '文件正文',
+    };
+    const next: AnthropicRequest = {
+      ...request,
+      messages: [...request.messages, { role: 'assistant', content: first.content }, {
+        role: 'user',
+        content: [result],
+      }],
+    };
+    const mixed = await send(app, {
+      ...next,
+      messages: [...request.messages, {
+        role: 'assistant',
+        content: [...first.content, ...other.content],
+      }, { role: 'user', content: [result, { ...result, tool_use_id: other.content[0].id }] }],
+    });
+    equal(mixed.status, 400);
+    const conflict = await app.request('/v1/messages', {
+      method: 'POST',
+      headers: { ...headers, 'x-conversation-id': other.sider_session.conversation_id },
+      body: JSON.stringify(next),
+    });
+    equal(conflict.status, 400);
+    equal(count, 2);
+    equal((await send(app, next)).status, 200);
+    const consumed = await send(app, {
+      ...next,
+      messages: [...next.messages, { role: 'user', content: '请继续完成' }],
+    });
+    equal(consumed.status, 400);
+    equal(count, 3);
+  });
+});
+Deno.test('主控HTTP：完整的历史并行工具轮恢复时保留每项结果及错误标记', async () => {
+  const id = crypto.randomUUID();
+  await appWithMock((body) => {
+    equal(body.cid, '');
+    const text = body.multi_content[0].text;
+    for (
+      const value of [
+        `tool_use_id=${id}-1`,
+        `tool_use_id=${id}-2 is_error=true`,
+        '第一个结果',
+        '第二个失败',
+      ]
+    ) {
+      equal(text.includes(value), true);
+    }
+    return sse('第一个已完成，第二个失败');
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      messages: [
+        {
+          role: 'assistant',
+          content: [1, 2].map((index) => ({
+            type: 'tool_use',
+            id: `${id}-${index}`,
+            name: 'PowerShell',
+            input: { command: `echo ${index}` },
+          })),
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: `${id}-1`, content: '第一个结果' },
+            { type: 'tool_result', tool_use_id: `${id}-2`, is_error: true, content: '第二个失败' },
+          ],
+        },
+      ],
+    });
+    equal(response.status, 200);
+    equal((await response.json()).stop_reason, 'end_turn');
   });
 });
 Deno.test('主控HTTP：StoreContent→本地哈希保存→WriteFromRef展开，长正文逐字保真', async () => {
