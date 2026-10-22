@@ -1192,6 +1192,111 @@ Deno.test('主控大上下文：安全分块登记后重申最新请求并直接
   });
 });
 
+Deno.test('主控长会话：超过16分片且远小于32MB的SVG历史完整登记后继续P08', async () => {
+  const path = `C:/isolated/${crypto.randomUUID()}/spec_lock.md`;
+  const system = '<svg><text>已完成页面的完整正文，不得截断。</text></svg>\n'.repeat(2500) +
+    `\n尾部唯一规范路径：${path}`;
+  const instruction = 'P07已完成。现在按规范指定的唯一路径调用Read，继续P08德国。';
+  const chunks: string[] = [];
+  let expectedCount = 0;
+  await appWithMock((body) => {
+    const text = body.multi_content[0].text;
+    equal(text.length <= 6000, true);
+    const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+    if (part) {
+      equal(Number(part[1]), chunks.length + 1);
+      expectedCount = Number(part[2]);
+      chunks.push(part[3]);
+      return sse('已记住', 'long-svg-cid', `long-svg-${part[1]}`);
+    }
+    equal(expectedCount > 16, true);
+    equal(chunks.length, expectedCount);
+    equal(chunks.join(''), `${system}\n\n${instruction}`);
+    return sse(
+      `[tool_use:Read] id=p08 input=${JSON.stringify({ file_path: path })}`,
+      'long-svg-cid',
+    );
+  }, async (app) => {
+    const request: AnthropicRequest = {
+      model: 'claude-opus-5.5',
+      tools: [tools![0]!],
+      system,
+      messages: [{ role: 'user', content: instruction }],
+    };
+    equal(new TextEncoder().encode(JSON.stringify(request)).length < 32 * 1024 * 1024, true);
+    const response = await send(app, request);
+    equal(response.status, 200);
+    equal((await response.json()).content[0].input.file_path, path);
+  });
+});
+Deno.test('主控长会话：上传中断后追加请继续，先续传原始尾部再执行，不重发已确认分片', async () => {
+  const id = `native_read_${crypto.randomUUID()}`;
+  const path = `C:/isolated/${id}/08.svg`;
+  const seen = new Map<number, string>();
+  let total = 0;
+  let failed = false;
+  const request: AnthropicRequest = {
+    model: 'claude-opus-5.5',
+    tools: [tools![0]!],
+    system: '必须保留完整SVG及规范。\n'.repeat(1800) + `尾部唯一下一页路径：${path}`,
+    messages: [
+      { role: 'user', content: 'P07完成，读取规范后继续P08。' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: 'spec_lock.md' } }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: '已读取规范' }] },
+    ],
+  };
+  await appWithMock((body) => {
+    const text = body.multi_content[0].text;
+    const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+    if (part) {
+      const index = Number(part[1]);
+      total = Number(part[2]);
+      if (index === 2 && !failed) {
+        failed = true;
+        return new Response('temporary upstream failure', { status: 503 });
+      }
+      equal(seen.has(index), false);
+      if (index > 1) equal(body.parent_message_id, `resume-parent-${index - 1}`);
+      seen.set(index, part[3]);
+      return sse('已记住', 'resume-context-cid', `resume-parent-${index}`);
+    }
+    equal(seen.size, total);
+    equal([...seen.values()].join('').includes(path), true);
+    equal(text.includes('请继续完成P08'), true);
+    return sse(
+      `[tool_use:Read] id=p08 input=${JSON.stringify({ file_path: path })}`,
+      'resume-context-cid',
+    );
+  }, async (app) => {
+    equal((await send(app, request)).status, 502);
+    equal(seen.size, 1);
+    const response = await send(app, {
+      ...request,
+      messages: [...request.messages, { role: 'user', content: '请继续完成P08' }],
+    });
+    equal(response.status, 200);
+    equal((await response.json()).content[0].input.file_path, path);
+    equal(seen.size, total);
+  });
+});
+Deno.test('主控长会话：内部内容库超限显示实际容量错误，不伪装成HTTP32MB限制', async () => {
+  await appWithMock(() => {
+    throw new Error('容量校验失败不应调用上游');
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      system: 'x'.repeat(512001),
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    });
+    equal(response.status, 400);
+    const body = await response.json();
+    equal(body.error.type, 'invalid_request_error');
+    equal(body.error.message.includes('512000'), true);
+  });
+});
 Deno.test('主控纠错：完整工具schema超出单轮上限时再次分段，不能返回413', async () => {
   const largeTools: AnthropicRequest['tools'] = [{
     name: 'Read',

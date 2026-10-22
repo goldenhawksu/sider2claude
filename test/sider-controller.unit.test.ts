@@ -16,6 +16,7 @@ import { canUseSider, consumeSiderSlot, resetSiderThrottle } from '../src/utils/
 import { isSafetyClassifierRequest } from '../src/utils/request-analyzer';
 import { RouterEngine } from '../src/routing/router-engine';
 import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
+import type { AnthropicRequest } from '../src/types/anthropic';
 
 test('Bun：XML分类使用兼容后端，保留显式disabled及真实阻止判定', async () => {
   const original = globalThis.fetch;
@@ -226,6 +227,95 @@ test('Bun：无检查点的孤立、重复和缺失结果仍拒绝，不能请�
     ]) {
       await expect(runSiderController({ model: 'claude-sonnet-5.5', messages }, crypto.randomUUID())).rejects.toMatchObject({ statusCode: 400 });
     }
+  } finally {
+    globalThis.fetch = original;
+    if (previous === undefined) delete process.env.SIDER_AUTH_TOKEN;
+    else process.env.SIDER_AUTH_TOKEN = previous;
+  }
+});
+
+test('Bun长会话：超过16分片完整登记，中断后追加继续仍保留尾部且不重发已确认内容', async () => {
+  const original = globalThis.fetch;
+  const keys = ['SIDER_AUTH_TOKEN', 'SIDER_CONTROLLER_STORAGE', 'SIDER_CONTROLLER_PACE_MS', 'SIDER_CONTROLLER_MAX_INPUT_CHARS'];
+  const previous = keys.map((key) => process.env[key]);
+  Object.assign(process.env, { SIDER_AUTH_TOKEN: 'context-bun', SIDER_CONTROLLER_STORAGE: 'memory',
+    SIDER_CONTROLLER_PACE_MS: '0', SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000' });
+  try {
+    for (const mode of ['long', 'resume']) {
+      const id = crypto.randomUUID();
+      const path = `C:/isolated/${id}/08.svg`;
+      const seen = new Map<number, string>();
+      let total = 0, failed = false;
+      const request: AnthropicRequest = { model: 'claude-sonnet-5.5',
+        system: '既有SVG规范。'.repeat(mode === 'long' ? 8000 : 1800) + `尾部唯一路径：${path}`,
+        tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }],
+        messages: [
+          { role: 'user', content: 'P07已完成，读取规范后继续P08。' },
+          { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: 'spec_lock.md' } }] },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: '已读取规范' }] },
+        ],
+      };
+      globalThis.fetch = ((_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        const text = body.multi_content[0].text;
+        expect(text.length).toBeLessThanOrEqual(3000);
+        const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+        let reply: string;
+        if (part) {
+          const index = Number(part[1]);
+          total = Number(part[2]);
+          if (mode === 'resume' && index === 2 && !failed) {
+            failed = true;
+            return Promise.resolve(new Response('temporary upstream failure', { status: 503 }));
+          }
+          expect(seen.has(index)).toBe(false);
+          if (index > 1) expect(body.parent_message_id).toBe(`parent-${index - 1}`);
+          seen.set(index, part[3]);
+          reply = '已记住';
+        } else {
+          expect(seen.size).toBe(total);
+          expect([...seen.values()].join('')).toContain(path);
+          if (mode === 'long') expect(total).toBeGreaterThan(16);
+          else expect(text).toContain('请继续完成P08');
+          reply = `[tool_use:Read] id=p08 input=${JSON.stringify({ file_path: path })}`;
+        }
+        return Promise.resolve(new Response([
+          { code: 0, msg: 'ok', data: { type: 'message_start', model: request.model,
+            message_start: { cid: `context-${id}`, user_message_id: 'u', assistant_message_id: `parent-${part?.[1] ?? 'done'}` } } },
+          { code: 0, msg: 'ok', data: { type: 'text', model: request.model, text: reply } },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }));
+      }) as typeof fetch;
+      if (mode === 'resume') {
+        await expect(runSiderController(request, id)).rejects.toThrow();
+        expect(seen.size).toBe(1);
+        request.messages.push({ role: 'user', content: '请继续完成P08' });
+      }
+      const result = await runSiderController(request, id);
+      expect(result.content.find((block) => block.type === 'tool_use')?.input.file_path).toBe(path);
+      expect(seen.size).toBe(total);
+    }
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
+
+test('Bun长会话：内容库超限返回明确的400容量错误，保留真正上游413的语义', async () => {
+  const original = globalThis.fetch;
+  const previous = process.env.SIDER_AUTH_TOKEN;
+  process.env.SIDER_AUTH_TOKEN = 'context-capacity-bun';
+  const request: AnthropicRequest = { model: 'claude-sonnet-5.5', system: 'x'.repeat(512001),
+    messages: [{ role: 'user', content: crypto.randomUUID() }] };
+  try {
+    globalThis.fetch = (() => { throw new Error('容量校验失败不应调用上游'); }) as typeof fetch;
+    const response = await controllerResponse(request, crypto.randomUUID(), createRequestLogContext(request));
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.message).toContain('512000');
   } finally {
     globalThis.fetch = original;
     if (previous === undefined) delete process.env.SIDER_AUTH_TOKEN;

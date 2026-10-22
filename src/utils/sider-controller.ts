@@ -65,6 +65,7 @@ interface Task {
   refs: string[];
   pending: PendingTool[];
   uploads?: Record<string, number>;
+  pendingUpload?: string;
   toolsHash?: string;
   mustWrite?: boolean;
   exactCopy?: boolean;
@@ -97,7 +98,7 @@ export async function saveControllerText(
   key: string,
   text: string,
 ): Promise<void> {
-  if (text.length > 512_000) throw new ControllerError('正文超过可信内容库单项容量', 413);
+  if (text.length > 512_000) throw new ControllerError('待登记内容超过可信内容库单项512000字符容量，请压缩会话历史或缩短正文', 400);
   const count = Math.max(1, Math.ceil(text.length / 8000));
   for (let i = 0; i < count; i++) {
     await store.write(`${key}:${i}`, text.slice(i * 8000, (i + 1) * 8000), RETENTION_MS);
@@ -557,29 +558,6 @@ export async function runSiderController(
           }
         }
       }
-      let text = writeIntegrityResult ??
-        (task.cid
-          ? pendingUserMessages(request).map((message) => contentToText(message.content)).join(
-            '\n\n',
-          )
-          : buildSiderMessageText(request, {
-            includeHistory: request.messages.length > 1,
-            currentUserInput: contentToText(request.messages.at(-1)!.content),
-          }));
-      for (const p of task.pending) {
-        text = text.replace(
-          `tool_use_id=${p.id}`,
-          `tool_use_id=${p.upstreamId}`,
-        );
-      }
-      if (!task.cid && task.pending.length) {
-        text += '\n\n代理检查点已从以上完整历史恢复。已有tool_result的工具已经执行，禁止重新执行；后台任务应按返回的任务ID或输出路径继续查询，不能把后台启动当作任务完成。';
-      }
-      if (task.refs.length) text += `\n代理可信正文引用：${JSON.stringify(task.refs)}`;
-      if (task.copyRef) {
-        text +=
-          `\n当前逐字复制任务的Read JSON正文已由代理去除连续行号并完整保存，content_ref=${task.copyRef}。必须使用WriteFromRef引用该正文，禁止重写、二次转义或再次StoreContent。`;
-      }
       let corrections = 0;
       let totalInputTokens = 0, totalOutputTokens = 0;
       const paceKey = `pace:${await controllerHash(siderToken)}`;
@@ -595,7 +573,7 @@ export async function runSiderController(
         if (prompt.length > maxChars) {
           throw new ControllerError(
             `Sider实际新增输入${prompt.length}字符超过配置上限${maxChars}，检查点已保留`,
-            413,
+            400,
           );
         }
         const callStarted = Date.now();
@@ -691,10 +669,12 @@ export async function runSiderController(
       const upload = async (context: string) => {
         const hash = await controllerHash(context), size = maxChars - 256;
         const count = Math.ceil(context.length / size);
-        if (count > 16) {
-          throw new ControllerError('上下文超过单次可登记的16个分段，检查点保留', 413);
-        }
         task.uploads ??= {};
+        if ((task.uploads[hash] ?? 0) < count && task.pendingUpload !== hash) {
+          await saveControllerText(store, `${owner}:${task.id}:upload:${hash}`, context);
+          task.pendingUpload = hash;
+          await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
+        }
         for (let i = task.uploads[hash] ?? 0; i < count; i++) {
           const uploadStarted = Date.now();
           const chunk = `以下是当前任务上下文片段${
@@ -737,7 +717,38 @@ export async function runSiderController(
             outcome: 'context_accepted',
           });
         }
+        if (task.pendingUpload === hash) {
+          delete task.pendingUpload;
+          await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
+        }
       };
+      // 必须先续传原始上下文尾部，再根据当前会话发送新增消息。
+      if (task.pendingUpload) {
+        await upload(await readControllerText(store, `${owner}:${task.id}:upload:${task.pendingUpload}`));
+      }
+      let text = writeIntegrityResult ??
+        (task.cid
+          ? pendingUserMessages(request).map((message) => contentToText(message.content)).join(
+            '\n\n',
+          )
+          : buildSiderMessageText(request, {
+            includeHistory: request.messages.length > 1,
+            currentUserInput: contentToText(request.messages.at(-1)!.content),
+          }));
+      for (const p of task.pending) {
+        text = text.replace(
+          `tool_use_id=${p.id}`,
+          `tool_use_id=${p.upstreamId}`,
+        );
+      }
+      if (!task.cid && task.pending.length) {
+        text += '\n\n代理检查点已从以上完整历史恢复。已有tool_result的工具已经执行，禁止重新执行；后台任务应按返回的任务ID或输出路径继续查询，不能把后台启动当作任务完成。';
+      }
+      if (task.refs.length) text += `\n代理可信正文引用：${JSON.stringify(task.refs)}`;
+      if (task.copyRef) {
+        text +=
+          `\n当前逐字复制任务的Read JSON正文已由代理去除连续行号并完整保存，content_ref=${task.copyRef}。必须使用WriteFromRef引用该正文，禁止重写、二次转义或再次StoreContent。`;
+      }
       let contract = buildToolContract(tools);
       if (text.length + Math.min(contract.length, maxChars - 1000) + 512 > maxChars) {
         await upload(text);

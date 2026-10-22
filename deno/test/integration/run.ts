@@ -28,6 +28,7 @@ import { suite as longToolRequest } from './suites/12-long-tool-request.ts';
 import { suite as writeIntegrity } from './suites/13-write-integrity.ts';
 import { suite as siderController } from './suites/14-sider-controller.ts';
 import { suite as contextWindow } from './suites/15-context-window.ts';
+import { suite as controllerContext } from './suites/16-controller-context.ts';
 
 const ALL_SUITES: Suite[] = [
   infrastructure,
@@ -43,7 +44,9 @@ const ALL_SUITES: Suite[] = [
   clientTools,
   longToolRequest,
   writeIntegrity,
-  ...(Deno.env.get('E2E_CONTROLLER') === 'true' ? [siderController, contextWindow] : []),
+  ...(Deno.env.get('E2E_CONTROLLER') === 'true'
+    ? [siderController, contextWindow, controllerContext]
+    : []),
 ];
 
 const selected = Deno.args.filter((arg) => !arg.startsWith('-'));
