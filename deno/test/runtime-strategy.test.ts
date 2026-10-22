@@ -11,10 +11,13 @@
  */
 
 import {
+  currentControllerStreaming,
   currentSiderStrategy,
   refreshStrategy,
   resetRuntimeStrategy,
+  resolveControllerStreaming,
   resolveSiderStrategy,
+  setControllerStreaming,
 } from '../src/utils/runtime-strategy.ts';
 import { closeStatsKv, getKv } from '../src/utils/usage-stats-kv.ts';
 
@@ -46,6 +49,29 @@ async function waitFor(ready: () => boolean, timeoutMs = 8_000): Promise<void> {
 
 const KEY = ['config', 'siderStrategy'];
 const T0 = 1_700_000_000_000;
+
+Deno.test({
+  name: '流式主控：管理覆盖持久化、冷实例恢复及跨实例关闭，优先于旧false环境变量',
+  sanitizeResources: false,
+  sanitizeOps: false,
+  fn: () =>
+    withMemoryKv(async () => {
+      resetRuntimeStrategy();
+      assertEquals(await resolveControllerStreaming(false), false);
+      await setControllerStreaming(true);
+      resetRuntimeStrategy();
+      assertEquals(await resolveControllerStreaming(false), true, '冷实例读取已保存开关');
+      const now = Date.now();
+      await (await getKv())!.set(['config', 'controllerStreaming'], false);
+      assertEquals(currentControllerStreaming(true), true, 'TTL内保留旧值');
+      assertEquals(
+        await resolveControllerStreaming(true, now + 4000),
+        false,
+        '过期读取其他实例的关闭操作',
+      );
+      resetRuntimeStrategy();
+    }),
+});
 
 Deno.test({
   name: 'runtime-strategy：缓存过期后重新从 KV 读新策略（守多实例分叉回归）',

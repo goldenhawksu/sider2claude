@@ -27,6 +27,7 @@
 
 import type { SiderStrategy } from '../config/backends.ts';
 import { getKv } from './usage-stats-kv.ts';
+import { recordSiderActivity } from './sider-activity.ts';
 
 const BUCKET_MS = 60 * 60_000;
 /** 遥测桶的保留跨度；超出的桶在读取扫描时回收。 */
@@ -89,10 +90,19 @@ export function persistSiderTelemetry(record: SiderTelemetryRecord): void {
 
     const hourBucket = Math.floor(record.ts / BUCKET_MS) * BUCKET_MS;
     if (throttled(hourBucket)) {
+      recordSiderActivity(record.model, { telemetryDropped: 1 }, record.ts);
       return;
     }
 
-    await kv.set(['tele', hourBucket, record.ts], record).catch(() => {});
+    const saved = await kv.set(['tele', hourBucket, record.ts], record).then(
+      () => true,
+      () => false,
+    );
+    recordSiderActivity(
+      record.model,
+      saved ? { telemetryRecorded: 1 } : { telemetryDropped: 1 },
+      record.ts,
+    );
   })();
 }
 

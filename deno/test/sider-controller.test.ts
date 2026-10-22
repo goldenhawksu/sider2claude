@@ -15,6 +15,8 @@ import {
 import { fetchSiderResponse } from '../src/utils/sider-transport.ts';
 import { validDeclaredToolInput } from '../src/utils/tool-input-validation.ts';
 import type { AnthropicRequest } from '../src/types/anthropic.ts';
+import { getSiderActivitySnapshot, resetSiderActivity } from '../src/utils/sider-activity.ts';
+import { getUsageSnapshot, resetUsageStats } from '../src/utils/usage-stats.ts';
 
 function equal(actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -112,6 +114,99 @@ const headers = { 'x-api-key': 'controller-test-token', 'content-type': 'applica
 function send(app: Hono, request: AnthropicRequest) {
   return app.request('/v1/messages', { method: 'POST', headers, body: JSON.stringify(request) });
 }
+
+Deno.test('P0主控：默认流式接管Read续轮，重放不再调用模型且统计实际模型', async () => {
+  resetUsageStats();
+  resetSiderActivity();
+  let count = 0;
+  await appWithMock(() => {
+    count++;
+    return sse(
+      count === 1 ? '[tool_use:Read] id=p0_read input={"file_path":"p0.json"}' : '事实标记P0_OK',
+      'p0-stream-cid',
+    );
+  }, async (app) => {
+    Deno.env.delete('SIDER_CONTROLLER_STREAMING');
+    const status = await (await app.request('/v1/messages/backends/status', { headers })).json();
+    equal(status.routing.siderControllerStreaming, true);
+    const request: AnthropicRequest = {
+      model: 'claude-opus-5.5[1m]',
+      stream: true,
+      tools,
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    };
+    const firstResponse = await send(app, request);
+    equal(firstResponse.headers.get('x-sider-controller'), 'true');
+    const first = await firstResponse.text();
+    equal(first.includes('"name":"Read"'), true);
+    equal(first.includes('event: message_stop'), true);
+    const call = first.split('\n').filter((line) => line.startsWith('data: '))
+      .map((line) => JSON.parse(line.slice(6)))
+      .find((event) => event.content_block?.type === 'tool_use').content_block;
+    equal(
+      await (await send(app, request)).text().then((text) => text.includes('"name":"Read"')),
+      true,
+    );
+    equal(count, 1);
+    const activity = await getSiderActivitySnapshot();
+    equal(activity.totals.attempts, 1);
+    equal(activity.totals.completed, 1);
+    equal(activity.totals.cachedReplays, 1);
+    equal(getUsageSnapshot().totals.cachedReplays, 1);
+    const recent = getUsageSnapshot().recent[0];
+    equal(recent.actualModel, 'claude-opus-5.5');
+    equal(recent.mode, 'controller');
+    equal(recent.stream, true);
+    const response = await send(app, {
+      ...request,
+      messages: [...request.messages, {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: call.id, name: 'Read', input: { file_path: 'p0.json' } }],
+      }, {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: call.id, content: '事实标记P0_OK' }],
+      }],
+    });
+    const result = await response.text();
+    equal(result.includes('事实标记P0_OK'), true);
+    equal(result.includes('event: error'), false);
+    equal(count, 2);
+  });
+});
+
+Deno.test('P0主控：没有fallback的1135及冷却拒绝也进入失败统计', async () => {
+  resetSiderActivity();
+  const store = await getControllerStore();
+  const key = `cooldown:${await controllerHash('controller-sider-token')}:claude-opus-5.5`;
+  try {
+    await appWithMock(
+      () =>
+        new Response(JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.' }), {
+          status: 400,
+        }),
+      async (app) => {
+        for (let i = 0; i < 2; i++) {
+          equal(
+            (await send(app, {
+              model: 'claude-opus-5.5',
+              messages: [{ role: 'user', content: crypto.randomUUID() }],
+            })).status,
+            429,
+          );
+        }
+        const activity = await getSiderActivitySnapshot();
+        equal(activity.totals.attempts, 1);
+        equal(activity.totals.failed, 1);
+        equal(activity.totals.quotaErrors, 1);
+        equal(activity.totals.requestFailures, 2);
+        equal(activity.totals.cooldownRejections, 1);
+        equal(activity.totals.completed, 0);
+      },
+    );
+  } finally {
+    await store.write(key, 0, -1);
+  }
+});
 
 Deno.test('主控HTTP：无cid工具续轮发送增量并保留错误结果，重试不产生重复工具', async () => {
   let count = 0;
@@ -1298,6 +1393,7 @@ Deno.test('主控长会话：内部内容库超限显示实际容量错误，不
   });
 });
 Deno.test('主控部署期限：非流式分批返回可重试进度，纯用户追加继续仍续传同一原文', async () => {
+  resetSiderActivity();
   const previous = Deno.env.get('DENO_DEPLOYMENT_ID');
   Deno.env.set('DENO_DEPLOYMENT_ID', 'context-batch-test');
   const path = `C:/isolated/${crypto.randomUUID()}/spec_lock.md`;
@@ -1313,8 +1409,9 @@ Deno.test('主控部署期限：非流式分批返回可重试进度，纯用户
     await appWithMock((body) => {
       const text = body.multi_content[0].text;
       const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+      // 最后一批登记之后的执行调用也消耗同一请求预算。
+      if (++inRequest > 2) return new Response('DEPLOYMENT_TIMED_OUT', { status: 503 });
       if (part) {
-        if (++inRequest > 2) return new Response('DEPLOYMENT_TIMED_OUT', { status: 503 });
         const index = Number(part[1]);
         total = Number(part[2]);
         equal(seen.has(index), false);
@@ -1360,6 +1457,13 @@ Deno.test('主控部署期限：非流式分批返回可重试进度，纯用户
       }
       equal(completed, true);
       equal(total > 2, true);
+      equal(total % 2, 0);
+      const activity = await getSiderActivitySnapshot();
+      equal(activity.totals.attempts, total + 1);
+      equal(activity.totals.contextUploads, total);
+      equal(activity.totals.completed, 1);
+      equal(activity.totals.requestFailures, 0);
+      equal(activity.totals.checkpointResponses > 0, true);
     });
   } finally {
     if (previous === undefined) Deno.env.delete('DENO_DEPLOYMENT_ID');

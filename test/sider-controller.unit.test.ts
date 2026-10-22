@@ -17,6 +17,36 @@ import { isSafetyClassifierRequest } from '../src/utils/request-analyzer';
 import { RouterEngine } from '../src/routing/router-engine';
 import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
 import type { AnthropicRequest } from '../src/types/anthropic';
+import { getSiderActivitySnapshot, resetSiderActivity } from '../src/utils/sider-activity';
+import { controllerHandlesRequest } from '../src/utils/sider-controller';
+
+test('Bun P0：主控默认接管流式，实际调用的1135独立于fallback统计', async () => {
+  const original = globalThis.fetch;
+  const previous = { controller: process.env.SIDER_CONTROLLER, streaming: process.env.SIDER_CONTROLLER_STREAMING };
+  resetSiderActivity();
+  try {
+    process.env.SIDER_CONTROLLER = 'true';
+    delete process.env.SIDER_CONTROLLER_STREAMING;
+    const request: AnthropicRequest = { model: 'claude-opus-5.5', stream: true, messages: [{ role: 'user', content: 'P0测试' }] };
+    expect(controllerHandlesRequest(request)).toBe(true);
+    process.env.SIDER_CONTROLLER_STREAMING = 'false';
+    expect(controllerHandlesRequest(request)).toBe(false);
+    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.' }), { status: 400 }))) as typeof fetch;
+    await expect(new SiderClient().chat(convertAnthropicToSiderSync(request), 'test')).rejects.toThrow('1135');
+    const activity = await getSiderActivitySnapshot();
+    expect(activity.totals.attempts).toBe(1);
+    expect(activity.totals.failed).toBe(1);
+    expect(activity.totals.quotaErrors).toBe(1);
+    expect(activity.totals.completed).toBe(0);
+  } finally {
+    globalThis.fetch = original;
+    if (previous.controller === undefined) delete process.env.SIDER_CONTROLLER;
+    else process.env.SIDER_CONTROLLER = previous.controller;
+    if (previous.streaming === undefined) delete process.env.SIDER_CONTROLLER_STREAMING;
+    else process.env.SIDER_CONTROLLER_STREAMING = previous.streaming;
+    resetSiderActivity();
+  }
+});
 
 test('Bun：XML分类使用兼容后端，保留显式disabled及真实阻止判定', async () => {
   const original = globalThis.fetch;
@@ -330,20 +360,21 @@ test('Bun部署期限：小批登记后纯用户追加继续保持原文和父�
   Object.assign(process.env, { SIDER_AUTH_TOKEN: 'batch-bun', SIDER_CONTROLLER_STORAGE: 'memory',
     SIDER_CONTROLLER_PACE_MS: '0', SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', DENO_DEPLOYMENT_ID: 'batch-test' });
   const owner = crypto.randomUUID(), path = `C:/isolated/${owner}/spec_lock.md`;
-  const request: AnthropicRequest = { model: 'claude-sonnet-5.5', system: '完整规范。'.repeat(1600) + path,
+  const request: AnthropicRequest = { model: 'claude-sonnet-5.5', system: '完整规范。'.repeat(1800) + path,
     tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }],
     messages: [{ role: 'user', content: '按尾部唯一路径用Read读取规范。' }] };
   const seen = new Set<number>();
-  let inRequest = 0, total = 0;
+  let inRequest = 0, total = 0, sawFinalBatch = false;
   try {
     globalThis.fetch = ((_url, init) => {
       const body = JSON.parse(String(init?.body));
       const text = body.multi_content[0].text;
       const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+      expect(++inRequest).toBeLessThanOrEqual(2);
       if (part) {
-        expect(++inRequest).toBeLessThanOrEqual(2);
         const index = Number(part[1]);
         total = Number(part[2]);
+        if (index === total && inRequest === 2) sawFinalBatch = true;
         expect(seen.has(index)).toBe(false);
         if (index > 1) expect(body.parent_message_id).toBe(`parent-${index - 1}`);
         seen.add(index);
@@ -372,6 +403,7 @@ test('Bun部署期限：小批登记后纯用户追加继续保持原文和父�
       }
     }
     expect(completed).toBe(true);
+    expect(sawFinalBatch).toBe(true);
   } finally {
     globalThis.fetch = original;
     keys.forEach((key, index) => {

@@ -1,3 +1,10 @@
+import {
+  getLocalSiderActivity,
+  getSiderActivitySnapshot,
+  recordSiderActivity,
+  type SiderActivitySnapshot,
+} from './sider-activity.ts';
+import { controllerRoutingStatus, resolveControllerRoutingStatus } from '../config/backends.ts';
 /**
  * 进程内用量统计，聚合部分可选持久化到 Deno KV。
  *
@@ -90,6 +97,11 @@ export function classifyDeepSeekReason(
 
 export interface UsageRecord {
   model: string;
+  /** 实际上游模型与执行模式；旧记录缺失时不猜测。 */
+  actualModel?: string | undefined;
+  mode?: 'controller' | 'hybrid' | undefined;
+  routingRule?: string | undefined;
+  deployment?: string | undefined;
   backend: Backend;
   /** 实际后端与路由初判不同 = 发生过 fallback。 */
   fallback: boolean;
@@ -143,6 +155,8 @@ export interface TrendBucket {
 }
 
 export interface UsageSnapshot {
+  siderActivity?: SiderActivitySnapshot;
+  controller?: { enabled: boolean; streaming: boolean };
   since: string;
   totals: {
     requests: number;
@@ -198,6 +212,10 @@ export interface UsageSnapshot {
   recent: Array<{
     time: string;
     model: string;
+    actualModel?: string | undefined;
+    mode?: 'controller' | 'hybrid' | undefined;
+    routingRule?: string | undefined;
+    deployment?: string | undefined;
     backend: Backend;
     fallback: boolean;
     /** 走 DeepSeek 的原因；Sider 请求为 null。 */
@@ -258,6 +276,9 @@ const trendBuckets = new Map<number, Omit<TrendBucket, 'at'>>();
 const modelStats = new Map<string, ModelStat>();
 
 export function recordUsage(record: UsageRecord): void {
+  if (record.backend === 'sider') {
+    recordSiderActivity(record.actualModel ?? record.model, { completed: 1 });
+  }
   totals.requests += 1;
   totals[record.backend] += 1;
   if (record.fallback) totals.fallbacks += 1;
@@ -374,7 +395,8 @@ export function formatCacheHitRate(
   return `${((counts.cacheReadTokens / prompt) * 100).toFixed(1)}%`;
 }
 
-export function getUsageSnapshot(now = Date.now()): UsageSnapshot {  const pct = (part: number) =>
+export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
+  const pct = (part: number) =>
     totals.requests === 0 ? '0%' : `${Math.round((part / totals.requests) * 100)}%`;
 
   const lastHour = { requests: 0, sider: 0, deepseek: 0, fallbacks: 0 };
@@ -393,6 +415,8 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {  const pct =
   const models = [...modelStats.values()].sort((a, b) => b.requests - a.requests);
 
   return {
+    siderActivity: getLocalSiderActivity(now),
+    controller: controllerRoutingStatus(),
     since: new Date(startedAt).toISOString(),
     totals: { ...totals, cacheHitRate: formatCacheHitRate(totals) },
     backendShare: { sider: pct(totals.sider), deepseek: pct(totals.deepseek) },
@@ -408,6 +432,10 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {  const pct =
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
       model: record.model,
+      actualModel: record.actualModel,
+      mode: record.mode,
+      routingRule: record.routingRule,
+      deployment: record.deployment,
       backend: record.backend,
       fallback: record.fallback,
       reason: record.deepseekReason ?? null,
@@ -456,14 +484,18 @@ export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot>
 }
 
 async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
+  await resolveControllerRoutingStatus();
   const local = getUsageSnapshot(now);
   // 展示路径等 KV 读回来再定策略：getUsageSnapshot 里用的是同步版，冷实例上会先
   // 返回环境变量兜底值，多实例下 /stats 每 5 秒自动刷新就会周期性跳回默认档。
   const siderStrategy = await resolveEffectiveSiderStrategy();
-  const siderHealth = await aggregateSiderHealth(now);
+  const [siderHealth, siderActivity] = await Promise.all([
+    aggregateSiderHealth(now),
+    getSiderActivitySnapshot(now),
+  ]);
   const persistent = await readPersistentStats(now);
   if (!persistent) {
-    return { ...local, siderStrategy, siderHealth };
+    return { ...local, siderStrategy, siderHealth, siderActivity };
   }
 
   const pct = (part: number) =>
@@ -492,6 +524,7 @@ async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
     ...local,
     siderStrategy,
     siderHealth,
+    siderActivity,
     since: new Date(persistent.since).toISOString(),
     totals: { ...persistent.totals, cacheHitRate: formatCacheHitRate(persistent.totals) },
     backendShare: {
@@ -511,6 +544,10 @@ async function buildStatsSnapshot(now: number): Promise<UsageSnapshot> {
     recent: persistent.recent.slice(0, RECENT_DISPLAY).map((entry) => ({
       time: new Date(entry.at).toISOString(),
       model: entry.model,
+      actualModel: entry.actualModel,
+      mode: entry.mode,
+      routingRule: entry.routingRule,
+      deployment: entry.deployment,
       backend: entry.backend,
       fallback: entry.fallback,
       reason: entry.reason,

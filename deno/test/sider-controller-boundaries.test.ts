@@ -32,14 +32,17 @@ const request: AnthropicRequest = {
   }],
 };
 
-Deno.test('Controller默认不接管流式请求；实验开关可显式启用', () => {
+Deno.test('Controller默认接管JSON和流式；显式false可关闭流式', () => {
   const previousController = Deno.env.get('SIDER_CONTROLLER');
   const previousStreaming = Deno.env.get('SIDER_CONTROLLER_STREAMING');
   try {
     Deno.env.set('SIDER_CONTROLLER', 'true');
     Deno.env.delete('SIDER_CONTROLLER_STREAMING');
     equal(controllerHandlesRequest({ ...request, stream: false }), true);
+    equal(controllerHandlesRequest({ ...request, stream: true }), true);
+    Deno.env.set('SIDER_CONTROLLER_STREAMING', 'false');
     equal(controllerHandlesRequest({ ...request, stream: true }), false);
+    equal(controllerHandlesRequest({ ...request, stream: false }), true);
     Deno.env.set('SIDER_CONTROLLER_STREAMING', 'true');
     equal(controllerHandlesRequest({ ...request, stream: true }), true);
   } finally {

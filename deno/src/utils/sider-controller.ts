@@ -1,3 +1,5 @@
+import { controllerRoutingStatus } from '../config/backends.ts';
+import { recordSiderActivity } from './sider-activity.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import type {
   AnthropicRequest,
@@ -16,7 +18,7 @@ import { isValidWriteInput } from './textual-tool-use.ts';
 import { getControllerStore } from './controller-storage.ts';
 import type { ControllerStore } from './controller-memory-store.ts';
 import { persistSiderTelemetry } from './sider-telemetry.ts';
-import { recordUsage } from './usage-stats.ts';
+import { recordCachedReplay, recordUsage } from './usage-stats.ts';
 import { applyStopSequences } from './stop-sequences.ts';
 
 const RETENTION_MS = 24 * 60 * 60_000;
@@ -80,9 +82,9 @@ export class ControllerError extends Error {
     super(message);
   }
 }
-export const controllerEnabled = () => getEnv('SIDER_CONTROLLER') === 'true';
+export const controllerEnabled = () => controllerRoutingStatus().enabled;
 export const controllerHandlesRequest = (request: AnthropicRequest) =>
-  controllerEnabled() && (!request.stream || getEnv('SIDER_CONTROLLER_STREAMING') === 'true');
+  controllerEnabled() && (!request.stream || controllerRoutingStatus().streaming);
 export async function controllerHash(text: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))]
     .map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -356,6 +358,10 @@ async function persistControllerResponse(
   await store.write(replayKey, { responseKey }, RETENTION_MS);
   recordUsage({
     model: request.model,
+    actualModel: getModelById(request.model)!.siderModel,
+    mode: 'controller',
+    routingRule: 'sider_controller',
+    deployment: getEnv('DENO_DEPLOYMENT_ID', 'local').slice(0, 8),
     backend: 'sider',
     fallback: false,
     toolUses: response.content.filter((block) => block.type === 'tool_use').map((block) =>
@@ -487,6 +493,8 @@ export async function runSiderController(
       )}`;
       const cached = await store.read<{ responseKey: string }>(replayKey);
       if (cached) {
+        recordCachedReplay();
+        recordSiderActivity(model.siderModel, { cachedReplays: 1 });
         return {
           ...JSON.parse(await readControllerText(store, cached.responseKey)),
           model: request.model,
@@ -496,6 +504,7 @@ export async function runSiderController(
         `cooldown:${await controllerHash(siderToken)}:${model.siderModel}`,
       );
       if (cooldown && cooldown > Date.now()) {
+        recordSiderActivity(model.siderModel, { cooldownRejections: 1 });
         throw new ControllerError(
           'Sider模型额度仍在冷却，主控任务保留',
           429,
@@ -798,6 +807,7 @@ export async function runSiderController(
             );
           }
           uploaded++;
+          recordSiderActivity(model.siderModel, { contextUploads: 1 });
           task.uploads[hash] = i + 1;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
           persistSiderTelemetry({
@@ -817,6 +827,14 @@ export async function runSiderController(
         if (task.pendingUpload === hash) {
           delete task.pendingUpload;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
+        }
+        // 最后一批也要结束当前请求，给下一轮实际执行保留完整期限。
+        if (deployedJson && uploaded >= 2) {
+          throw new ControllerError(
+            `上下文登记进度${count}/${count}，检查点已保存，请自动重试或继续`,
+            429,
+            1000,
+          );
         }
       };
       // 必须先续传原始上下文尾部，再根据当前会话发送新增消息。
@@ -971,6 +989,7 @@ export async function runSiderController(
           }
           const correctionLimit = forcedToolMissing ? 1 : 2;
           if (++corrections > correctionLimit) throw error;
+          recordSiderActivity(model.siderModel, { corrections: 1 });
           const name = raw.match(/\[tool_use:([^\]]+)\]/)?.[1];
           const declared = tools.find((tool) => tool.name === name);
           text = `代理校验失败，尚未执行任何工具：${

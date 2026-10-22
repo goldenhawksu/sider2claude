@@ -1,3 +1,5 @@
+import { getLocalSiderActivity, recordSiderActivity, type SiderActivitySnapshot } from './sider-activity.js';
+import { controllerRoutingStatus, resolveControllerRoutingStatus } from '../config/backends.js';
 /**
  * 进程内用量统计。
  *
@@ -79,6 +81,11 @@ export function classifyDeepSeekReason(
 
 export interface UsageRecord {
   model: string;
+  /** 实际上游模型与执行模式；旧记录缺失时不猜测。 */
+  actualModel?: string | undefined;
+  mode?: 'controller' | 'hybrid' | undefined;
+  routingRule?: string | undefined;
+  deployment?: string | undefined;
   backend: Backend;
   /** 实际后端与路由初判不同 = 发生过 fallback。 */
   fallback: boolean;
@@ -132,6 +139,8 @@ export interface TrendBucket {
 }
 
 export interface UsageSnapshot {
+  siderActivity?: SiderActivitySnapshot;
+  controller?: { enabled: boolean; streaming: boolean };
   since: string;
   totals: {
     requests: number;
@@ -187,6 +196,10 @@ export interface UsageSnapshot {
   recent: Array<{
     time: string;
     model: string;
+    actualModel?: string | undefined;
+    mode?: 'controller' | 'hybrid' | undefined;
+    routingRule?: string | undefined;
+    deployment?: string | undefined;
     backend: Backend;
     fallback: boolean;
     /** 走 DeepSeek 的原因；Sider 请求为 null。 */
@@ -241,6 +254,7 @@ const trendBuckets = new Map<number, Omit<TrendBucket, 'at'>>();
 const modelStats = new Map<string, ModelStat>();
 
 export function recordUsage(record: UsageRecord): void {
+  if (record.backend === 'sider') recordSiderActivity(record.actualModel ?? record.model, { completed: 1 });
   totals.requests += 1;
   totals[record.backend] += 1;
   if (record.fallback) totals.fallbacks += 1;
@@ -375,6 +389,8 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
   const models = [...modelStats.values()].sort((a, b) => b.requests - a.requests);
 
   return {
+    siderActivity: getLocalSiderActivity(now),
+    controller: controllerRoutingStatus(),
     since: new Date(startedAt).toISOString(),
     totals: { ...totals, cacheHitRate: formatCacheHitRate(totals) },
     backendShare: { sider: pct(totals.sider), deepseek: pct(totals.deepseek) },
@@ -390,6 +406,10 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
     recent: recent.slice(0, RECENT_DISPLAY).map(({ at, record }) => ({
       time: new Date(at).toISOString(),
       model: record.model,
+      actualModel: record.actualModel,
+      mode: record.mode,
+      routingRule: record.routingRule,
+      deployment: record.deployment,
       backend: record.backend,
       fallback: record.fallback,
       reason: record.deepseekReason ?? null,
@@ -408,6 +428,7 @@ export function getUsageSnapshot(now = Date.now()): UsageSnapshot {
  * 保留同名导出使两侧调用方代码一致。
  */
 export async function getStatsSnapshot(now = Date.now()): Promise<UsageSnapshot> {
+  await resolveControllerRoutingStatus();
   return getUsageSnapshot(now);
 }
 

@@ -144,6 +144,8 @@ Deno.test({
       // Sider 从头到尾没被调用，fallback 计数必须为 0
       assertEquals(snap.totals.fallbacks, 0, 'fallback 总数');
       assertEquals(snap.recent[0].reason, 'tools', '明细归因');
+      assertEquals(snap.recent[0].actualModel, 'deepseek-v4-flash', '记录实际兼容上游模型');
+      assertEquals(snap.recent[0].mode, 'hybrid', '记录混合路由模式');
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -245,6 +247,21 @@ Deno.test({
       assertEquals(model.deepseek, 0, 'deepseek 次数');
       assertEquals(model.deepseekTools + model.deepseekFallback + model.deepseekRouting, 0, '归因');
       assertEquals(snap.recent[0].reason, null, '明细归因');
+      const unknown = await app.request(
+        '/v1/messages',
+        post({
+          model: 'claude-sonnet-unknown-for-stats',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: '测试家族映射的实际模型' }],
+        }),
+      );
+      assertEquals(unknown.status, 200);
+      assertEquals(getUsageSnapshot().recent[0].model, 'claude-sonnet-unknown-for-stats');
+      assertEquals(
+        getUsageSnapshot().recent[0].actualModel,
+        'claude-sonnet-5.5',
+        '统计使用与转换器相同的实际映射',
+      );
     });
   } finally {
     globalThis.fetch = originalFetch;

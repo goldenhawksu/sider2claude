@@ -122,6 +122,10 @@ Deno.test({
   const allowed = [
     'time',
     'model',
+    'actualModel',
+    'mode',
+    'routingRule',
+    'deployment',
     'backend',
     'fallback',
     'reason',

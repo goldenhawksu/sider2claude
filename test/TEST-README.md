@@ -43,12 +43,12 @@ npm run build
 | `E2E_LIVE_MODEL` | 默认 `claude-haiku-4.5` |
 | `E2E_CC_SONNET_MODEL`、`E2E_CC_OPUS_MODEL` | 套件 06 默认 `claude-sonnet-4.6`、`claude-opus-4.8` |
 | `E2E_REQUIRE_ALL_PASS` | 发布时设 `true`，upstream 也使退出码非零 |
-| `E2E_CONTROLLER` | 为 true 时注册 14／15；不修改服务端开关 |
+| `E2E_CONTROLLER` | 为 true 时注册 14–17；不修改服务端开关 |
 | `E2E_CONTROLLER_SECOND_URL` | 共享存储的第二独立主控实例 |
 | `E2E_CASE_PATTERN` | 用例名正则筛选，忽略大小写；没有匹配时退出码为 2 |
 | `E2E_REPORT_DIR` | 默认 `deno/test/integration/reports` |
 
-基础路由套件和主控套件须分别指向适配模式的服务器。`E2E_CONTROLLER=true` 且不指定套件时，会注册并选择 01–15，不代表这些路由断言都适用于同一个主控实例。
+基础路由套件和主控套件须分别指向适配模式的服务器。`E2E_CONTROLLER=true` 且不指定套件时，会注册并选择 01–17，不代表这些路由断言都适用于同一个主控实例。
 
 ## Deno 真实集成套件
 
@@ -69,8 +69,10 @@ npm run build
 | 13 | 12 项长 JSON Write 完整性 |
 | 14 | Sider 主控循环、长正文、分段、缓存与跨实例 |
 | 15 | cc-switch 窗口切换、重放／续轮与 XML 分类 |
+| 16 | 超过16片的完整上下文、尾部续传及内容库容量 |
+| 17 | 有效流式配置、视觉旁路、实际SSE文件复制与统计重放 |
 
-默认基础套件 01–13 当前共 88 项。套件 14 通常 10 项，设置第二实例时增加一项；套件 15 共 3 项。实际数量以 runner 输出为准。
+默认基础套件 01–13 当前共 88 项。套件14通常12项，设置第二实例时增加一项；套件15共3项，16共2项，17共4项。实际数量以runner输出为准。
 
 混合实例先设置服务端 `SIDER_CONTROLLER=false` 并启动，然后：
 
@@ -84,7 +86,7 @@ deno task test:e2e
 deno task test:e2e 11 12 13
 ```
 
-主控测试服务须配置 `SIDER_CONTROLLER=true`。Deno 流式用例另需 `SIDER_CONTROLLER_STREAMING=true`；Bun 主控没有此开关。两实例共享对应存储，按账号串行并保持节奏；不要混用 Deno KV 与 Bun SQLite 验证跨实例恢复。
+主控测试服务须配置 `SIDER_CONTROLLER=true`，并确认状态接口的流式有效值为true。两实例共享对应存储，按账号串行并保持节奏；不要混用 Deno KV 与 Bun SQLite 验证跨实例恢复。正常本地工具流程与部署期限／小批登记分别选用对应环境。
 
 ```powershell
 $env:E2E_BASE_URL='http://localhost:18001'
@@ -95,7 +97,7 @@ $env:E2E_TIMEOUT_MS='1200000'
 deno task test:e2e 14 15
 ```
 
-套件 15 的分类用例需要真实兼容后端配置。所有工具执行结果由测试模拟，真实上游生成工具意图；它不等于实际运行 VS Code 或完整 ppt-master 导出。
+套件15的分类、套件17的视觉用例需要真实兼容后端配置。套件14的工具反馈主要使用合成数据，套件17会实际执行受限目录内的Read／Write并校验文件字节；它不等于完整ppt-master导出。
 
 按配额拆分执行时，可显式设置筛选：
 

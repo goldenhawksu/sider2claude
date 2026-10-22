@@ -257,6 +257,10 @@ function enqueueLive(kv: Deno.Kv, record: UsageRecord): void {
 interface LiveRecent {
   at: number;
   model: string;
+  actualModel?: string | undefined;
+  mode?: 'controller' | 'hybrid' | undefined;
+  routingRule?: string | undefined;
+  deployment?: string | undefined;
   backend: Backend;
   fallback: boolean;
   reason: DeepSeekReason | null;
@@ -297,6 +301,10 @@ async function updateLive(kv: Deno.Kv, record: UsageRecord): Promise<void> {
     state.recent.unshift({
       at,
       model: record.model,
+      actualModel: record.actualModel,
+      mode: record.mode,
+      routingRule: record.routingRule,
+      deployment: record.deployment,
       backend: record.backend,
       fallback: record.fallback,
       reason: record.deepseekReason ?? null,

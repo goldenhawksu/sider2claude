@@ -25,7 +25,7 @@ node --version
 - 用文件存在、完整参数、内容哈希或工具反馈等证据验收，不以助手自述代替。
 - 原始失败、重跑原因、环境与测试范围一起保留；上游受限不算通过。
 
-当前主控重点见[Sider 主控模式](Sider主控模式.md)：Deno 流式接管需要两个开关，Bun 主控接管全部请求格式；XML 分类在配置了原生兼容后端时走独立路由。
+当前主控重点见[Sider 主控模式](Sider主控模式.md)：两套运行时主控开启后默认接管JSON及SSE，显式false可退出流式接管；Deno支持持久化管理覆盖。XML分类及直接图文输入在配置了原生兼容后端时走独立路由。
 
 ## 3. 本地静态与确定性回归
 
@@ -75,7 +75,7 @@ $env:E2E_TIMEOUT_MS='600000'
 deno task test:e2e
 ```
 
-主控实例需先在服务端设置 `SIDER_CONTROLLER=true`；Deno 流式用例还需 `SIDER_CONTROLLER_STREAMING=true`。两个独立实例共享对应 KV／SQLite 才能验证跨实例恢复。
+主控实例需先在服务端设置 `SIDER_CONTROLLER=true`，并核对状态接口的有效流式开关。两个独立实例共享对应 KV／SQLite 才能验证跨实例恢复。本地正常模式不设置 `DENO_DEPLOYMENT_ID`；部署期限、分批与续传在独立部署模式实例验证，避免人工降低测试频率与平台预算互相干扰。
 
 ```powershell
 $env:E2E_BASE_URL='http://localhost:18001'

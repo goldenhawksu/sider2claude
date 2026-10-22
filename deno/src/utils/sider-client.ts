@@ -8,12 +8,14 @@ import {
   createAccumulatorCallbacks,
   maskId,
   type SiderStreamCallbacks,
+  SiderUpstreamError,
   siderUpstreamError,
   streamSiderSSE,
 } from './sse-line-reader.ts';
 import { getEnv } from './env.ts';
 import { fetchSiderResponse } from './sider-transport.ts';
 import { normalizeModelId } from '../config/models.ts';
+import { recordSiderActivity } from './sider-activity.ts';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -112,6 +114,7 @@ export class SiderClient {
       toolCount: request.tools?.auto?.length || 0,
     });
 
+    recordSiderActivity(request.model, { attempts: 1 });
     try {
       const response = await this.doFetch(request, authToken, signal);
       const { callbacks, result, upstream } = createAccumulatorCallbacks();
@@ -124,8 +127,13 @@ export class SiderClient {
       }
 
       this.logParsedSummary(result);
+      recordSiderActivity(request.model, { succeeded: 1 });
       return result;
     } catch (error) {
+      recordSiderActivity(request.model, {
+        failed: 1,
+        quotaErrors: error instanceof SiderUpstreamError && error.siderCode === 1135 ? 1 : 0,
+      });
       console.error('Sider API call failed:', error);
       throw error;
     }
@@ -149,8 +157,18 @@ export class SiderClient {
       toolCount: request.tools?.auto?.length || 0,
     });
 
-    const response = await this.doFetch(request, authToken);
-    await streamSiderSSE(response, callbacks);
+    recordSiderActivity(request.model, { attempts: 1 });
+    try {
+      const response = await this.doFetch(request, authToken);
+      await streamSiderSSE(response, callbacks);
+      recordSiderActivity(request.model, { succeeded: 1 });
+    } catch (error) {
+      recordSiderActivity(request.model, {
+        failed: 1,
+        quotaErrors: error instanceof SiderUpstreamError && error.siderCode === 1135 ? 1 : 0,
+      });
+      throw error;
+    }
   }
 
   /**

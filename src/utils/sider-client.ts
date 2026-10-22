@@ -12,6 +12,7 @@ import { cancelUpstreamReader } from './stream-cancel.js';
 import { getEnv } from './env';
 import { fetchSiderResponse } from './sider-transport.js';
 import { normalizeModelId } from '../config/models.js';
+import { recordSiderActivity } from './sider-activity.js';
 
 // Sider API 配置
 const SIDER_API_URL = getEnv('SIDER_API_URL', 'https://sider.ai/api/chat/v1/completions');
@@ -113,6 +114,7 @@ export class SiderClient {
       toolCount: request.tools?.auto?.length || 0,
     });
     
+    recordSiderActivity(request.model, { attempts: 1 });
     try {
       // 构建请求
       const response = await fetchSiderResponse(this.baseURL, {
@@ -156,9 +158,14 @@ export class SiderClient {
       }
 
       // 解析 SSE 流
-      return await this.parseSSEResponse(response);
+      const result = await this.parseSSEResponse(response);
+      recordSiderActivity(request.model, { succeeded: 1 });
+      return result;
 
     } catch (error) {
+      recordSiderActivity(request.model, {
+        failed: 1, quotaErrors: error instanceof SiderUpstreamError && error.siderCode === 1135 ? 1 : 0,
+      });
       consola.error('Sider API call failed:', error);
       throw error;
     }

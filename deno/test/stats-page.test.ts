@@ -12,6 +12,57 @@
 
 import { renderStatsPage } from '../src/utils/stats-page.ts';
 import type { UsageSnapshot } from '../src/utils/usage-stats.ts';
+import { getLocalSiderActivity } from '../src/utils/sider-activity.ts';
+
+Deno.test('stats 页面：区分业务完成与上游失败，显示实际模型和流式接管状态', () => {
+  const activity = getLocalSiderActivity();
+  const counts = {
+    ...activity.totals,
+    attempts: 4,
+    succeeded: 3,
+    failed: 1,
+    quotaErrors: 1,
+    contextUploads: 2,
+    completed: 1,
+  };
+  const html = renderStatsPage(snapshot({
+    controller: { enabled: true, streaming: true },
+    siderActivity: {
+      since: '2026-10-22T03:00:00Z',
+      persisted: true,
+      totals: counts,
+      models: [{ model: 'claude-opus-5.5', ...counts }],
+    },
+    recent: [{
+      time: '2026-10-22T03:00:00Z',
+      model: 'claude-opus-5.5',
+      actualModel: 'glm-5.3-flash',
+      mode: 'hybrid',
+      backend: 'deepseek',
+      fallback: false,
+      reason: 'tools',
+      tools: ['Read'],
+      stream: true,
+      ms: 10,
+      tokens: 16,
+    }],
+  }));
+  for (
+    const label of [
+      '业务完成响应',
+      '上游失败',
+      '1135',
+      '登记待续',
+      '流式接管：启用',
+      '实际：glm-5.3-flash',
+      '采样丢弃',
+      '部署前无历史回填',
+    ]
+  ) {
+    assertIncludes(html, label, label);
+  }
+  assertIncludes(html, '2026-10-22 11:00', '计数起点采用UTC+8');
+});
 
 function assertEquals<T>(actual: T, expected: T, what = '值') {
   if (actual !== expected) {
@@ -221,7 +272,7 @@ Deno.test('stats 页面：区域数量与刷新脚本的 REGIONS 清单一致', 
   const html = renderStatsPage(snapshot());
   const declared = html.match(/var REGIONS = \[([^\]]+)\]/)?.[1] ?? '';
   const ids = [...declared.matchAll(/'([^']+)'/g)].map((m) => m[1]);
-  assertEquals(ids.length, 9, 'REGIONS 条目数');
+  assertEquals(ids.length, 10, 'REGIONS 条目数');
   // 清单里的每个 id 都必须真的存在于页面，否则该区域永远不会被刷新
   for (const id of ids) {
     assertIncludes(html, `id="${id}"`, `REGIONS 中的 ${id} 对应元素`);

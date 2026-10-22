@@ -1,3 +1,6 @@
+import { mapModelName } from '../config/models.js';
+import { controllerRoutingStatus, resolveControllerRoutingStatus } from '../config/backends.js';
+import { getEnv } from '../utils/env.js';
 /**
  * Messages API 混合路由。
  *
@@ -7,9 +10,9 @@
  */
 
 import { Hono } from 'hono';
-import { controllerEnabled } from '../utils/sider-controller.js';
+import { controllerEnabled, controllerHandlesRequest } from '../utils/sider-controller.js';
 import { controllerResponse } from '../utils/controller-http.js';
-import { isSafetyClassifierRequest } from '../utils/request-analyzer';
+import { isSafetyClassifierRequest, isStandaloneVisionRequest } from '../utils/request-analyzer';
 import type { Context } from 'hono';
 import { getAuthInfo, requireAuth } from '../middleware/auth';
 import type {
@@ -33,7 +36,7 @@ import {
   recordSiderRejection,
   recordSiderSuccess,
 } from '../utils/sider-throttle';
-import { classifyDeepSeekReason, recordUsage } from '../utils/usage-stats';
+import { classifyDeepSeekReason, recordUsage as recordCompletedUsage } from '../utils/usage-stats';
 import { buildToolContract } from '../utils/textual-tool-use';
 import { persistSiderTelemetry } from '../utils/sider-telemetry';
 import { convertSiderToAnthropic, getSessionHeaders } from '../utils/response-converter';
@@ -68,6 +71,15 @@ const config = loadBackendConfig();
 const routerEngine = new RouterEngine(config);
 const capabilityAdapter = config.deepseek.enabled ? new AnthropicApiAdapter(config.deepseek) : null;
 
+function recordUsage(record: Parameters<typeof recordCompletedUsage>[0]): void {
+  recordCompletedUsage({
+    ...record,
+    actualModel: record.backend === 'sider' ? mapModelName(record.model) : config.deepseek.model,
+    mode: 'hybrid',
+    deployment: getEnv('DENO_DEPLOYMENT_ID', 'local').slice(0, 8),
+  });
+}
+
 messagesRouter.use('*', requireAuth);
 
 messagesRouter.post('/', async (c: Context) => {
@@ -99,7 +111,8 @@ messagesRouter.post('/', async (c: Context) => {
 
     validateAnthropicRequest(anthropicRequest);
 
-    if (controllerEnabled() && !(capabilityAdapter && isSafetyClassifierRequest(anthropicRequest))) {
+    await resolveControllerRoutingStatus();
+    if (controllerHandlesRequest(anthropicRequest) && !(capabilityAdapter && (isSafetyClassifierRequest(anthropicRequest) || isStandaloneVisionRequest(anthropicRequest)))) {
       return await controllerResponse(anthropicRequest, auth.token, logContext, c.req.raw.signal, c.req.query('cid') || c.req.header('X-Conversation-ID'));
     }
 
@@ -223,6 +236,7 @@ messagesRouter.post('/', async (c: Context) => {
     recordUsage({
       model: anthropicRequest.model,
       backend: selectedBackend,
+      routingRule: decision.ruleId,
       // 实际后端与路由初判不同 = 中途发生过 fallback。
       fallback: selectedBackend !== decision.backend,
       deepseekReason: classifyDeepSeekReason(selectedBackend, decision.backend, decision.ruleId),
@@ -533,7 +547,8 @@ messagesRouter.post('/count_tokens', async (c: Context) => {
   }
 });
 
-messagesRouter.get('/backends/status', (c: Context) => {
+messagesRouter.get('/backends/status', async (c: Context) => {
+  await resolveControllerRoutingStatus();
   return c.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -551,6 +566,7 @@ messagesRouter.get('/backends/status', (c: Context) => {
     },
     routing: {
       siderController: controllerEnabled(),
+      siderControllerStreaming: controllerRoutingStatus().streaming,
       defaultBackend: config.routing.defaultBackend,
       autoFallback: config.routing.autoFallback,
       preferSiderForSimpleChat: config.routing.preferSiderForSimpleChat,

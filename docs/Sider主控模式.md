@@ -67,7 +67,13 @@ Claude Code 客户端模板：`config/claude-code.sider-controller.json.example`
 | SIDER_REQUEST_TIMEOUT_MS | 默认 `300000`，Sider 上游真实字节的空闲期限 |
 | SIDER_TOTAL_TIMEOUT_MS | 默认 `600000`，独立总期限；客户端 ping 不刷新它 |
 
-Deno 主控默认接管非流式；接管流式还需 `SIDER_CONTROLLER_STREAMING=true`。Bun 主控开启后接管两种格式，未实现单独流式开关。
+两套运行时主控开启后默认接管 JSON 和 SSE。`SIDER_CONTROLLER_STREAMING=false` 可保留流式混合路由；已有部署中的旧 `false` 不会被默认值静默覆盖。
+
+Deno 的受鉴权管理接口 `POST /stats/strategy` 接受 `{ "strategy": "pro", "controllerStreaming": true }`。该布尔覆盖值等待 KV 写入成功后返回，并优先于环境变量；其他实例最多经过 3 秒缓存刷新后读取新值，冷实例会等待配置解析再决定路由。传 `false` 可回退。缺少可用统计 KV 时返回 503，不把仅当前实例生效误报为保存成功。鉴权沿用服务端 AUTH_TOKEN，凭证不应写入命令历史或文档。
+
+`GET /v1/messages/backends/status` 的 `routing.siderControllerStreaming`，以及 `/stats.json` 的 `controller` 展示当前有效值。主控接管优先于 Pro/Max，切换普通策略不会覆盖已进入主控的请求。
+
+看板的“业务完成响应”与“Sider 业务与调用”采用不同口径：前者记录已完成的客户端响应；后者按实际模型和小时记录上游尝试、成功、失败、1135、已确认登记、纠错、冷却拦截、主控失败、登记待续及重放。登记待续不计为业务失败；重放不增加模型调用。新增计数标明起点，不回填部署前缺失的数据，且聚合不受每小时 40 条遥测明细上限影响。明细保留／丢弃量单列，实际模型、执行模式与部署标识仅从新记录读取，旧记录不猜测。
 
 Deno 存储仅对 `memory` 作测试例外，其余使用 KV。Bun 除 `memory` 外使用固定路径 SQLite，不读取 `SIDER_CONTROLLER_KV_PATH`。统计 `STATS_KV` 与主控存储独立。
 
@@ -111,6 +117,9 @@ deno run --allow-net --allow-env --allow-read --allow-write deno/test/integratio
 # cc-switch窗口标签切换、跨实例续轮及XML安全分类。
 deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts 15
 
+# P0有效配置、Opus/Sonnet真实SSE文件复制与统计重放。
+deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts 17
+
 # 实际Claude Code客户端；使用已安装的claude，或通过CLAUDE_CODE_BIN指定可执行文件。
 deno run --allow-net --allow-env --allow-read --allow-write=.runtime --allow-run deno/test/integration/claude-code-controller.ts
 
@@ -120,9 +129,9 @@ deno run --allow-net --allow-env --allow-read deno/tools/probe-sider-controller-
 deno run --allow-net --allow-env --allow-read deno/tools/probe-sider-controller-refusal.ts claude-sonnet-5.5 breaker normal
 ```
 
-主控模式当前拒绝未证实可用的图片输入，不能假装 Sider 已看见图片。原生搜索是服务端工具，不能代替客户端 Read／Write／MCP；统一 `tool_call` 的协议解析已兼容，但主控工具循环默认不启用它，避免不可观察的服务端副作用。
+已配置兼容后端时，直接图文输入在 JSON 和 SSE 两种格式下保留视觉旁路，图片原样交给视觉兼容端；不能假装 Sider 文本主控已看见图片。主控工具结果中的嵌套图片仍明确拒绝，不静默丢弃。原生搜索是服务端工具，不能代替客户端 Read／Write／MCP；统一 `tool_call` 的协议解析已兼容，但主控工具循环默认不启用它，避免不可观察的服务端副作用。
 
-上下文每次最多登记 16 个分段，正文单项最多 512,000 字符；超限保留检查点并返回明确错误。本次大上下文通过不代表无限记忆或最高吞吐。上游模型标识是 Sider 返回的标识，不能独立证明底层权重身份。
+上下文已移除 16 片限制，正文单项最多 512,000 字符。Deno 部署的非流式请求每次最多登记两片、预算至多 70 秒，保存进度后返回明确的 429／Retry-After，由客户端续传；原文缺失或哈希不一致时拒绝继续。上游模型标识是 Sider 返回的标识，不能独立证明底层权重身份。
 
 Sider 未提供真实 token 用量；报告和兼容 usage 采用字符估算，并汇总内部登记／保存／纠正轮次，不能当作真实计费或厂商思考预算。Deno 的调用遥测按上游尝试记录；Bun 保持现有遥测边界，另有请求完成统计及本地验证日志。
 

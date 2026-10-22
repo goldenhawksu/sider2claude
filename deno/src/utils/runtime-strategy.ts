@@ -20,6 +20,50 @@ import { getKv } from './usage-stats-kv.ts';
 
 const STRATEGY_KEY = ['config', 'siderStrategy'];
 const TTL_MS = 3_000;
+const STREAMING_KEY = ['config', 'controllerStreaming'];
+let streamingOverride: boolean | undefined;
+let streamingReadAt = 0;
+
+export function currentControllerStreaming(fallback: boolean): boolean {
+  return streamingOverride ?? fallback;
+}
+
+/** 路由和展示都等待冷实例配置加载，避免旧环境变量使流式请求误入混合路由。 */
+export async function resolveControllerStreaming(
+  fallback: boolean,
+  now = Date.now(),
+): Promise<boolean> {
+  if (now - streamingReadAt < TTL_MS) return currentControllerStreaming(fallback);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        const kv = await getKv();
+        if (!kv) return;
+        const entry = await kv.get<boolean>(STREAMING_KEY);
+        streamingOverride = typeof entry.value === 'boolean' ? entry.value : undefined;
+      })(),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 2000);
+      }),
+    ]);
+  } catch {
+    /* 配置读取失败时保留当前有效值。 */
+  } finally {
+    clearTimeout(timer);
+    streamingReadAt = now;
+  }
+  return currentControllerStreaming(fallback);
+}
+
+/** 管理接口必须等待落库，不能把仅当前实例生效误报为跨实例成功。 */
+export async function setControllerStreaming(enabled: boolean): Promise<void> {
+  const kv = await getKv();
+  if (!kv) throw new Error('流式主控开关需要启用持久化KV');
+  await kv.set(STREAMING_KEY, enabled);
+  streamingOverride = enabled;
+  streamingReadAt = Date.now();
+}
 
 /** 运行时覆盖值。优先于环境变量 `SIDER_STRATEGY`。 */
 let override: SiderStrategy | undefined;
@@ -114,6 +158,8 @@ export function setSiderStrategy(strategy: SiderStrategy): void {
 
 /** 仅供测试。 */
 export function resetRuntimeStrategy(): void {
+  streamingOverride = undefined;
+  streamingReadAt = 0;
   override = undefined;
   cached = undefined;
   refreshInFlight = undefined;

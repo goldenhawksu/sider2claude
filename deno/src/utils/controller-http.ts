@@ -1,3 +1,4 @@
+import { recordSiderActivity } from './sider-activity.ts';
 import type { AnthropicRequest } from '../types/anthropic.ts';
 import { ControllerError, runSiderController } from './sider-controller.ts';
 import { SiderUpstreamError } from './sse-line-reader.ts';
@@ -42,6 +43,13 @@ export async function controllerResponse(
         headers: { ...headers, 'X-Conversation-ID': response.sider_session!.conversation_id },
       });
     } catch (error) {
+      recordSiderActivity(
+        request.model,
+        error instanceof ControllerError && error.statusCode === 429 &&
+          /^上下文登记(?:进度|达到本次时限)/.test(error.message)
+          ? { checkpointResponses: 1 }
+          : { requestFailures: 1 },
+      );
       const { status, body } = errorBody(error);
       logWarn('controller_failed', {
         requestId: context.requestId,
@@ -134,6 +142,13 @@ export async function controllerResponse(
             toolCalls: response.content.filter((b) => b.type === 'tool_use').length,
           });
         } catch (error) {
+          recordSiderActivity(
+            request.model,
+            error instanceof ControllerError && error.statusCode === 429 &&
+              /^上下文登记(?:进度|达到本次时限)/.test(error.message)
+              ? { checkpointResponses: 1 }
+              : { requestFailures: 1 },
+          );
           if (!combined.aborted) {
             send(errorBody(error).body);
             logWarn('controller_failed', {

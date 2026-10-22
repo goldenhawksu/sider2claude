@@ -11,6 +11,16 @@
 import type { SiderStrategy } from '../config/backends';
 
 let override: SiderStrategy | undefined;
+let streamingOverride: boolean | undefined;
+export function currentControllerStreaming(fallback: boolean): boolean {
+  return streamingOverride ?? fallback;
+}
+export async function resolveControllerStreaming(fallback: boolean): Promise<boolean> {
+  return currentControllerStreaming(fallback);
+}
+export async function setControllerStreaming(enabled: boolean): Promise<void> {
+  streamingOverride = enabled;
+}
 
 /** 当前生效的策略：运行时覆盖（网页切换）> 环境变量兜底。同步返回。 */
 export function currentSiderStrategy(fallback: SiderStrategy): SiderStrategy {
@@ -37,5 +47,6 @@ export async function refreshStrategy(): Promise<SiderStrategy | undefined> {
 
 /** 仅供测试。 */
 export function resetRuntimeStrategy(): void {
+  streamingOverride = undefined;
   override = undefined;
 }

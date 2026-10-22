@@ -9,6 +9,10 @@
 
 import { getEnv } from '../utils/env.ts';
 import { currentSiderStrategy, resolveSiderStrategy } from '../utils/runtime-strategy.ts';
+import {
+  currentControllerStreaming,
+  resolveControllerStreaming,
+} from '../utils/runtime-strategy.ts';
 
 export const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-flash';
 
@@ -169,6 +173,23 @@ export function usesAdaptiveThrottle(strategy: SiderStrategy): boolean {
 }
 
 /** 该策略是否把工具请求也投给 Sider。 */
+/** 主控开启时默认接管流式，显式false保留混合路由退出路径。 */
+export function controllerRoutingStatus(): { enabled: boolean; streaming: boolean } {
+  const enabled = getEnv('SIDER_CONTROLLER') === 'true';
+  return {
+    enabled,
+    streaming: enabled &&
+      currentControllerStreaming(getEnv('SIDER_CONTROLLER_STREAMING', 'true') !== 'false'),
+  };
+}
+
+export async function resolveControllerRoutingStatus(): Promise<
+  { enabled: boolean; streaming: boolean }
+> {
+  await resolveControllerStreaming(getEnv('SIDER_CONTROLLER_STREAMING', 'true') !== 'false');
+  return controllerRoutingStatus();
+}
+
 export function siderHandlesTools(strategy: SiderStrategy): boolean {
   return strategy === 'max';
 }

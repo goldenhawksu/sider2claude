@@ -9,7 +9,7 @@ Sider2Claude 将客户端请求转换为 Sider 文本通道或原生 Anthropic �
 ```mermaid
 flowchart TD
     A["Claude Code / VS Code / cc-switch / API 客户端"] --> B["鉴权与请求规范化"]
-    B --> C{"无工具 XML 安全分类？"}
+    B --> C{"无工具 XML 安全分类或直接图文输入？"}
     C -->|"是，兼容后端已配置"| D["原生 Anthropic 兼容后端"]
     C -->|"否"| E{"本运行时的主控开关接管此请求？"}
     E -->|"是"| F["KV / SQLite 检查点与正文引用"]
@@ -39,7 +39,7 @@ flowchart TD
 | --- | --- | --- |
 | 未覆盖时的本地端口 | 8000 | 4141 |
 | 主控非流式请求 | `SIDER_CONTROLLER=true` 时接管 | `SIDER_CONTROLLER=true` 时接管 |
-| 主控流式请求 | 还须 `SIDER_CONTROLLER_STREAMING=true`，否则走混合路由 | 主控开启后直接接管；未实现该流式开关 |
+| 主控流式请求 | 主控开启后默认接管，显式 `SIDER_CONTROLLER_STREAMING=false` 可退出；支持 KV 管理覆盖 | 主控开启后默认接管，显式 `SIDER_CONTROLLER_STREAMING=false` 可退出 |
 | 主控默认单次新增输入上限 | 6,000 字符 | 14,000 字符 |
 | 主控持久化 | Deno KV | `.runtime/controller.sqlite` |
 | 用量统计持久化 | 配置 `STATS_KV=kv` 后使用 Deno KV | 进程内统计 |
@@ -124,7 +124,7 @@ $env:ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-haiku-5.5'
 模型查找支持 `[1m]`、`[200k]` 等末尾数字窗口标签；这些标签不会新增模型目录条目。混合路由对未知 Claude 名称可按家族映射；主控要求目录中明确登记的模型，否则返回 400。移除的别名可能仍触发混合路由家族映射，但不代表它们是目录条目。
 
 - Sider 原生返回文本、推理及部分服务端工具事件；客户端工具调用由文本契约还原或由兼容后端提供。
-- 主控拒绝图片输入；混合路由将视觉请求优先交给已配置的兼容后端，实际模型需支持视觉。
+- 直接图文输入优先交给已配置的视觉兼容后端，主控也适用；主控工具结果中的嵌套图片仍明确拒绝，实际兼容模型需支持视觉。
 - Sider 的 Anthropic token 预算与 thinking 参数没有完整兑现保证；主控 usage 使用字符估算。
 - XML 安全分类保留模型实际判定及错误。它不会替代客户端权限控制，也不会伪造允许结果。
 - `tool_use` 由客户端执行；服务端工具结果则转成客户端可识别的文本记录。
@@ -148,7 +148,7 @@ npm run build
 git diff --check
 ```
 
-真实集成入口为 `deno/test/integration/run.ts`：默认基础套件 01–13；`E2E_CONTROLLER=true` 时加入 14 和 15。发布门禁设置 `E2E_REQUIRE_ALL_PASS=true`，要求通过数等于执行总数，失败及上游受限都为 0。
+真实集成入口为 `deno/test/integration/run.ts`：默认基础套件 01–13；`E2E_CONTROLLER=true` 时加入 14–17。套件17覆盖流式接管、视觉旁路、实际文件复制及统计。发布门禁设置 `E2E_REQUIRE_ALL_PASS=true`，要求通过数等于执行总数，失败及上游受限都为 0。
 
 ```powershell
 $env:E2E_BASE_URL='http://localhost:4141'

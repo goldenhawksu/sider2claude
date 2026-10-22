@@ -24,7 +24,7 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 ### Sider 主控模式（2026-10-08 实证开发）
 
 - `SIDER_CONTROLLER=true` 优先于下文的普通 `pro/max/conservative` 路由，Sider 保持规划、创作和工具选型权；工具由 Claude Code/MCP 执行，不把业务回合整体交给 GLM。
-- Deno 主控默认接管非流式，流式另需 `SIDER_CONTROLLER_STREAMING=true`；Bun 主控接管两种格式，没有该开关。新增输入上限默认 Deno 6000、Bun 14000 字符。
+- 两套运行时主控开启后默认接管 JSON 和 SSE，`SIDER_CONTROLLER_STREAMING=false` 可退出流式接管。Deno 管理接口 `/stats/strategy` 可同时传布尔 `controllerStreaming`，覆盖值等待 KV 落库并优先于旧环境变量；路由与看板均解析有效值。新增输入上限默认 Deno 6000、Bun 14000 字符。
 - 分类旁路识别 system 中明确的分类用途与 `<block>`／`<severity>`，且请求不含工具。保留完整 system、实际判定和错误，不伪造允许；回归是套件15和 `safety-classifier.test.ts`。
 - 入口是两套 `utils/sider-controller.ts` 和 `controller-http.ts`；Deno KV、Bun SQLite 保存任务、父消息、工具关联、正文引用和账号租约。参数不能靠宽松 JSON 修补；完整工具结果必须续轮回到同一 Sider 会话。
 - Opus 5.5 和 Sonnet 5.5 已实测工具契约、多轮失败恢复、长 Write 及 StoreContent→WriteFromRef。旧版 Opus 的历史额度数据不能作为硬排除 Opus 5.5 的依据。推理事件存在不等于 Anthropic thinking 预算参数已被兑现。

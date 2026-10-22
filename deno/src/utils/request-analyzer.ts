@@ -14,6 +14,14 @@ export function isSafetyClassifierRequest(request: AnthropicRequest): boolean {
     /<(?:block|severity)>/i.test(request.system);
 }
 
+/** 直接图文输入交给视觉兼容端；主控工具结果中的嵌套图片仍保留明确拒绝。 */
+export function isStandaloneVisionRequest(request: AnthropicRequest): boolean {
+  return request.messages.some((message) =>
+    Array.isArray(message.content) &&
+    message.content.some((block) => block.type === 'image')
+  );
+}
+
 export interface RequestAnalysis {
   type: RequestType;
   hasClaudeCodeTools: boolean;
@@ -153,7 +161,8 @@ export class RequestAnalyzer {
     });
   }
 
-  private extractRequestText(request: AnthropicRequest): string {    const parts: string[] = [];
+  private extractRequestText(request: AnthropicRequest): string {
+    const parts: string[] = [];
 
     if (typeof request.system === 'string') {
       parts.push(request.system);

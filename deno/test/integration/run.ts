@@ -29,6 +29,7 @@ import { suite as writeIntegrity } from './suites/13-write-integrity.ts';
 import { suite as siderController } from './suites/14-sider-controller.ts';
 import { suite as contextWindow } from './suites/15-context-window.ts';
 import { suite as controllerContext } from './suites/16-controller-context.ts';
+import { suite as controllerStats } from './suites/17-controller-stats.ts';
 
 const ALL_SUITES: Suite[] = [
   infrastructure,
@@ -45,7 +46,7 @@ const ALL_SUITES: Suite[] = [
   longToolRequest,
   writeIntegrity,
   ...(Deno.env.get('E2E_CONTROLLER') === 'true'
-    ? [siderController, contextWindow, controllerContext]
+    ? [siderController, contextWindow, controllerContext, controllerStats]
     : []),
 ];
 

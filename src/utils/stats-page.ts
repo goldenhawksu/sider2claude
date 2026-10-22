@@ -276,6 +276,27 @@ const REFRESH_SCRIPT = `<script>
 })();
 </script>`;
 
+/** 新计数单独标明起点，避免把部署前缺失的数据显示成零失败。 */
+function activityCard(snapshot: UsageSnapshot): string {
+  const activity = snapshot.siderActivity;
+  const controller = snapshot.controller;
+  const mode = controller
+    ? `主控：${controller.enabled ? '启用' : '关闭'} · 流式接管：${controller.streaming ? '启用' : '关闭'}`
+    : '主控状态未知';
+  const fields = ['completed', 'attempts', 'succeeded', 'failed', 'quotaErrors', 'contextUploads', 'corrections', 'cooldownRejections', 'requestFailures', 'checkpointResponses', 'cachedReplays'] as const;
+  const labels = ['业务完成', '上游尝试', '上游成功', '上游失败', '1135', '登记', '纠错', '冷却拦截', '主控失败', '登记待续', '重放'];
+  const rows = activity?.models.map((row) => `<tr><td>${esc(row.model)}</td>${fields.map((field) => `<td class="num">${row[field]}</td>`).join('')}</tr>`).join('') || '<tr><td colspan="12" class="empty-row">尚无新增调用计数</td></tr>';
+  const since = activity?.since
+    ? new Date(new Date(activity.since).getTime() + DISPLAY_TZ_OFFSET_MS).toISOString().slice(0, 16).replace('T', ' ')
+    : '尚未开始';
+  return `<div class="card" id="activity-card" style="margin-bottom:16px;overflow-x:auto">
+    <h2>Sider 业务与调用（近24小时）</h2>
+    <p class="muted small">${mode}；新增计数自 ${since}（UTC+8）起记录，部署前无历史回填。</p>
+    <table><thead><tr><th>实际上游模型</th>${labels.map((label) => `<th class="num">${label}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>
+    <p class="muted small">业务完成与内部调用分别计数；登记待续不计为主控失败。遥测明细保留 ${activity?.totals.telemetryRecorded ?? 0} 条、采样丢弃 ${activity?.totals.telemetryDropped ?? 0} 条；调用聚合不受采样上限影响。${activity?.persisted ? '调用计数已持久化。' : '调用计数仅当前实例。'}</p>
+  </div>`;
+}
+
 export function renderStatsPage(snapshot: UsageSnapshot): string {
   const { totals } = snapshot;
   // 超过槽位数的模型折叠为「其他」，绝不循环取色
@@ -317,10 +338,11 @@ export function renderStatsPage(snapshot: UsageSnapshot): string {
       if (r.reason === 'routing') marks.push('<span class="tag ghost">策略</span>');
       if (r.fallback) marks.push('<span class="tag warn">受限兜底</span>');
       if (r.stream) marks.push('<span class="tag ghost">stream</span>');
+      if (r.mode) marks.push(`<span class="tag ghost">${esc(r.mode)}</span>`);
       return `<tr>
         <td class="num muted">${hhmm(r.time)}</td>
         <td><span class="tag ${r.backend}">${r.backend}</span></td>
-        <td>${esc(r.model)}</td>
+        <td>${esc(r.model)}<div class="muted small">实际：${esc(r.actualModel ?? "历史未记录")}</div></td>
         <td>${marks.join('')}</td>
         <td>${r.tools.length ? esc(r.tools.join(', ')) : '<span class="muted">—</span>'}</td>
         <td class="num muted">${r.ms}ms</td>
@@ -479,7 +501,7 @@ a { color: var(--s1); }
 </div>
 
 <div class="grid-3" id="tiles">
-  <div class="card tile"><div class="v">${totals.requests}</div><div class="k">上游请求</div></div>
+  <div class="card tile"><div class="v">${totals.requests}</div><div class="k">业务完成响应</div></div>
   <div class="card tile"><div class="v">${
     compact(totals.inputTokens + totals.outputTokens)
   }</div><div class="k">Token 总量</div></div>
@@ -503,7 +525,7 @@ a { color: var(--s1); }
       </table>
     </div>
     <p class="muted small" style="margin:12px 0 0">
-      走 DeepSeek 的原因：<b>工具</b>=请求含 Claude Code / MCP 工具，本就该由 DeepSeek 承接；
+      走 DeepSeek 的原因：<b>工具</b>=请求含 Claude Code / MCP 工具，经混合路由交给兼容后端；
       <b>受限兜底</b>=Sider 调用失败后被迫改走 DeepSeek；<b>策略</b>=长文本等路由策略主动选择。
     </p>
   </div>
@@ -537,6 +559,8 @@ a { color: var(--s1); }
     ${toolRows}
   </div>
 </div>
+
+${activityCard(snapshot)}
 
 <div class="card" id="recent-card">
   <h2>最近请求</h2>

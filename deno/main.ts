@@ -16,7 +16,7 @@ import protocolRouter from './src/routes/protocols.ts';
 import { getEnv } from './src/utils/env.ts';
 import { getStatsSnapshot } from './src/utils/usage-stats.ts';
 import { renderStatsPage } from './src/utils/stats-page.ts';
-import { setSiderStrategy } from './src/utils/runtime-strategy.ts';
+import { setControllerStreaming, setSiderStrategy } from './src/utils/runtime-strategy.ts';
 import { readSiderTelemetry } from './src/utils/sider-telemetry.ts';
 import { requireAuth } from './src/middleware/auth.ts';
 
@@ -135,13 +135,32 @@ app.get('/stats.json', async (c) => {
 
 // 写进 KV 让多实例最多 3 秒收敛；当前实例立即生效。
 app.post('/stats/strategy', requireAuth, async (c) => {
-  const body = await c.req.json().catch(() => ({})) as { strategy?: unknown };
+  const body = await c.req.json().catch(() => ({})) as {
+    strategy?: unknown;
+    controllerStreaming?: unknown;
+  };
   const strategy = body.strategy;
   if (strategy !== 'conservative' && strategy !== 'pro' && strategy !== 'max') {
     return c.json({ error: `invalid strategy: ${String(strategy)}` }, 400);
   }
+  if (body.controllerStreaming !== undefined) {
+    if (typeof body.controllerStreaming !== 'boolean') {
+      return c.json({ error: 'controllerStreaming必须为boolean' }, 400);
+    }
+    try {
+      await setControllerStreaming(body.controllerStreaming);
+    } catch {
+      return c.json({ error: '无法持久化流式主控配置，原配置继续生效' }, 503);
+    }
+  }
   setSiderStrategy(strategy);
-  return c.json({ status: 'ok', strategy });
+  return c.json({
+    status: 'ok',
+    strategy,
+    ...(body.controllerStreaming !== undefined
+      ? { controllerStreaming: body.controllerStreaming }
+      : {}),
+  });
 });
 
 // 运行遥测原始记录，供离线分析优化调度策略。
