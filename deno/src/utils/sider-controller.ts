@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import type {
   AnthropicRequest,
   AnthropicResponse,
@@ -67,6 +68,8 @@ interface Task {
   pending: PendingTool[];
   uploads?: Record<string, number>;
   pendingUpload?: string;
+  pendingHistory?: string;
+  pendingUsage?: { input_tokens: number; output_tokens: number };
   toolsHash?: string;
   mustWrite?: boolean;
   exactCopy?: boolean;
@@ -263,6 +266,12 @@ async function resolveTask(
   }
   id ??= historyId;
   let task = id ? await store.read<Task>(`${owner}:task:${id}`) : null;
+  if (!task && !id && !session && !results.length && request.messages.length > 1) {
+    const pendingHash = await historyKey(request, request.messages.slice(0, -1));
+    const pendingId = await store.read<string>(`${owner}:pending-history:${pendingHash}`);
+    const pendingTask = pendingId ? await store.read<Task>(`${owner}:task:${pendingId}`) : null;
+    if (pendingTask?.pendingHistory === pendingHash) task = pendingTask;
+  }
   const model = getModelById(request.model)!.siderModel;
   if (task && getModelById(task.model)?.siderModel !== model) {
     throw new ControllerError('恢复主控会话时不能静默切换模型', 400);
@@ -330,6 +339,8 @@ async function persistControllerResponse(
   replayKey: string,
   started: number,
 ): Promise<void> {
+  delete task.pendingHistory;
+  delete task.pendingUsage;
   await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
   await store.write(`${owner}:session:${task.id}`, task.id, RETENTION_MS);
   await store.write(
@@ -453,7 +464,12 @@ export async function runSiderController(
   if (!siderToken) throw new ControllerError('未配置Sider主控凭证', 503);
   const store = await getControllerStore();
   const owner = await controllerHash(token);
-  const totalMs = Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000'));
+  // 部署平台限制非流式首字节等待；保存进度后以小批登记让客户端继续。
+  const deployedJson = !!getEnv('DENO_DEPLOYMENT_ID') && !request.stream;
+  const totalMs = Math.min(
+    Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000')),
+    deployedJson ? 70_000 : Infinity,
+  );
   const deadline = AbortSignal.timeout(totalMs);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
   const started = Date.now();
@@ -489,6 +505,7 @@ export async function runSiderController(
       const inflightKey = `${replayKey}:task`;
       const resumeId = await store.read<string>(inflightKey);
       const task = await resolveTask(store, owner, request, session ?? resumeId ?? undefined);
+      task.pendingHistory = await historyKey(request);
       const currentInstruction = latestUserInstruction(request);
       if (currentInstruction) {
         task.goalHint = currentInstruction.length <= 8000 ? currentInstruction : undefined;
@@ -497,6 +514,7 @@ export async function runSiderController(
       await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
       await store.write(`${owner}:session:${task.id}`, task.id, RETENTION_MS);
       await store.write(inflightKey, task.id, RETENTION_MS);
+      await store.write(`${owner}:pending-history:${task.pendingHistory}`, task.id, RETENTION_MS);
       const clientTools = request.tool_choice?.type === 'none' ? [] : request.tools ?? [];
       if (
         clientTools.some((t) => ['StoreContent', 'WriteFromRef'].includes(t.name))
@@ -615,7 +633,8 @@ export async function runSiderController(
         }
       }
       let corrections = 0;
-      let totalInputTokens = 0, totalOutputTokens = 0;
+      let totalInputTokens = task.pendingUsage?.input_tokens ?? 0;
+      let totalOutputTokens = task.pendingUsage?.output_tokens ?? 0;
       const paceKey = `pace:${await controllerHash(siderToken)}`;
       // 5.5 三模型实测：约7.7K中文已触发603，5.7K仍可投递；保守留出契约包装空间。
       const maxChars = Number(getEnv('SIDER_CONTROLLER_MAX_INPUT_CHARS', '6000'));
@@ -637,7 +656,7 @@ export async function runSiderController(
         try {
           const nextAt = await store.read<number>(paceKey);
           if (nextAt && nextAt > Date.now()) {
-            await new Promise((resolve) => setTimeout(resolve, nextAt - Date.now()));
+            await delay(nextAt - Date.now(), undefined, { signal: combined });
           }
           if (combined.aborted) throw combined.reason;
           const body = {
@@ -715,13 +734,15 @@ export async function runSiderController(
         }
         task.cid = upstream.conversationId;
         task.parent = upstream.messageIds.assistant;
-        await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         totalInputTokens += Math.ceil(prompt.length / 4);
         totalOutputTokens += Math.ceil(
           (upstream.textParts.join('').length + upstream.reasoningParts.join('').length) / 4,
         );
+        task.pendingUsage = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens };
+        await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         return upstream;
       };
+      let uploaded = 0;
       const upload = async (context: string) => {
         const hash = await controllerHash(context), size = maxChars - 512;
         const count = Math.ceil(context.length / size);
@@ -732,13 +753,32 @@ export async function runSiderController(
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         }
         for (let i = task.uploads[hash] ?? 0; i < count; i++) {
+          if (deployedJson && uploaded >= 2) {
+            throw new ControllerError(
+              `上下文登记进度${i}/${count}，检查点已保存，请自动重试或继续`,
+              429,
+              1000,
+            );
+          }
           const uploadStarted = Date.now();
           const chunk = `以下是当前任务上下文片段${
             i + 1
           }/${count}。仅记住，暂时不执行任务、不调用工具；只确认已记住，所有片段发送完后再执行。\n${
             context.slice(i * size, (i + 1) * size)
           }`;
-          const result = await sendText(chunk);
+          let result;
+          try {
+            result = await sendText(chunk);
+          } catch (error) {
+            if (deployedJson && deadline.aborted && !signal?.aborted) {
+              throw new ControllerError(
+                '上下文登记达到本次时限，检查点已保存，请自动重试或继续',
+                429,
+                1000,
+              );
+            }
+            throw error;
+          }
           if (!contextUploadAccepted(result.textParts.join(''))) {
             persistSiderTelemetry({
               ts: Date.now(),
@@ -757,6 +797,7 @@ export async function runSiderController(
               `Sider未确认上下文分片${i + 1}/${count}，已停止后续发送`,
             );
           }
+          uploaded++;
           task.uploads[hash] = i + 1;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
           persistSiderTelemetry({

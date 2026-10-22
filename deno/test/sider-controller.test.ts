@@ -1297,6 +1297,147 @@ Deno.test('主控长会话：内部内容库超限显示实际容量错误，不
     equal(body.error.message.includes('512000'), true);
   });
 });
+Deno.test('主控部署期限：非流式分批返回可重试进度，纯用户追加继续仍续传同一原文', async () => {
+  const previous = Deno.env.get('DENO_DEPLOYMENT_ID');
+  Deno.env.set('DENO_DEPLOYMENT_ID', 'context-batch-test');
+  const path = `C:/isolated/${crypto.randomUUID()}/spec_lock.md`;
+  const seen = new Map<number, string>();
+  let total = 0, inRequest = 0, inputTokens = 0, outputTokens = 0;
+  const request: AnthropicRequest = {
+    model: 'claude-opus-5.5',
+    tools: [tools![0]!],
+    system: '完整部署规范。'.repeat(2800) + `尾部唯一路径：${path}`,
+    messages: [{ role: 'user', content: 'P07已完成，按尾部规范路径调用Read继续P08。' }],
+  };
+  try {
+    await appWithMock((body) => {
+      const text = body.multi_content[0].text;
+      const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+      if (part) {
+        if (++inRequest > 2) return new Response('DEPLOYMENT_TIMED_OUT', { status: 503 });
+        const index = Number(part[1]);
+        total = Number(part[2]);
+        equal(seen.has(index), false);
+        if (index > 1) equal(body.parent_message_id, `batch-parent-${index - 1}`);
+        seen.set(index, part[3]);
+        inputTokens += Math.ceil(text.length / 4);
+        outputTokens++;
+        return sse('已记住', 'batch-context-cid', `batch-parent-${index}`);
+      }
+      equal(seen.size, total);
+      equal([...seen.values()].join('').includes(path), true);
+      equal(text.includes('请继续完成P08'), true);
+      const reply = `[tool_use:Read] id=p08 input=${JSON.stringify({ file_path: path })}`;
+      inputTokens += Math.ceil(text.length / 4);
+      outputTokens += Math.ceil(reply.length / 4);
+      return sse(reply, 'batch-context-cid');
+    }, async (app) => {
+      let completed = false;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        inRequest = 0;
+        const response = await send(app, request);
+        const result = await response.json();
+        if (response.status === 429) {
+          equal(response.headers.get('retry-after'), '1');
+          equal(result.error.message.includes('登记进度'), true);
+          request.messages.push({ role: 'user', content: '请继续完成P08' });
+          continue;
+        }
+        equal(response.status, 200);
+        equal(result.content[0].input.file_path, path);
+        equal(result.usage.input_tokens, inputTokens);
+        equal(result.usage.output_tokens, outputTokens);
+        const store = await getControllerStore();
+        const task = await store.read<{ pendingHistory?: string; pendingUpload?: string }>(
+          `${await controllerHash(
+            'controller-test-token',
+          )}:task:${result.sider_session.conversation_id}`,
+        );
+        equal(task?.pendingHistory, undefined);
+        equal(task?.pendingUpload, undefined);
+        completed = true;
+        break;
+      }
+      equal(completed, true);
+      equal(total > 2, true);
+    });
+  } finally {
+    if (previous === undefined) Deno.env.delete('DENO_DEPLOYMENT_ID');
+    else Deno.env.set('DENO_DEPLOYMENT_ID', previous);
+  }
+});
+Deno.test('主控部署期限：节奏等待可被请求期限取消，保存原文后返回继续登记而非平台超时', async () => {
+  const previous = {
+    deployment: Deno.env.get('DENO_DEPLOYMENT_ID'),
+    total: Deno.env.get('SIDER_TOTAL_TIMEOUT_MS'),
+  };
+  Deno.env.set('DENO_DEPLOYMENT_ID', 'context-deadline-test');
+  Deno.env.set('SIDER_TOTAL_TIMEOUT_MS', '60');
+  try {
+    await appWithMock(() => {
+      throw new Error('等待期应在调用上游前被取消');
+    }, async (app) => {
+      const store = await getControllerStore();
+      const key = `pace:${await controllerHash('controller-sider-token')}`;
+      const previousPace = await store.read<number>(key);
+      await store.write(key, Date.now() + 10_000, 60_000);
+      try {
+        const started = Date.now();
+        const response = await send(app, {
+          model: 'claude-opus-5.5',
+          system: '上下文'.repeat(6000),
+          messages: [{ role: 'user', content: crypto.randomUUID() }],
+        });
+        equal(response.status, 429);
+        equal(response.headers.get('retry-after'), '1');
+        equal((await response.json()).error.message.includes('本次时限'), true);
+        equal(Date.now() - started < 2000, true);
+      } finally {
+        await store.write(key, previousPace, previousPace === null ? -1 : 60_000);
+      }
+    });
+  } finally {
+    for (
+      const [key, value] of [['DENO_DEPLOYMENT_ID', previous.deployment], [
+        'SIDER_TOTAL_TIMEOUT_MS',
+        previous.total,
+      ]]
+    ) {
+      if (value === undefined) Deno.env.delete(key!);
+      else Deno.env.set(key!, value);
+    }
+  }
+});
+Deno.test('主控部署期限：已开始响应的流式登记不受非流式批次限制', async () => {
+  const previous = Deno.env.get('DENO_DEPLOYMENT_ID');
+  Deno.env.set('DENO_DEPLOYMENT_ID', 'context-stream-test');
+  let chunks = 0;
+  try {
+    await appWithMock((body) => {
+      if (/^以下是当前任务上下文片段/.test(body.multi_content[0].text)) {
+        chunks++;
+        return sse('已记住', 'batch-stream-cid');
+      }
+      return sse('[tool_use:Read] id=p08 input={"file_path":"spec_lock.md"}', 'batch-stream-cid');
+    }, async (app) => {
+      const response = await send(app, {
+        model: 'claude-opus-5.5',
+        stream: true,
+        tools: [tools![0]!],
+        system: '完整流式规范。'.repeat(2300),
+        messages: [{ role: 'user', content: 'Read读取spec_lock.md' }],
+      });
+      const stream = await response.text();
+      equal(chunks > 2, true);
+      equal(stream.includes('event: error'), false);
+      equal(stream.includes('event: message_stop'), true);
+      equal(stream.includes('"type":"tool_use"'), true);
+    });
+  } finally {
+    if (previous === undefined) Deno.env.delete('DENO_DEPLOYMENT_ID');
+    else Deno.env.set('DENO_DEPLOYMENT_ID', previous);
+  }
+});
 Deno.test('主控纠错：完整工具schema超出单轮上限时再次分段，不能返回413', async () => {
   const largeTools: AnthropicRequest['tools'] = [{
     name: 'Read',

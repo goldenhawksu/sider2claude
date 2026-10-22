@@ -323,6 +323,64 @@ test('Bun长会话：内容库超限返回明确的400容量错误，保留真�
   }
 });
 
+test('Bun部署期限：小批登记后纯用户追加继续保持原文和父消息', async () => {
+  const original = globalThis.fetch;
+  const keys = ['SIDER_AUTH_TOKEN', 'SIDER_CONTROLLER_STORAGE', 'SIDER_CONTROLLER_PACE_MS', 'SIDER_CONTROLLER_MAX_INPUT_CHARS', 'DENO_DEPLOYMENT_ID'];
+  const previous = keys.map((key) => process.env[key]);
+  Object.assign(process.env, { SIDER_AUTH_TOKEN: 'batch-bun', SIDER_CONTROLLER_STORAGE: 'memory',
+    SIDER_CONTROLLER_PACE_MS: '0', SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', DENO_DEPLOYMENT_ID: 'batch-test' });
+  const owner = crypto.randomUUID(), path = `C:/isolated/${owner}/spec_lock.md`;
+  const request: AnthropicRequest = { model: 'claude-sonnet-5.5', system: '完整规范。'.repeat(1600) + path,
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }],
+    messages: [{ role: 'user', content: '按尾部唯一路径用Read读取规范。' }] };
+  const seen = new Set<number>();
+  let inRequest = 0, total = 0;
+  try {
+    globalThis.fetch = ((_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      const text = body.multi_content[0].text;
+      const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+      if (part) {
+        expect(++inRequest).toBeLessThanOrEqual(2);
+        const index = Number(part[1]);
+        total = Number(part[2]);
+        expect(seen.has(index)).toBe(false);
+        if (index > 1) expect(body.parent_message_id).toBe(`parent-${index - 1}`);
+        seen.add(index);
+      } else {
+        expect(seen.size).toBe(total);
+        expect(text).toContain('请继续完成P08');
+      }
+      return Promise.resolve(new Response([
+        { code: 0, msg: 'ok', data: { type: 'message_start', model: request.model,
+          message_start: { cid: `batch-${owner}`, user_message_id: 'u', assistant_message_id: `parent-${part?.[1] ?? 'done'}` } } },
+        { code: 0, msg: 'ok', data: { type: 'text', model: request.model,
+          text: part ? '已记住' : `[tool_use:Read] id=p08 input=${JSON.stringify({ file_path: path })}` } },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }));
+    }) as typeof fetch;
+    let completed = false;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      inRequest = 0;
+      try {
+        const result = await runSiderController(request, owner);
+        expect(result.content.find((block) => block.type === 'tool_use')?.input.file_path).toBe(path);
+        completed = true;
+        break;
+      } catch (error) {
+        expect(error).toMatchObject({ statusCode: 429, retryAfterMs: 1000 });
+        request.messages.push({ role: 'user', content: '请继续完成P08' });
+      }
+    }
+    expect(completed).toBe(true);
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
+
 test('Bun续轮保留纯工具结果和错误标记',()=>{
   const request:any={model:'claude-opus-5.5',messages:[{role:'user',content:[{type:'tool_result',tool_use_id:'id',is_error:true,content:'端口8080'}]}]};
   const text=convertAnthropicToSiderSync(request,'real-cid').multi_content[0]!.text;
