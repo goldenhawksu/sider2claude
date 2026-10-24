@@ -119,3 +119,21 @@ Deno.test('Sider HTTP400的603正文保持输入过长分类', async () => {
     globalThis.fetch = original;
   }
 });
+
+Deno.test('Controller：提供方工具（无 input_schema）不进主控', () => {
+  const previousController = Deno.env.get('SIDER_CONTROLLER');
+  Deno.env.set('SIDER_CONTROLLER', 'true');
+  try {
+    const provider = {
+      ...request,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+    } as unknown as AnthropicRequest;
+    equal(controllerHandlesRequest({ ...provider, stream: false }), false);
+    equal(controllerHandlesRequest({ ...provider, stream: true }), false);
+    // 带 input_schema 的普通客户端工具仍由主控接管。
+    equal(controllerHandlesRequest({ ...request, stream: false }), true);
+  } finally {
+    if (previousController === undefined) Deno.env.delete('SIDER_CONTROLLER');
+    else Deno.env.set('SIDER_CONTROLLER', previousController);
+  }
+});

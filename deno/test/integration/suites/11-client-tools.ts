@@ -55,7 +55,8 @@ export const suite: Suite = {
           tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
           messages: [{
             role: 'user',
-            content: '使用网页搜索查询 Python 官方网站最新稳定版本，必须给出来源网址。',
+            content:
+              `使用网页搜索查询 Python 官方网站最新稳定版本，必须给出来源网址。（运行 ${crypto.randomUUID()}）`,
           }],
         };
         if (stream) {
@@ -76,10 +77,13 @@ export const suite: Suite = {
     {
       name: '17 工具：README 抓取失败 → webReader → Write 文档',
       async run({ api }: any) {
+        // 每次运行使用唯一请求内容，避免命中主控响应缓存后复用上一轮的 tool_use id
+        // （该 id 的工具结果已被消费，会让重跑误报“工具结果已处理”）。
+        const runNonce = crypto.randomUUID();
         const history: any[] = [{
           role: 'user',
           content:
-            '先用 mcp__open_websearch__fetchGithubReadme 读取 https://github.com/goldenhawksu/sider2claude，只做这一步。',
+            `先用 mcp__open_websearch__fetchGithubReadme 读取 https://github.com/goldenhawksu/sider2claude，只做这一步。（运行 ${runNonce}）`,
         }];
         const request = () => ({
           model: 'claude-opus-5.5',

@@ -640,3 +640,94 @@ test('Bun 主控流式：chat 实时转发文本增量且仍返回完整结果',
     globalThis.fetch = original;
   }
 });
+
+test('Bun 主控：非流式部署超时返回要求改用流式的400', async () => {
+  const original = globalThis.fetch;
+  const keys = [
+    'SIDER_AUTH_TOKEN',
+    'SIDER_CONTROLLER_STORAGE',
+    'SIDER_CONTROLLER_PACE_MS',
+    'DENO_DEPLOYMENT_ID',
+    'SIDER_TOTAL_TIMEOUT_MS',
+  ];
+  const previous = keys.map((key) => process.env[key]);
+  process.env.SIDER_AUTH_TOKEN = 'timeout-account';
+  process.env.SIDER_CONTROLLER_STORAGE = 'memory';
+  process.env.SIDER_CONTROLLER_PACE_MS = '0';
+  process.env.DENO_DEPLOYMENT_ID = 'timeout-bun';
+  process.env.SIDER_TOTAL_TIMEOUT_MS = '50';
+  try {
+    globalThis.fetch = ((_url, init) =>
+      new Promise((_resolve, reject) => {
+        const signal = (init as RequestInit | undefined)?.signal as AbortSignal | undefined;
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      })) as typeof fetch;
+    await expect(
+      runSiderController({
+        model: 'claude-opus-5.5',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `超时-${crypto.randomUUID()}` }],
+      }, 'timeout-owner'),
+    ).rejects.toThrow('stream=true');
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
+
+test('Bun 主控：提供方工具（无 input_schema）不进主控', () => {
+  const previous = process.env.SIDER_CONTROLLER;
+  process.env.SIDER_CONTROLLER = 'true';
+  try {
+    const provider = {
+      model: 'claude-opus-5.5',
+      stream: false,
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+      messages: [{ role: 'user', content: '搜索' }],
+    } as unknown as AnthropicRequest;
+    expect(controllerHandlesRequest(provider)).toBe(false);
+    expect(controllerHandlesRequest({
+      ...provider,
+      tools: [{ name: 'Read', input_schema: { type: 'object', properties: {} } }],
+    } as AnthropicRequest)).toBe(true);
+  } finally {
+    if (previous === undefined) delete process.env.SIDER_CONTROLLER;
+    else process.env.SIDER_CONTROLLER = previous;
+  }
+});
+
+test('Bun 路由：提供方工具走 DeepSeek，续轮不被 Sider 记录带回', () => {
+  const config = {
+    sider: { enabled: true, apiUrl: 'https://sider.ai/api/chat/v1/completions', authToken: 'test' },
+    deepseek: {
+      enabled: true,
+      provider: 'anthropic-compatible' as const,
+      baseUrl: 'https://compatible.example',
+      apiKey: 'test',
+      model: 'glm-5.3-flash',
+    },
+    routing: {
+      defaultBackend: 'sider' as const,
+      autoFallback: true,
+      preferSiderForSimpleChat: true,
+      debugMode: false,
+      siderStrategy: 'pro' as const,
+    },
+  };
+  const router = new RouterEngine(config);
+  router.recordSessionBackend('provider-session', 'sider');
+  const request = {
+    model: 'claude-opus-5.5',
+    max_tokens: 64,
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+    messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: '结果' }] }],
+  } as unknown as AnthropicRequest;
+
+  const decision = router.decide(request, 'provider-session');
+  expect(decision.backend).toBe('deepseek');
+  expect(decision.ruleId).toBe('rule_4_provider_tools');
+  expect(decision.allowFallback).toBe(false);
+});

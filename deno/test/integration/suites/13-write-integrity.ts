@@ -1,11 +1,4 @@
-import {
-  assertAnthropicMessage,
-  assertEquals,
-  assertIncludes,
-  assertStatus,
-  type Suite,
-  toolUseOf,
-} from '../harness.ts';
+import { assertEquals, assertIncludes, assertStatus, assertTrue, type Suite } from '../harness.ts';
 
 export const suite: Suite = {
   id: '13',
@@ -30,9 +23,11 @@ export const suite: Suite = {
         null,
         2,
       );
-      const response = await api.post('/v1/messages', {
+      // 部署环境的非流式主控总期限约 70 秒，长写必须走流式（Claude Code 的实际形态）。
+      const response = await api.sse('/v1/messages', {
         model: 'claude-opus-5.5',
         max_tokens: 8192,
+        stream: true,
         tools: [{
           name: 'Write',
           description: 'Write the exact given content to file_path without changing it.',
@@ -49,9 +44,35 @@ export const suite: Suite = {
         }],
       });
       assertStatus(response, 200);
-      assertAnthropicMessage(response.json, 'claude-opus-5.5');
-      const tool = toolUseOf(response.json);
-      assertEquals(tool?.name, 'Write', '客户端工具');
+      assertTrue(
+        !response.events.some((event: any) => event.type === 'error'),
+        '无流式错误',
+      );
+      assertEquals(response.events.at(-1)?.type, 'message_stop', '流完整结束');
+      const blockStart = response.events.find((event: any) =>
+        event.type === 'content_block_start' && event.content_block?.type === 'tool_use'
+      );
+      assertEquals(blockStart?.content_block?.name, 'Write', '客户端工具');
+      const partial = response.events
+        .filter((event: any) =>
+          event.type === 'content_block_delta' && event.index === blockStart?.index &&
+          event.delta?.type === 'input_json_delta'
+        )
+        .map((event: any) => event.delta.partial_json)
+        .join('');
+      let tool: { name: string; input: any };
+      try {
+        tool = { name: blockStart.content_block.name, input: JSON.parse(partial) };
+      } catch (error) {
+        const preview = partial.replace(/\s+/g, ' ').slice(0, 500);
+        throw new Error(
+          `Write正文不是合法JSON（${partial.length}字符）：${
+            error instanceof Error ? error.message : String(error)
+          }；预览=${preview}`,
+        );
+      }
+      const final = response.events.find((event: any) => event.type === 'message_delta');
+      assertEquals(final?.delta?.stop_reason, 'tool_use', '停止原因');
       assertEquals(tool.input.file_path, path, '目标路径必须完全相同');
       let parsed: { project: string; items: unknown[] };
       try {

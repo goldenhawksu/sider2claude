@@ -474,3 +474,38 @@ Deno.test('路由策略：图片 + Claude Code 工具仍走 DeepSeek（两条规
 
   assertEquals(decision.backend, 'deepseek');
 });
+
+Deno.test('路由策略：提供方工具（无 input_schema）走 DeepSeek 且不允许 fallback', () => {
+  const router = new RouterEngine(baseConfig());
+  const providerRequest = {
+    ...request(),
+    model: 'claude-opus-5.5',
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+    messages: [{ role: 'user', content: '搜索 Python 官网最新稳定版本' }],
+  } as unknown as AnthropicRequest;
+
+  const decision = router.decide(providerRequest);
+
+  assertEquals(decision.backend, 'deepseek');
+  assertEquals(decision.ruleId, 'rule_4_provider_tools');
+  assertEquals(decision.allowFallback, false);
+});
+
+Deno.test('路由策略：提供方工具续轮不被上一回合 Sider 记录带回', () => {
+  const router = new RouterEngine(baseConfig());
+  router.recordSessionBackend('provider-session', 'sider');
+  const providerRequest = {
+    ...request(),
+    model: 'claude-opus-5.5',
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
+    messages: [{
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'w1', content: '搜索结果' }],
+    }],
+  } as unknown as AnthropicRequest;
+
+  const decision = router.decide(providerRequest, 'provider-session');
+
+  assertEquals(decision.backend, 'deepseek');
+  assertEquals(decision.ruleId, 'rule_4_provider_tools');
+});

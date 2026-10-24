@@ -18,6 +18,7 @@ import { isValidWriteInput } from './textual-tool-use.js';
 import { getControllerStore } from './controller-storage.js';
 import type { ControllerStore } from './controller-memory-store.js';
 import { getSiderAccounts, type SiderAccount } from './sider-accounts.js';
+import { hasProviderDefinedTools } from './request-analyzer.js';
 import { persistSiderTelemetry } from './sider-telemetry.js';
 import { recordCachedReplay, recordUsage } from './usage-stats.js';
 import { applyStopSequences } from './stop-sequences.js';
@@ -85,8 +86,10 @@ export class ControllerError extends Error {
   }
 }
 export const controllerEnabled = () => controllerRoutingStatus().enabled;
+// 提供方工具（服务端工具）没有 input_schema，主控的文本契约无法描述，必须交给兼容后端。
 export const controllerHandlesRequest = (request: AnthropicRequest) =>
-  controllerEnabled() && (!request.stream || controllerRoutingStatus().streaming);
+  controllerEnabled() && (!request.stream || controllerRoutingStatus().streaming) &&
+  !hasProviderDefinedTools(request);
 export async function controllerHash(text: string): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))]
     .map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -1235,5 +1238,19 @@ async function runSiderControllerOnce(
       }
       throw new ControllerError('主控内部保存或参数纠正超过单请求轮数，检查点保留');
     },
-  );
+  ).catch((error) => {
+    // 部署平台限制非流式首字节等待：主控在部署环境的非流式总期限约 70 秒。
+    // 超时不是上游故障，重试同一非流式请求仍会超时，因此用 400 明确要求改用流式，
+    // 避免客户端按 5xx 反复重试。检查点进度类 429 和真实上游错误原样保留。
+    if (
+      deployedJson && deadline.aborted && !signal?.aborted &&
+      !(error instanceof ControllerError) && !(error instanceof SiderUpstreamError)
+    ) {
+      throw new ControllerError(
+        '非流式请求超过部署环境时限（约 70 秒）；请改用 stream=true 重试，或拆分任务',
+        400,
+      );
+    }
+    throw error;
+  });
 }

@@ -8,7 +8,11 @@
  */
 
 import { Hono } from 'hono';
-import { getUsageSnapshot, resetUsageStats } from '../src/utils/usage-stats.ts';
+import {
+  classifyDeepSeekReason,
+  getUsageSnapshot,
+  resetUsageStats,
+} from '../src/utils/usage-stats.ts';
 
 function assertEquals<T>(actual: T, expected: T, what = '值') {
   if (actual !== expected) {
@@ -349,4 +353,11 @@ Deno.test({
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+Deno.test('DeepSeek 归因：提供方工具规则计入 tools', () => {
+  assertEquals(
+    classifyDeepSeekReason('deepseek', 'deepseek', 'rule_4_provider_tools'),
+    'tools',
+  );
 });

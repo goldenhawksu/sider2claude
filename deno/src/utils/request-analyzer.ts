@@ -22,11 +22,48 @@ export function isStandaloneVisionRequest(request: AnthropicRequest): boolean {
   );
 }
 
+/**
+ * Anthropic 定义的提供方工具（服务端工具：web_search_20250305、web_fetch_*、
+ * code_execution_* 等）没有 `input_schema`。主控的文本契约无法描述它们，Sider 也
+ * 无法执行；这类请求必须由兼容后端原生处理。
+ */
+export function hasProviderDefinedTools(request: AnthropicRequest): boolean {
+  return (request.tools ?? []).some((tool) => isProviderDefinedTool(tool));
+}
+
+/** Anthropic 提供方工具的显式类型（带日期版本后缀）。 */
+const PROVIDER_DEFINED_TOOL_TYPE =
+  /^(?:web_search|web_fetch|code_execution|bash_code_execution|text_editor_code_execution)_\d{8}$/;
+
+/**
+ * 判定一个工具声明是否由 Anthropic 提供方定义。
+ *
+ * 显式 `type` 优先：`web_search_20250305` 的名字与 Sider 原生工具 `web_search`
+ * 重名，只按名字判断会把它误当成 Sider 工具。其余情况下，既不是 Claude Code
+ * 工具、也不是 Sider 原生工具、又没有 `input_schema` 的未知工具同样无法进主控。
+ */
+function isProviderDefinedTool(tool: unknown): boolean {
+  if (!tool || typeof tool !== 'object') return false;
+  const type = (tool as { type?: unknown }).type;
+  if (typeof type === 'string' && PROVIDER_DEFINED_TOOL_TYPE.test(type)) return true;
+  const name = (tool as { name?: unknown }).name;
+  if (typeof name !== 'string') return false;
+  if (CLAUDE_CODE_TOOLS.has(name) || SIDER_NATIVE_TOOLS.has(name)) return false;
+  return !toolHasInputSchema(tool);
+}
+
+function toolHasInputSchema(tool: unknown): boolean {
+  return !!tool && typeof tool === 'object' && 'input_schema' in tool &&
+    !!(tool as { input_schema?: unknown }).input_schema;
+}
+
 export interface RequestAnalysis {
   type: RequestType;
   hasClaudeCodeTools: boolean;
   hasMcpTools: boolean;
   hasSiderTools: boolean;
+  /** 是否包含 Anthropic 定义的提供方工具（没有 input_schema，只能由兼容后端执行）。 */
+  hasProviderDefinedTools: boolean;
   hasLongFormGenerationIntent: boolean;
   longFormSignals: string[];
   inputCharCount: number;
@@ -34,6 +71,7 @@ export interface RequestAnalysis {
   claudeCodeToolNames: string[]; // Claude Code 工具名称
   mcpToolNames: string[]; // MCP 工具名称
   siderToolNames: string[]; // Sider 工具名称
+  providerToolNames: string[]; // Anthropic 定义的提供方工具名称
   toolCount: number;
   messageCount: number;
   isMultiTurn: boolean;
@@ -102,6 +140,7 @@ export class RequestAnalyzer {
       hasClaudeCodeTools: false,
       hasMcpTools: false,
       hasSiderTools: false,
+      hasProviderDefinedTools: false,
       hasLongFormGenerationIntent: longFormSignals.length > 0,
       longFormSignals,
       inputCharCount: inputText.length,
@@ -109,6 +148,7 @@ export class RequestAnalyzer {
       claudeCodeToolNames: [],
       mcpToolNames: [],
       siderToolNames: [],
+      providerToolNames: [],
       toolCount: request.tools?.length || 0,
       messageCount: request.messages.length,
       isMultiTurn: request.messages.length > 1,
@@ -121,7 +161,11 @@ export class RequestAnalyzer {
       for (const tool of request.tools) {
         analysis.toolNames.push(tool.name);
 
-        if (CLAUDE_CODE_TOOLS.has(tool.name)) {
+        if (isProviderDefinedTool(tool)) {
+          // 提供方工具（服务端工具）没有 input_schema，不能当 MCP/Sider 工具处理。
+          analysis.hasProviderDefinedTools = true;
+          analysis.providerToolNames.push(tool.name);
+        } else if (CLAUDE_CODE_TOOLS.has(tool.name)) {
           analysis.hasClaudeCodeTools = true;
           analysis.claudeCodeToolNames.push(tool.name);
         } else if (SIDER_NATIVE_TOOLS.has(tool.name)) {

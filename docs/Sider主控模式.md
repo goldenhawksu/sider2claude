@@ -75,6 +75,10 @@ Claude Code 客户端模板：`config/claude-code.sider-controller.json.example`
 
 流式行为：无工具且未设置 `stop_sequences` 的请求，控制器把 Sider 的文本增量实时转发给客户端，不再等整段生成后才下发；带工具时仍整段缓冲后做文本调用还原与校验，带 `stop_sequences` 时也缓冲，以便在服务端按截断点处理。上游中途失败时，已打开的文本块会先正常收尾，再发送 `error` 事件；`message_delta` 透传 `stop_sequence`。
 
+**Anthropic 提供方工具（服务端工具）不经过主控**：`web_search_20250305`、`web_fetch_*`、`code_execution_*` 等声明没有 `input_schema`，主控的文本契约无法描述，Sider 也无法执行。路由规则 `rule_4_provider_tools` 会把它们交给兼容后端原生处理，并禁止 fallback 回 Sider；`controllerHandlesRequest` 同样排除这类请求。判定以显式 `type` 优先，避免与 Sider 原生工具 `web_search` 重名时误判。
+
+部署环境对非流式响应有首字节时限，主控非流式请求的总期限约 70 秒（流式不受此限，默认 600 秒）。期限内未完成时返回 400 `invalid_request_error`，明确提示改用 `stream=true`：同一非流式请求重试仍会超时，返回 5xx 只会诱发无效重试。上下文登记进度类 429 和真实上游错误保持原有语义。长 Write、长上下文登记等耗时任务应使用流式。
+
 Deno 的受鉴权管理接口 `POST /stats/strategy` 接受 `{ "strategy": "pro", "controllerStreaming": true }`。该布尔覆盖值等待 KV 写入成功后返回，并优先于环境变量；其他实例最多经过 3 秒缓存刷新后读取新值，冷实例会等待配置解析再决定路由。传 `false` 可回退。缺少可用统计 KV 时返回 503，不把仅当前实例生效误报为保存成功。鉴权沿用服务端 AUTH_TOKEN，凭证不应写入命令历史或文档。
 
 `GET /v1/messages/backends/status` 的 `routing.siderControllerStreaming`，以及 `/stats.json` 的 `controller` 展示当前有效值。主控接管优先于 Pro/Max，切换普通策略不会覆盖已进入主控的请求。

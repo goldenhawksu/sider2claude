@@ -2185,3 +2185,25 @@ Deno.test('主控流式：带stop_sequences时保持整段缓冲并正确截断'
     },
   );
 });
+
+Deno.test('主控部署期限：非流式上游超时返回400并要求改用流式', async () => {
+  resetSiderActivity();
+  await appWithMock(
+    (_body, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) throw new Error('缺少超时信号');
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    async (app) => {
+      const response = await send(app, {
+        model: 'claude-opus-5.5',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `超时-${crypto.randomUUID()}` }],
+      });
+      equal(response.status, 400);
+      equal((await response.json()).error.message.includes('stream=true'), true);
+    },
+    { DENO_DEPLOYMENT_ID: 'timeout-test', SIDER_TOTAL_TIMEOUT_MS: '50' },
+  );
+});

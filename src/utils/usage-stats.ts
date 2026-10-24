@@ -60,6 +60,7 @@ const TOOL_CAPABILITY_RULES = new Set([
   'rule_1_tool_result_continuity',
   'rule_2_claude_tools',
   'rule_3_mcp_tools',
+  'rule_4_provider_tools',
 ]);
 
 /**

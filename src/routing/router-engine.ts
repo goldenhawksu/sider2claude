@@ -148,6 +148,20 @@ export class RouterEngine {
     model: string,
     conversationId?: string,
   ): RoutingDecision {
+    // Anthropic 定义的提供方工具（web_search_20250305、web_fetch_*、code_execution_*）
+    // 没有 input_schema：主控的文本契约描述不了，Sider 也执行不了，只能由兼容后端原生执行。
+    // 必须排在 tool_result 连续性之前，否则续轮会被上一回合的 Sider 记录带回。
+    // 与视觉同理，allowFallback: false——fallback 回 Sider 等于把工具静默丢掉。
+    if (analysis.hasProviderDefinedTools && this.config.deepseek.enabled) {
+      return {
+        backend: 'deepseek',
+        reason: 'Request contains provider-defined tools that only the compatible backend can execute',
+        confidence: 0.95,
+        allowFallback: false,
+        ruleId: 'rule_4_provider_tools',
+      };
+    }
+
     const siderReady = this.siderUsable(analysis, model);
 
     if (analysis.type === 'tool_result_feedback' && conversationId) {
