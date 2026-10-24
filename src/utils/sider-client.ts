@@ -104,7 +104,12 @@ export class SiderClient {
   /**
    * 调用 Sider API 并解析 SSE 响应
    */
-  async chat(request: SiderRequest, authToken: string, signal?: AbortSignal): Promise<SiderParsedResponse> {
+  async chat(
+    request: SiderRequest,
+    authToken: string,
+    signal?: AbortSignal,
+    onText?: (text: string) => void,
+  ): Promise<SiderParsedResponse> {
     consola.info('Calling Sider API:', {
       model: request.model,
       contentLength: request.multi_content[0]?.text?.length || 0,
@@ -158,7 +163,7 @@ export class SiderClient {
       }
 
       // 解析 SSE 流
-      const result = await this.parseSSEResponse(response);
+      const result = await this.parseSSEResponse(response, onText);
       recordSiderActivity(request.model, { succeeded: 1 });
       return result;
 
@@ -174,7 +179,10 @@ export class SiderClient {
   /**
    * 解析 SSE 响应流
    */
-  private async parseSSEResponse(response: Response): Promise<SiderParsedResponse> {
+  private async parseSSEResponse(
+    response: Response,
+    onText?: (text: string) => void,
+  ): Promise<SiderParsedResponse> {
     const reader = response.body?.getReader();
     if (!reader) {
       throw new Error('No response body');
@@ -204,13 +212,13 @@ export class SiderClient {
         buffer = lines.pop() || ''; // 保留最后一个不完整的行
 
         for (const line of lines) {
-          await this.processSSELine(line.trim(), result, upstream);
+          await this.processSSELine(line.trim(), result, upstream, onText);
         }
       }
 
       // 处理剩余的缓冲区
       if (buffer.trim()) {
-        await this.processSSELine(buffer.trim(), result, upstream);
+        await this.processSSELine(buffer.trim(), result, upstream, onText);
       }
 
     } finally {
@@ -280,6 +288,7 @@ export class SiderClient {
     line: string,
     result: SiderParsedResponse,
     upstream: { error?: SiderUpstreamError },
+    onText?: (text: string) => void,
   ): Promise<void> {
     // 跳过空行和注释
     if (!line || line.startsWith(':')) {
@@ -386,6 +395,7 @@ export class SiderClient {
             if (data.data.text) {
               // consola.debug('Adding text part:', data.data.text);
               result.textParts.push(data.data.text);
+              onText?.(data.data.text);
             } else {
               consola.debug('Received text event but no text content');
             }

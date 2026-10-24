@@ -2081,3 +2081,107 @@ Deno.test('账号池：按token哈希写下的旧绑定自动迁移到账号身�
     equal(migrated?.account === legacyId, false);
   }, { SIDER_AUTH_TOKEN_1: 'controller-sider-token-2' });
 });
+
+Deno.test('主控流式：无工具请求实时下发文本增量', async () => {
+  resetSiderActivity();
+  const sseBody = (chunks: string[]) =>
+    [
+      {
+        code: 0,
+        msg: 'ok',
+        data: {
+          type: 'message_start',
+          model: 'claude-opus-5.5',
+          message_start: {
+            cid: `stream-answer-${crypto.randomUUID()}`,
+            user_message_id: 'u',
+            assistant_message_id: crypto.randomUUID(),
+          },
+        },
+      },
+      ...chunks.map((text) => ({
+        code: 0,
+        msg: 'ok',
+        data: { type: 'text', model: 'claude-opus-5.5', text },
+      })),
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
+
+  await appWithMock(
+    () =>
+      new Response(sseBody(['第一段', '第二段']), {
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    async (app) => {
+      const response = await send(app, {
+        model: 'claude-opus-5.5',
+        stream: true,
+        max_tokens: 50,
+        messages: [{ role: 'user', content: `流式回答-${crypto.randomUUID()}` }],
+      });
+      equal(response.status, 200);
+      const events = (await response.text())
+        .split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)));
+      const deltas = events.filter((event) =>
+        event.type === 'content_block_delta' && event.delta?.type === 'text_delta'
+      );
+      equal(deltas.length, 2);
+      equal(deltas.map((event) => event.delta.text).join(''), '第一段第二段');
+      equal(events.filter((event) => event.type === 'content_block_start').length, 1);
+      equal(events.filter((event) => event.type === 'content_block_stop').length, 1);
+      equal(events.find((event) => event.type === 'message_delta').delta.stop_reason, 'end_turn');
+    },
+  );
+});
+
+Deno.test('主控流式：带stop_sequences时保持整段缓冲并正确截断', async () => {
+  resetSiderActivity();
+  await appWithMock(
+    () =>
+      new Response(
+        [
+          {
+            code: 0,
+            msg: 'ok',
+            data: {
+              type: 'message_start',
+              model: 'claude-opus-5.5',
+              message_start: {
+                cid: `stream-stop-${crypto.randomUUID()}`,
+                user_message_id: 'u',
+                assistant_message_id: crypto.randomUUID(),
+              },
+            },
+          },
+          {
+            code: 0,
+            msg: 'ok',
+            data: { type: 'text', model: 'claude-opus-5.5', text: '一二三停止后面的内容' },
+          },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } },
+      ),
+    async (app) => {
+      const response = await send(app, {
+        model: 'claude-opus-5.5',
+        stream: true,
+        max_tokens: 50,
+        stop_sequences: ['停止'],
+        messages: [{ role: 'user', content: `停止序列-${crypto.randomUUID()}` }],
+      });
+      const events = (await response.text())
+        .split('\n')
+        .filter((line) => line.startsWith('data: '))
+        .map((line) => JSON.parse(line.slice(6)));
+      const deltas = events.filter((event) =>
+        event.type === 'content_block_delta' && event.delta?.type === 'text_delta'
+      );
+      equal(deltas.length, 1);
+      equal(deltas[0].delta.text, '一二三');
+      const final = events.find((event) => event.type === 'message_delta');
+      equal(final.delta.stop_reason, 'stop_sequence');
+      equal(final.delta.stop_sequence, '停止');
+    },
+  );
+});

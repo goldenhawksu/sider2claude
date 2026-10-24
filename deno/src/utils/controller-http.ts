@@ -1,6 +1,10 @@
 import { recordSiderActivity } from './sider-activity.ts';
 import type { AnthropicRequest } from '../types/anthropic.ts';
-import { ControllerError, runSiderController } from './sider-controller.ts';
+import {
+  ControllerError,
+  type ControllerTextSink,
+  runSiderController,
+} from './sider-controller.ts';
 import { SiderUpstreamError } from './sse-line-reader.ts';
 import { logInfo, logWarn, type RequestLogContext } from './request-observability.ts';
 
@@ -99,10 +103,54 @@ export async function controllerResponse(
         },
       });
       ping = setInterval(() => send({ type: 'ping' }), 5_000);
+      // 无工具回答边收边发；工具轮的文本必须整段缓冲后还原，不使用这个出口。
+      let textStarted = false;
+      let textClosed = false;
+      let streamed = '';
+      const sink: ControllerTextSink = {
+        onTextDelta(text: string) {
+          if (!text || closed) return;
+          if (!textStarted) {
+            textStarted = true;
+            send({
+              type: 'content_block_start',
+              index: 0,
+              content_block: { type: 'text', text: '' },
+            });
+          }
+          streamed += text;
+          send({
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'text_delta', text },
+          });
+        },
+      };
       void (async () => {
         try {
-          const response = await runSiderController(request, token, combined, session);
+          const response = await runSiderController(request, token, combined, session, sink);
           for (const [index, block] of response.content.entries()) {
+            if (block.type === 'text' && textStarted) {
+              // 文本已经实时下发过；最终文本更长时只补发尾部，避免重复。
+              if (block.text.length > streamed.length && block.text.startsWith(streamed)) {
+                send({
+                  type: 'content_block_delta',
+                  index: 0,
+                  delta: { type: 'text_delta', text: block.text.slice(streamed.length) },
+                });
+              } else if (block.text !== streamed) {
+                logWarn('controller_stream_text_mismatch', {
+                  requestId: context.requestId,
+                  streamedChars: streamed.length,
+                  finalChars: block.text.length,
+                });
+              }
+              if (!textClosed) {
+                textClosed = true;
+                send({ type: 'content_block_stop', index: 0 });
+              }
+              continue;
+            }
             if (block.type === 'tool_use') {
               send({ type: 'content_block_start', index, content_block: { ...block, input: {} } });
               const input = JSON.stringify(block.input);
@@ -132,7 +180,10 @@ export async function controllerResponse(
           }
           send({
             type: 'message_delta',
-            delta: { stop_reason: response.stop_reason },
+            delta: {
+              stop_reason: response.stop_reason,
+              ...(response.stop_sequence ? { stop_sequence: response.stop_sequence } : {}),
+            },
             usage: response.usage,
           });
           send({ type: 'message_stop' });
@@ -149,6 +200,10 @@ export async function controllerResponse(
               ? { checkpointResponses: 1 }
               : { requestFailures: 1 },
           );
+          if (textStarted && !textClosed) {
+            textClosed = true;
+            send({ type: 'content_block_stop', index: 0 });
+          }
           if (!combined.aborted) {
             send(errorBody(error).body);
             logWarn('controller_failed', {

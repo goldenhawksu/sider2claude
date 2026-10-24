@@ -99,11 +99,13 @@ export class SiderClient {
 
   /**
    * 调用 Sider API 并把 SSE 响应累积为完整结果（非流式路径）。
+   * `onText` 可选：在累积的同时把文本增量实时交给调用方，用于主控无工具真流式。
    */
   async chat(
     request: SiderRequest,
     authToken: string,
     signal?: AbortSignal,
+    onText?: (text: string) => void,
   ): Promise<SiderParsedResponse> {
     console.log('Calling Sider API:', {
       model: request.model,
@@ -118,7 +120,18 @@ export class SiderClient {
     try {
       const response = await this.doFetch(request, authToken, signal);
       const { callbacks, result, upstream } = createAccumulatorCallbacks();
-      await streamSiderSSE(response, callbacks);
+      await streamSiderSSE(
+        response,
+        onText
+          ? {
+            ...callbacks,
+            onText(data) {
+              callbacks.onText?.(data);
+              if (data.text) onText(data.text);
+            },
+          }
+          : callbacks,
+      );
 
       // Sider 用 SSE 内的 code 表达业务失败。只在同时没拿到任何文本时才判定为失败，
       // 避免把「已正常作答 + 附带一条非致命提示」误判成错误。

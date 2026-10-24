@@ -596,3 +596,47 @@ test('Bun 账号池：两个账号跑满同模型两路并发，会话续轮固�
     });
   }
 });
+
+test('Bun 主控流式：chat 实时转发文本增量且仍返回完整结果', async () => {
+  const original = globalThis.fetch;
+  try {
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(
+          [
+            {
+              code: 0,
+              msg: 'ok',
+              data: {
+                type: 'message_start',
+                model: 'claude-sonnet-5.5',
+                message_start: {
+                  cid: 'stream-client-cid',
+                  user_message_id: 'u',
+                  assistant_message_id: 'a',
+                },
+              },
+            },
+            { code: 0, msg: 'ok', data: { type: 'text', model: 'claude-sonnet-5.5', text: '甲' } },
+            { code: 0, msg: 'ok', data: { type: 'text', model: 'claude-sonnet-5.5', text: '乙' } },
+          ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+          { headers: { 'content-type': 'text/event-stream' } },
+        ),
+      )) as typeof fetch;
+    const seen: string[] = [];
+    const result = await new SiderClient().chat(
+      convertAnthropicToSiderSync({
+        model: 'claude-sonnet-5.5',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: '流式客户端测试' }],
+      }),
+      'test',
+      undefined,
+      (text) => seen.push(text),
+    );
+    expect(seen).toEqual(['甲', '乙']);
+    expect(result.textParts.join('')).toBe('甲乙');
+  } finally {
+    globalThis.fetch = original;
+  }
+});

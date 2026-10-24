@@ -464,6 +464,14 @@ type ControllerAttempt =
   | { response: AnthropicResponse }
   | { reroute: string; ranOn: string };
 
+/**
+ * 无工具回答的实时文本出口。工具轮必须整段缓冲后再还原/校验，不能边流边解析，
+ * 因此只有 `tools.length === 0` 且没有 stop_sequences 的请求会用到它。
+ */
+export interface ControllerTextSink {
+  onTextDelta(text: string): void;
+}
+
 let accountCursor = 0;
 /** 轮转起点让新会话分散到不同账号；真正用哪个账号由空闲租约抢占决定。 */
 function orderedAccounts(accounts: SiderAccount[]): SiderAccount[] {
@@ -477,6 +485,7 @@ export async function runSiderController(
   token: string,
   signal?: AbortSignal,
   session?: string,
+  sink?: ControllerTextSink,
 ): Promise<AnthropicResponse> {
   const accounts = await getSiderAccounts();
   if (!accounts.length) throw new ControllerError('未配置Sider主控凭证', 503);
@@ -490,6 +499,7 @@ export async function runSiderController(
       candidates,
       signal,
       session,
+      sink,
     );
     if ('response' in attempt) return attempt.response;
     tried.add(attempt.ranOn);
@@ -521,6 +531,7 @@ async function runSiderControllerOnce(
   candidates: SiderAccount[],
   signal?: AbortSignal,
   session?: string,
+  sink?: ControllerTextSink,
 ): Promise<ControllerAttempt> {
   const model = getModelById(request.model);
   if (!model) {
@@ -612,6 +623,9 @@ async function runSiderControllerOnce(
       const tools = clientTools.some((t) => t.name === 'Write')
         ? [...clientTools, ...INTERNAL_TOOLS]
         : clientTools;
+      // 无工具回答不存在文本工具还原与纠错，可以边收边发；带 stop_sequences 时
+      // 截断点可能跨分片，仍走整段缓冲，避免客户端收到截断点之后的文本。
+      const streamAnswer = !!sink && tools.length === 0 && !(request.stop_sequences?.length);
       let writeIntegrityResult: string | undefined;
       for (const message of pendingUserMessages(request)) {
         if (!Array.isArray(message.content)) continue;
@@ -739,7 +753,7 @@ async function runSiderControllerOnce(
           400,
         );
       }
-      const sendText = async (prompt: string) => {
+      const sendText = async (prompt: string, onText?: (text: string) => void) => {
         if (prompt.length > maxChars) {
           throw new ControllerError(
             `Sider实际新增输入${prompt.length}字符超过配置上限${maxChars}，检查点已保留`,
@@ -748,6 +762,13 @@ async function runSiderControllerOnce(
         }
         const callStarted = Date.now();
         let upstream;
+        let streamedAny = false;
+        const forward = onText
+          ? (text: string) => {
+            streamedAny = true;
+            onText(text);
+          }
+          : undefined;
         const pace = await store.read<SiderPaceState>(paceKey);
         const previousGap = pace?.gapMs ?? paceMinMs;
         let paceOutcome: SiderPaceOutcome = 'other';
@@ -768,11 +789,14 @@ async function runSiderControllerOnce(
             output_language: 'zh-CN',
           };
           try {
-            upstream = await siderClient.chat(body, account.token, combined);
+            upstream = await siderClient.chat(body, account.token, combined, forward);
           } catch (error) {
             // 仅重试明确的建立连接失败；SSE失败、读取超时和工具服务端副作用均不重试。
+            // 已经吐出文本后也不能重试，否则客户端会收到重复内容。
             const message = error instanceof Error ? error.message : '';
-            if (combined.aborted || !(/\(Connect\)|Unable to connect/.test(message))) throw error;
+            if (
+              combined.aborted || streamedAny || !(/\(Connect\)|Unable to connect/.test(message))
+            ) throw error;
             persistSiderTelemetry({
               ts: Date.now(),
               model: request.model,
@@ -787,7 +811,7 @@ async function runSiderControllerOnce(
               outcome: 'connect_retry',
             });
             await new Promise((resolve) => setTimeout(resolve, 1000));
-            upstream = await siderClient.chat(body, account.token, combined);
+            upstream = await siderClient.chat(body, account.token, combined, forward);
           }
           paceOutcome = 'ok';
         } catch (error) {
@@ -976,7 +1000,7 @@ async function runSiderControllerOnce(
           ? `${text}\n\n${contract}${choice}\n实际工具由客户端执行，不能在收到成功tool_result之前声称已执行。长正文先StoreContent，再用WriteFromRef；正文引用必须保持原样。`
           : `${text}\n本轮没有可调用的工具，直接回答，不得输出工具意图。`;
         const callStarted = Date.now();
-        const upstream = await sendText(prompt);
+        const upstream = await sendText(prompt, streamAnswer ? sink!.onTextDelta : undefined);
         const raw = upstream.textParts.join('');
         let calls: AnthropicToolUse[];
         try {
