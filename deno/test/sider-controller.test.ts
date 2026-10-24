@@ -8,11 +8,13 @@ import {
   controllerPayloadDiagnostics,
   controllerToolRefusalDetected,
   extractReadJson,
+  nextSiderPaceGap,
   readControllerText,
   saveControllerText,
   strictControllerCalls,
 } from '../src/utils/sider-controller.ts';
 import { fetchSiderResponse } from '../src/utils/sider-transport.ts';
+import { getSiderAccounts, siderAccountId } from '../src/utils/sider-accounts.ts';
 import { validDeclaredToolInput } from '../src/utils/tool-input-validation.ts';
 import type { AnthropicRequest } from '../src/types/anthropic.ts';
 import { getSiderActivitySnapshot, resetSiderActivity } from '../src/utils/sider-activity.ts';
@@ -73,8 +75,9 @@ function sse(
   );
 }
 async function appWithMock(
-  fn: (body: any) => Response | Promise<Response>,
+  fn: (body: any, init?: RequestInit) => Response | Promise<Response>,
   run: (app: Hono) => Promise<void>,
+  extraEnv: Record<string, string> = {},
 ) {
   const original = globalThis.fetch;
   const vars = {
@@ -85,6 +88,7 @@ async function appWithMock(
     SIDER_CONTROLLER_STREAMING: 'true',
     SIDER_CONTROLLER_STORAGE: 'memory',
     SIDER_CONTROLLER_PACE_MS: '0',
+    ...extraEnv,
   };
   const prev = new Map<string, string | undefined>();
   for (const [key, value] of Object.entries(vars)) {
@@ -94,7 +98,7 @@ async function appWithMock(
   try {
     globalThis.fetch = (async (url, init) => {
       if (!String(url).includes('sider.ai')) throw new Error('主控不应调用GLM或其他上游');
-      return await fn(JSON.parse(String(init?.body)));
+      return await fn(JSON.parse(String(init?.body)), init);
     }) as typeof fetch;
     const routes = await import(
       `../src/routes/messages-hybrid.ts?controller=${crypto.randomUUID()}`
@@ -177,7 +181,7 @@ Deno.test('P0主控：默认流式接管Read续轮，重放不再调用模型且
 Deno.test('P0主控：没有fallback的1135及冷却拒绝也进入失败统计', async () => {
   resetSiderActivity();
   const store = await getControllerStore();
-  const key = `cooldown:${await controllerHash('controller-sider-token')}:claude-opus-5.5`;
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:claude-opus-5.5`;
   try {
     await appWithMock(
       () =>
@@ -376,7 +380,7 @@ Deno.test('主控HTTP：无cid纯对话切换1M标签后通过历史恢复，真
 Deno.test('主控HTTP：1M标签和原名共享冷却，不通过改名重试上游', async () => {
   let count = 0;
   const store = await getControllerStore();
-  const key = `cooldown:${await controllerHash('controller-sider-token')}:claude-sonnet-5.5`;
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:claude-sonnet-5.5`;
   const decoratedKey = key + '[1m]';
   try {
     await appWithMock(() => {
@@ -1482,9 +1486,9 @@ Deno.test('主控部署期限：节奏等待可被请求期限取消，保存原
       throw new Error('等待期应在调用上游前被取消');
     }, async (app) => {
       const store = await getControllerStore();
-      const key = `pace:${await controllerHash('controller-sider-token')}`;
-      const previousPace = await store.read<number>(key);
-      await store.write(key, Date.now() + 10_000, 60_000);
+      const key = `pace:${await siderAccountId('controller-sider-token')}:claude-opus-5.5`;
+      const previousPace = await store.read<{ nextAt: number; gapMs: number }>(key);
+      await store.write(key, { nextAt: Date.now() + 10_000, gapMs: 12_000 }, 60_000);
       try {
         const started = Date.now();
         const response = await send(app, {
@@ -1866,4 +1870,214 @@ Deno.test('主控响应缓存：相同续轮正文按query cid隔离', async () 
     equal(secondReply.sider_session.conversation_id, second.sider_session.conversation_id);
     equal(calls, 4);
   });
+});
+
+Deno.test('主控节奏：空闲无固定等待，1101 翻倍上探，成功快速回落且受上下限约束', () => {
+  // 空闲起步：没有历史碰撞时不产生任何等待。
+  equal(nextSiderPaceGap(0, 'ok', 0, 12_000), 0);
+  // 同一模型并发碰撞后逐级拉长（实测两路并发必有一路 1101）。
+  equal(nextSiderPaceGap(0, 'concurrency', 0, 12_000), 1_000);
+  equal(nextSiderPaceGap(1_000, 'concurrency', 0, 12_000), 2_000);
+  // 上限封顶，避免把退避无限放大。
+  equal(nextSiderPaceGap(8_000, 'concurrency', 0, 12_000), 12_000);
+  // 成功后快速回落，几轮就回到 0，不把偶发碰撞变成长期限速。
+  equal(nextSiderPaceGap(12_000, 'ok', 0, 12_000), 5_750);
+  equal(nextSiderPaceGap(5_750, 'ok', 0, 12_000), 2_625);
+  equal(nextSiderPaceGap(281, 'ok', 0, 12_000), 0);
+  // 下限生效；非并发错误保持当前节奏。
+  equal(nextSiderPaceGap(500, 'ok', 500, 12_000), 500);
+  equal(nextSiderPaceGap(5_000, 'other', 0, 12_000), 5_000);
+  // 配置上限为 0 等价于关闭节奏，测试环境依赖这一点。
+  equal(nextSiderPaceGap(0, 'concurrency', 0, 0), 0);
+});
+
+Deno.test('主控租约：不同模型可并行，同一模型严格串行', async () => {
+  resetSiderActivity();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  await appWithMock(async (body) => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    inFlight--;
+    return sse('OK', `lease-${crypto.randomUUID()}`, crypto.randomUUID(), body.model);
+  }, async (app) => {
+    const request = (model: string) =>
+      send(app, {
+        model,
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `租约探针-${crypto.randomUUID()}` }],
+      });
+
+    // 实测不同模型可同时执行：租约必须按模型拆开。
+    const [a, b] = await Promise.all([
+      request('claude-opus-5.5'),
+      request('claude-haiku-5.5'),
+    ]);
+    equal([a.status, b.status], [200, 200]);
+    equal(maxInFlight, 2);
+
+    // 同一模型只有一路并发额度：第二个请求等待租约，不能同时打上游。
+    maxInFlight = 0;
+    const [c, d] = await Promise.all([
+      request('claude-sonnet-5.5'),
+      request('claude-sonnet-5.5'),
+    ]);
+    equal([c.status, d.status], [200, 200]);
+    equal(maxInFlight, 1);
+  });
+});
+
+Deno.test('账号池：读取主账号与编号账号，去重、忽略空值、最多8个', async () => {
+  const keys = [
+    'SIDER_AUTH_TOKEN',
+    ...Array.from({ length: 9 }, (_, i) => `SIDER_AUTH_TOKEN_${i + 1}`),
+  ];
+  const previous = new Map(keys.map((key) => [key, Deno.env.get(key)]));
+  for (const key of keys) Deno.env.delete(key);
+  try {
+    Deno.env.set('SIDER_AUTH_TOKEN', 'token-primary');
+    Deno.env.set('SIDER_AUTH_TOKEN_1', 'token-a');
+    Deno.env.set('SIDER_AUTH_TOKEN_2', 'token-a');
+    Deno.env.set('SIDER_AUTH_TOKEN_3', '');
+    const accounts = await getSiderAccounts();
+    equal(accounts.length, 2);
+    equal(accounts.map((account) => account.primary), [true, false]);
+    // id 只由账号身份决定：重复读取稳定，且与明文 token 无关。
+    equal(accounts[0].id, (await getSiderAccounts())[0].id);
+    equal(accounts[0].id === accounts[1].id, false);
+
+    // 同一 Sider 账号的两个 token（JWT user_id 相同）必须归并为一个账号：
+    // 实测它们并发仍返回 1101，不能当成两路额度。
+    const jwt = (userId: string) => {
+      const encode = (value: object) =>
+        btoa(JSON.stringify(value)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      return `${encode({ alg: 'none' })}.${encode({ user_id: userId })}.sig`;
+    };
+    Deno.env.set('SIDER_AUTH_TOKEN', jwt('user-1'));
+    Deno.env.set('SIDER_AUTH_TOKEN_1', jwt('user-1'));
+    Deno.env.set('SIDER_AUTH_TOKEN_2', jwt('user-2'));
+    equal((await getSiderAccounts()).length, 2);
+
+    for (let index = 1; index <= 9; index++) {
+      Deno.env.set(`SIDER_AUTH_TOKEN_${index}`, `token-${index}`);
+    }
+    equal((await getSiderAccounts()).length, 8);
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) Deno.env.delete(key);
+      else Deno.env.set(key, value);
+    }
+  }
+});
+
+Deno.test('账号池：同模型并发用满两个账号，同一会话续轮固定在原账号', async () => {
+  resetSiderActivity();
+  const used: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  await appWithMock(async (body, init) => {
+    used.push(String((init?.headers as Record<string, string>)?.Authorization));
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    inFlight--;
+    return sse('OK', `pool-${crypto.randomUUID()}`, crypto.randomUUID(), body.model);
+  }, async (app) => {
+    const request = (content: string, cid?: string) =>
+      app.request(`/v1/messages${cid ? `?cid=${cid}` : ''}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'claude-sonnet-5.5',
+          max_tokens: 20,
+          messages: [{ role: 'user', content }],
+        }),
+      });
+
+    // 两个账号让同模型的两路请求同时进入上游。
+    const [a, b] = await Promise.all([
+      request(`池-a-${crypto.randomUUID()}`),
+      request(`池-b-${crypto.randomUUID()}`),
+    ]);
+    equal([a.status, b.status], [200, 200]);
+    equal(maxInFlight, 2);
+    equal(new Set(used.slice(-2)).size, 2);
+
+    // 同一会话的下一轮必须沿用建立 cid 的账号。
+    const first = await request(`会话首轮-${crypto.randomUUID()}`);
+    const firstBody = await first.json();
+    const firstToken = used.at(-1);
+    const cid = firstBody.sider_session.conversation_id;
+    const second = await request(`会话续轮-${crypto.randomUUID()}`, cid);
+    equal(second.status, 200);
+    equal(used.at(-1), firstToken);
+  }, { SIDER_AUTH_TOKEN_1: 'controller-sider-token-2' });
+});
+
+Deno.test('账号池：任务绑定的账号被移除后明确报错，不改投其他账号', async () => {
+  resetSiderActivity();
+  const used: string[] = [];
+  await appWithMock(async (body, init) => {
+    used.push(String((init?.headers as Record<string, string>)?.Authorization));
+    return sse('OK', `pinned-${crypto.randomUUID()}`, crypto.randomUUID(), body.model);
+  }, async (app) => {
+    const first = await send(app, {
+      model: 'claude-opus-5.5',
+      max_tokens: 20,
+      messages: [{ role: 'user', content: `绑定-${crypto.randomUUID()}` }],
+    });
+    const body = await first.json();
+    const token = used.at(-1)!.replace(/^Bearer /, '');
+    for (const key of ['SIDER_AUTH_TOKEN', 'SIDER_AUTH_TOKEN_1']) {
+      if (Deno.env.get(key) === token) Deno.env.delete(key);
+    }
+    const second = await app.request(`/v1/messages?cid=${body.sider_session.conversation_id}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'claude-opus-5.5',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `续轮-${crypto.randomUUID()}` }],
+      }),
+    });
+    equal(second.status, 503);
+    equal((await second.json()).error.message.includes('Sider账号'), true);
+  }, { SIDER_AUTH_TOKEN_1: 'controller-sider-token-2' });
+});
+
+Deno.test('账号池：按token哈希写下的旧绑定自动迁移到账号身份键', async () => {
+  resetSiderActivity();
+  const used: string[] = [];
+  await appWithMock(async (body, init) => {
+    used.push(String((init?.headers as Record<string, string>)?.Authorization));
+    return sse('OK', `legacy-${crypto.randomUUID()}`, crypto.randomUUID(), body.model);
+  }, async (app) => {
+    const first = await send(app, {
+      model: 'claude-opus-5.5',
+      max_tokens: 20,
+      messages: [{ role: 'user', content: `旧绑定-${crypto.randomUUID()}` }],
+    });
+    const body = await first.json();
+    const taskId = body.sider_session.conversation_id;
+    const store = await getControllerStore();
+    const owner = await controllerHash('controller-test-token');
+    const key = `${owner}:task:${taskId}`;
+    const task = await store.read<Record<string, unknown>>(key);
+    const legacyId = await controllerHash(used.at(-1)!.replace(/^Bearer /, ''));
+    await store.write(key, { ...task, account: legacyId }, 60_000);
+
+    const second = await app.request(`/v1/messages?cid=${taskId}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'claude-opus-5.5',
+        max_tokens: 20,
+        messages: [{ role: 'user', content: `续轮-${crypto.randomUUID()}` }],
+      }),
+    });
+    equal(second.status, 200);
+    const migrated = await store.read<{ account?: string }>(key);
+    equal(migrated?.account === legacyId, false);
+  }, { SIDER_AUTH_TOKEN_1: 'controller-sider-token-2' });
 });

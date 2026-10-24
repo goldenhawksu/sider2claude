@@ -11,6 +11,7 @@ import { getEnv } from '../utils/env.js';
 
 import { Hono } from 'hono';
 import { controllerEnabled, controllerHandlesRequest } from '../utils/sider-controller.js';
+import { getSiderAccounts } from '../utils/sider-accounts.js';
 import { controllerResponse } from '../utils/controller-http.js';
 import { isSafetyClassifierRequest, isStandaloneVisionRequest } from '../utils/request-analyzer';
 import type { Context } from 'hono';
@@ -567,6 +568,7 @@ messagesRouter.get('/backends/status', async (c: Context) => {
     routing: {
       siderController: controllerEnabled(),
       siderControllerStreaming: controllerRoutingStatus().streaming,
+      siderAccounts: (await getSiderAccounts()).length,
       defaultBackend: config.routing.defaultBackend,
       autoFallback: config.routing.autoFallback,
       preferSiderForSimpleChat: config.routing.preferSiderForSimpleChat,

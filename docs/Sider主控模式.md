@@ -63,11 +63,15 @@ Claude Code 客户端模板：`config/claude-code.sider-controller.json.example`
 | SIDER_CONTROLLER_STORAGE | Deno 使用 `kv`，Bun 使用 `sqlite`；`memory` 仅用于隔离测试 |
 | SIDER_CONTROLLER_KV_PATH | Deno 本地可指定 `.runtime` 内数据库；Deploy 留空连接关联的 Deno KV |
 | SIDER_CONTROLLER_MAX_INPUT_CHARS | Deno 默认 `6000`、Bun 默认 `14000`，限制实际单次新增输入；更长内容完整分段登记 |
-| SIDER_CONTROLLER_PACE_MS | 默认 `12000`，上游流结束后的账号级间隔，来自本次成功探测节奏 |
+| SIDER_AUTH_TOKEN_1..8 | 追加 Sider 账号（含主账号最多 8 个）。实测同一账号同一模型只能有一路在途请求，多账号按模型成倍提升并发与额度 |
+| SIDER_CONTROLLER_PACE_MIN_MS | 默认 `0`，节奏的起始／下限间隔；空闲时不产生固定等待 |
+| SIDER_CONTROLLER_PACE_MS | 默认 `12000`，同一模型遇到 1101 时的退避上限；成功后快速回落（实测 250ms 间隔连续请求无 1101／1135） |
 | SIDER_REQUEST_TIMEOUT_MS | 默认 `300000`，Sider 上游真实字节的空闲期限 |
 | SIDER_TOTAL_TIMEOUT_MS | 默认 `600000`，独立总期限；客户端 ping 不刷新它 |
 
 两套运行时主控开启后默认接管 JSON 和 SSE。`SIDER_CONTROLLER_STREAMING=false` 可保留流式混合路由；已有部署中的旧 `false` 不会被默认值静默覆盖。
+
+账号池按 `SIDER_AUTH_TOKEN`、`SIDER_AUTH_TOKEN_1..8` 收集，最多 8 个，并按 Sider 账号身份（JWT 的 `user_id`）归并：同一账号的多个 token 只算一个账号，因为实测它们并发仍返回 1101；token 轮换不会改变任务绑定。并发额度实测按模型隔离：同一账号同一模型只能有一路在途请求，不同模型可并行，因此新增**不同账号**能直接成倍提升并发。租约键为 `account:<账号键>:<model>`；任务首次执行时写入 `account` 字段，此后续轮只能由同一账号完成（Sider 的 `cid` 属于该账号）。只有尚未建立 `cid` 的新任务可以交给任一空闲账号；账号被移除时明确返回 503，不会把已有会话改投其他账号。节奏与冷却同样按账号和模型分别维护。`GET /v1/messages/backends/status` 的 `routing.siderAccounts` 显示当前识别到的账号数。
 
 Deno 的受鉴权管理接口 `POST /stats/strategy` 接受 `{ "strategy": "pro", "controllerStreaming": true }`。该布尔覆盖值等待 KV 写入成功后返回，并优先于环境变量；其他实例最多经过 3 秒缓存刷新后读取新值，冷实例会等待配置解析再决定路由。传 `false` 可回退。缺少可用统计 KV 时返回 503，不把仅当前实例生效误报为保存成功。鉴权沿用服务端 AUTH_TOKEN，凭证不应写入命令历史或文档。
 

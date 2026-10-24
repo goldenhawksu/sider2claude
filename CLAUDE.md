@@ -27,6 +27,7 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 - 两套运行时主控开启后默认接管 JSON 和 SSE，`SIDER_CONTROLLER_STREAMING=false` 可退出流式接管。Deno 管理接口 `/stats/strategy` 可同时传布尔 `controllerStreaming`，覆盖值等待 KV 落库并优先于旧环境变量；路由与看板均解析有效值。新增输入上限默认 Deno 6000、Bun 14000 字符。
 - 分类旁路识别 system 中明确的分类用途与 `<block>`／`<severity>`，且请求不含工具。保留完整 system、实际判定和错误，不伪造允许；回归是套件15和 `safety-classifier.test.ts`。
 - 入口是两套 `utils/sider-controller.ts` 和 `controller-http.ts`；Deno KV、Bun SQLite 保存任务、父消息、工具关联、正文引用和账号租约。参数不能靠宽松 JSON 修补；完整工具结果必须续轮回到同一 Sider 会话。
+- 并发额度实测按模型隔离（2026-10-24 直连 probe：同模型两路并发必有一路 1101，sonnet+haiku 三轮全部并行；250ms 间隔连续 12 次无 1101/1135）。账号池由 `SIDER_AUTH_TOKEN` 与 `SIDER_AUTH_TOKEN_1..8` 提供，最多 8 个，并按 JWT `user_id` 归并——同一账号的多个 token 并发仍会 1101，只能算一个账号。租约键 `account:<账号键>:<model>`。任务写入 `account` 后必须由同一账号续轮，只有尚未建立 `cid` 的新任务可换账号；账号被移除时返回 503，不能改投；旧版按 token 哈希写下的绑定会自动迁移。
 - Opus 5.5 和 Sonnet 5.5 已实测工具契约、多轮失败恢复、长 Write 及 StoreContent→WriteFromRef。旧版 Opus 的历史额度数据不能作为硬排除 Opus 5.5 的依据。推理事件存在不等于 Anthropic thinking 预算参数已被兑现。
 - 真实 Claude Code 2.1.195 使用 JSON Schema 2020-12，校验器必须支持该方言。模型“已完成”自述不算验收；文件复制必须检查实际 Write 成功反馈、文件存在、JSON 项数和字节完整性。
 - 大上下文先完整登记规范，执行前再次提供可容纳的完整 schema，不能先登记工具后用长规范淹没它。超大工具表分段登记；参数纠正必须带相关工具的完整定义。

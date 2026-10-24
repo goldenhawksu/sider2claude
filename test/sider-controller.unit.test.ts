@@ -19,6 +19,7 @@ import { AnthropicApiAdapter } from '../src/adapters/anthropic-adapter';
 import type { AnthropicRequest } from '../src/types/anthropic';
 import { getSiderActivitySnapshot, resetSiderActivity } from '../src/utils/sider-activity';
 import { controllerHandlesRequest } from '../src/utils/sider-controller';
+import { getSiderAccounts, siderAccountId } from '../src/utils/sider-accounts';
 
 test('Bun P0：主控默认接管流式，实际调用的1135独立于fallback统计', async () => {
   const original = globalThis.fetch;
@@ -125,7 +126,7 @@ test('Bun：1M切换保持主控重放、历史恢复与冷却，真正换模型
   const model = 'claude-sonnet-5.5';
   let calls = 0;
   const store = await getControllerStore();
-  const cooldownKey = `cooldown:${await controllerHash('window-controller-test')}:${model}`;
+  const cooldownKey = `cooldown:${await siderAccountId('window-controller-test')}:${model}`;
   try {
     globalThis.fetch = ((_url, init) => {
       calls++;
@@ -504,3 +505,94 @@ test('Bun真实HTTP：上游静默超过10秒时SSE心跳保持连接',async()=>
     for(const [key,value]of [['SIDER_AUTH_TOKEN',previous.token],['SIDER_CONTROLLER_STORAGE',previous.storage],['SIDER_CONTROLLER_PACE_MS',previous.pace]]){if(value===undefined)delete process.env[key!];else process.env[key!]=value;}
   }
 },20_000);
+
+test('Bun 账号池：读取主账号与编号账号，去重、忽略空值、最多8个', async () => {
+  const keys = ['SIDER_AUTH_TOKEN', ...Array.from({ length: 9 }, (_, i) => `SIDER_AUTH_TOKEN_${i + 1}`)];
+  const previous = keys.map((key) => process.env[key]);
+  try {
+    for (const key of keys) delete process.env[key];
+    process.env.SIDER_AUTH_TOKEN = 'token-primary';
+    process.env.SIDER_AUTH_TOKEN_1 = 'token-a';
+    process.env.SIDER_AUTH_TOKEN_2 = 'token-a';
+    process.env.SIDER_AUTH_TOKEN_3 = '';
+    const accounts = await getSiderAccounts();
+    expect(accounts.length).toBe(2);
+    expect(accounts.map((account) => account.primary)).toEqual([true, false]);
+    expect(accounts[0].id).toBe((await getSiderAccounts())[0].id);
+    expect(accounts[0].id === accounts[1].id).toBe(false);
+    // 同一 Sider 账号的两个 token（JWT user_id 相同）必须归并为一个账号。
+    const jwt = (userId: string) => {
+      const encode = (value: object) =>
+        btoa(JSON.stringify(value)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      return `${encode({ alg: 'none' })}.${encode({ user_id: userId })}.sig`;
+    };
+    process.env.SIDER_AUTH_TOKEN = jwt('user-1');
+    process.env.SIDER_AUTH_TOKEN_1 = jwt('user-1');
+    process.env.SIDER_AUTH_TOKEN_2 = jwt('user-2');
+    expect((await getSiderAccounts()).length).toBe(2);
+    for (let index = 1; index <= 9; index++) process.env[`SIDER_AUTH_TOKEN_${index}`] = `token-${index}`;
+    expect((await getSiderAccounts()).length).toBe(8);
+  } finally {
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
+
+test('Bun 账号池：两个账号跑满同模型两路并发，会话续轮固定原账号', async () => {
+  const original = globalThis.fetch;
+  const keys = ['SIDER_AUTH_TOKEN', 'SIDER_AUTH_TOKEN_1', 'SIDER_CONTROLLER_STORAGE', 'SIDER_CONTROLLER_PACE_MS'];
+  const previous = keys.map((key) => process.env[key]);
+  process.env.SIDER_AUTH_TOKEN = 'pool-account-a';
+  process.env.SIDER_AUTH_TOKEN_1 = 'pool-account-b';
+  process.env.SIDER_CONTROLLER_STORAGE = 'memory';
+  process.env.SIDER_CONTROLLER_PACE_MS = '0';
+  const used: string[] = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  try {
+    globalThis.fetch = (async (_url, init) => {
+      used.push(String((init?.headers as Record<string, string>)?.Authorization));
+      const body = JSON.parse(String(init?.body));
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      inFlight--;
+      const cid = `pool-cid-${crypto.randomUUID()}`;
+      return new Response([
+        { code: 0, msg: 'ok', data: { type: 'message_start', model: body.model,
+          message_start: { cid, user_message_id: 'u', assistant_message_id: crypto.randomUUID() } } },
+        { code: 0, msg: 'ok', data: { type: 'text', model: body.model, text: 'OK' } },
+      ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+        { headers: { 'content-type': 'text/event-stream' } });
+    }) as typeof fetch;
+    const owner = 'pool-owner-' + crypto.randomUUID();
+    const request = () => ({ model: 'claude-sonnet-5.5', max_tokens: 20,
+      messages: [{ role: 'user' as const, content: crypto.randomUUID() }] });
+
+    // 两个账号：同模型的两路请求必须同时进入上游。
+    const [a, b] = await Promise.all([
+      runSiderController(request(), owner),
+      runSiderController(request(), owner),
+    ]);
+    expect(a.sider_session?.conversation_id).toBeTruthy();
+    expect(b.sider_session?.conversation_id).toBeTruthy();
+    expect(maxInFlight).toBe(2);
+    expect(new Set(used.slice(-2)).size).toBe(2);
+
+    // 续轮必须沿用建立会话时的账号。
+    used.length = 0;
+    const first = await runSiderController(request(), owner);
+    const firstToken = used[0];
+    used.length = 0;
+    await runSiderController(request(), owner, undefined, first.sider_session!.conversation_id);
+    expect(used[0]).toBe(firstToken);
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});

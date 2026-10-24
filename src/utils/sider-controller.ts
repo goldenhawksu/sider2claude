@@ -17,6 +17,7 @@ import { declaredToolInputError, validDeclaredToolInput } from './tool-input-val
 import { isValidWriteInput } from './textual-tool-use.js';
 import { getControllerStore } from './controller-storage.js';
 import type { ControllerStore } from './controller-memory-store.js';
+import { getSiderAccounts, type SiderAccount } from './sider-accounts.js';
 import { persistSiderTelemetry } from './sider-telemetry.js';
 import { recordCachedReplay, recordUsage } from './usage-stats.js';
 import { applyStopSequences } from './stop-sequences.js';
@@ -65,6 +66,8 @@ interface Task {
   model: string;
   cid: string;
   parent: string;
+  /** 绑定的 Sider 账号 id；cid 属于该账号，后续续轮不能漂移。 */
+  account?: string;
   refs: string[];
   pending: PendingTool[];
   uploads?: Record<string, number>;
@@ -378,31 +381,94 @@ function containsImage(content: AnthropicRequest['messages'][number]['content'])
         containsImage(block.content as typeof content))
     );
 }
+/**
+ * 主控节奏（pace）状态。实测（2026-10-24 直接打 Sider）：
+ * - 同一模型两路并发必定一路 1101，不同模型（sonnet + haiku）三轮回合全部并行成功；
+ * - 连续 12 次、间隔 250ms 的请求没有触发 1101/1135。
+ * 因此节奏只需在真实碰撞后收敛，空闲时不应有固定等待。
+ */
+export type SiderPaceState = { nextAt: number; gapMs: number };
+export type SiderPaceOutcome = 'ok' | 'concurrency' | 'other';
+
+/** 成功时快速回落，1101 时翻倍上探；上限由配置封顶。 */
+export function nextSiderPaceGap(
+  gapMs: number,
+  outcome: SiderPaceOutcome,
+  minMs: number,
+  maxMs: number,
+): number {
+  const min = Math.max(0, minMs);
+  const max = Math.max(min, maxMs);
+  const current = Number.isFinite(gapMs) ? Math.max(min, gapMs) : min;
+  if (outcome === 'concurrency') {
+    return Math.min(max, Math.max(current, 500) * 2);
+  }
+  if (outcome === 'ok') {
+    return Math.max(min, Math.floor(current * 0.5) - 250);
+  }
+  return Math.min(max, current);
+}
+
 let queued = 0;
+/**
+ * 在给定账号中占用一个空闲的（账号 × 模型）额度。
+ *
+ * 实测并发额度按模型隔离：同一账号同一模型只能有一路在途请求，不同模型可以并行。
+ * 因此先把候选账号逐个试占，全部被占才在首个候选上按原节奏等待；多账号因此能提供
+ * 成倍的并发。fn 收到的账号就是本次实际占用的账号，任务必须绑定它。
+ */
 export async function withControllerLease<T>(
   store: ControllerStore,
-  key: string,
+  accounts: SiderAccount[],
+  siderModel: string,
   signal: AbortSignal,
   totalMs: number,
-  fn: () => Promise<T>,
+  fn: (account: SiderAccount) => Promise<T>,
 ): Promise<T> {
   if (queued >= 32) throw new ControllerError('Sider主控等待队列已满', 429, 1000);
+  if (!accounts.length) throw new ControllerError('未配置Sider主控凭证', 503);
   queued++;
-  const holder = crypto.randomUUID(), until = Date.now() + 30_000;
-  let claimed = false;
+  const holder = crypto.randomUUID();
+  const keyOf = (account: SiderAccount) => `account:${account.id}:${siderModel}`;
+  let claimed: SiderAccount | null = null;
+  const until = Date.now() + 30_000;
   try {
-    while (!(claimed = await store.claim(key, holder, totalMs + 5000))) {
+    for (const account of accounts) {
+      if (await store.claim(keyOf(account), holder, totalMs + 5000)) {
+        claimed = account;
+        break;
+      }
+    }
+    while (!claimed) {
       if (signal.aborted) throw signal.reason;
       if (Date.now() >= until) {
         throw new ControllerError('Sider账号正在处理其他任务，请稍后继续', 429, 1000);
       }
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      for (const account of accounts) {
+        if (await store.claim(keyOf(account), holder, totalMs + 5000)) {
+          claimed = account;
+          break;
+        }
+      }
+      if (!claimed) await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    return await fn();
+    return await fn(claimed);
   } finally {
     queued--;
-    if (claimed) await store.release(key, holder);
+    if (claimed) await store.release(keyOf(claimed), holder);
   }
+}
+
+/** 一次尝试的结果：正常响应，或任务绑定在另一个账号上需要重试。 */
+type ControllerAttempt =
+  | { response: AnthropicResponse }
+  | { reroute: string; ranOn: string };
+
+let accountCursor = 0;
+/** 轮转起点让新会话分散到不同账号；真正用哪个账号由空闲租约抢占决定。 */
+function orderedAccounts(accounts: SiderAccount[]): SiderAccount[] {
+  const start = accountCursor++ % accounts.length;
+  return [...accounts.slice(start), ...accounts.slice(0, start)];
 }
 
 /** 主控协议独立于pro/max：从不把业务回合交给兼容后端重做。 */
@@ -412,6 +478,50 @@ export async function runSiderController(
   signal?: AbortSignal,
   session?: string,
 ): Promise<AnthropicResponse> {
+  const accounts = await getSiderAccounts();
+  if (!accounts.length) throw new ControllerError('未配置Sider主控凭证', 503);
+  const tried = new Set<string>();
+  let candidates = orderedAccounts(accounts);
+  for (;;) {
+    const attempt = await runSiderControllerOnce(
+      request,
+      token,
+      accounts,
+      candidates,
+      signal,
+      session,
+    );
+    if ('response' in attempt) return attempt.response;
+    tried.add(attempt.ranOn);
+    const pinned = accounts.find((account) => account.id === attempt.reroute);
+    if (!pinned) {
+      throw new ControllerError('主控任务绑定的Sider账号已不可用，请恢复该账号或开始新会话', 503);
+    }
+    if (tried.has(pinned.id)) throw new ControllerError('主控任务账号归属异常', 500);
+    // 任务已经在该账号建立会话（cid），后续只能由同一账号续轮。
+    candidates = [pinned];
+  }
+}
+
+/** 兼容按 `controllerHash(token)` 写下的旧绑定：同一账号换成身份键后 cid 仍然可用。 */
+async function legacyAccountMatch(
+  legacyId: string,
+  accounts: SiderAccount[],
+): Promise<SiderAccount | undefined> {
+  for (const candidate of accounts) {
+    if (await controllerHash(candidate.token) === legacyId) return candidate;
+  }
+  return undefined;
+}
+
+async function runSiderControllerOnce(
+  request: AnthropicRequest,
+  token: string,
+  accounts: SiderAccount[],
+  candidates: SiderAccount[],
+  signal?: AbortSignal,
+  session?: string,
+): Promise<ControllerAttempt> {
   const model = getModelById(request.model);
   if (!model) {
     throw new ControllerError('主控模式要求明确登记的上游模型名', 400);
@@ -422,8 +532,6 @@ export async function runSiderController(
   if (request.messages.at(-1)?.role !== 'user') {
     throw new ControllerError('主控模式需要以用户或工具结果结束的消息', 400);
   }
-  const siderToken = getEnv('SIDER_AUTH_TOKEN');
-  if (!siderToken) throw new ControllerError('未配置Sider主控凭证', 503);
   const store = await getControllerStore();
   const owner = await controllerHash(token);
   // 部署平台限制非流式首字节等待；保存进度后以小批登记让客户端继续。
@@ -437,10 +545,11 @@ export async function runSiderController(
   const started = Date.now();
   return await withControllerLease(
     store,
-    `account:${await controllerHash(siderToken)}`,
+    candidates,
+    model.siderModel,
     combined,
     totalMs,
-    async () => {
+    async (account) => {
       const replayKey = `${owner}:response:${await controllerHash(
         JSON.stringify({ session: session ?? null, request: { ...request, model: model.siderModel, stream: undefined } }),
       )}`;
@@ -448,11 +557,40 @@ export async function runSiderController(
       if (cached) {
         recordCachedReplay();
         recordSiderActivity(model.siderModel, { cachedReplays: 1 });
-        return { ...JSON.parse(await readControllerText(store, cached.responseKey)), model: request.model };
+        return {
+          response: {
+            ...JSON.parse(await readControllerText(store, cached.responseKey)),
+            model: request.model,
+          },
+        };
       }
-      const cooldown = await store.read<number>(
-        `cooldown:${await controllerHash(siderToken)}:${model.siderModel}`,
-      );
+      const inflightKey = `${replayKey}:task`;
+      const resumeId = await store.read<string>(inflightKey);
+      const task = await resolveTask(store, owner, request, session ?? resumeId ?? undefined);
+      if (task.account && task.account !== account.id) {
+        // 该会话的 cid 属于另一个账号；先尝试把按 token 哈希写下的旧绑定迁移过来。
+        const migrated = await legacyAccountMatch(task.account, accounts);
+        if (!migrated) return { reroute: task.account, ranOn: account.id };
+        if (migrated.id !== account.id) return { reroute: migrated.id, ranOn: account.id };
+        task.account = migrated.id;
+      }
+      if (!task.account) {
+        // 只有已经建立服务端会话（cid）的旧任务才必须留在主账号；
+        // 全新任务（含尚未建立 cid 的检查点）可以绑定当前抢到的账号。
+        if (!task.cid) {
+          task.account = account.id;
+        } else {
+          const primary = accounts.find((candidate) => candidate.primary);
+          if (!primary) {
+            throw new ControllerError('旧主控检查点需要原来的主账号凭证', 503);
+          }
+          if (primary.id !== account.id) {
+            return { reroute: primary.id, ranOn: account.id };
+          }
+          task.account = primary.id;
+        }
+      }
+      const cooldown = await store.read<number>(`cooldown:${account.id}:${model.siderModel}`);
       if (cooldown && cooldown > Date.now()) {
         recordSiderActivity(model.siderModel, { cooldownRejections: 1 });
         throw new ControllerError(
@@ -461,9 +599,6 @@ export async function runSiderController(
           cooldown - Date.now(),
         );
       }
-      const inflightKey = `${replayKey}:task`;
-      const resumeId = await store.read<string>(inflightKey);
-      const task = await resolveTask(store, owner, request, session ?? resumeId ?? undefined);
       task.pendingHistory = await historyKey(request);
       task.exactCopy ??= /逐字复制|原样复制/.test(contentToText(request.messages[0]!.content));
       await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
@@ -530,7 +665,7 @@ export async function runSiderController(
                 replayKey,
                 started,
               );
-              return response;
+              return { response };
             }
             task.mustWrite = false;
             writeIntegrityResult = `[tool_result] tool_use_id=${pending.upstreamId}\n${
@@ -590,7 +725,12 @@ export async function runSiderController(
       let corrections = 0;
       let totalInputTokens = task.pendingUsage?.input_tokens ?? 0;
       let totalOutputTokens = task.pendingUsage?.output_tokens ?? 0;
-      const paceKey = `pace:${await controllerHash(siderToken)}`;
+      const paceKey = `pace:${account.id}:${model.siderModel}`;
+      const paceMinMs = Math.max(0, Number(getEnv('SIDER_CONTROLLER_PACE_MIN_MS', '0')) || 0);
+      const paceMaxMs = Math.max(
+        paceMinMs,
+        Number(getEnv('SIDER_CONTROLLER_PACE_MS', '12000')) || 0,
+      );
       // 当前实测13,662字符通过、25,671字符中文被拒；大上下文按已测会话续轮分段登记。
       const maxChars = Number(getEnv('SIDER_CONTROLLER_MAX_INPUT_CHARS', '14000'));
       if (!Number.isFinite(maxChars) || maxChars < 2000) {
@@ -608,10 +748,12 @@ export async function runSiderController(
         }
         const callStarted = Date.now();
         let upstream;
+        const pace = await store.read<SiderPaceState>(paceKey);
+        const previousGap = pace?.gapMs ?? paceMinMs;
+        let paceOutcome: SiderPaceOutcome = 'other';
         try {
-          const nextAt = await store.read<number>(paceKey);
-          if (nextAt && nextAt > Date.now()) {
-            await delay(nextAt - Date.now(), undefined, { signal: combined });
+          if (pace?.nextAt && pace.nextAt > Date.now()) {
+            await delay(pace.nextAt - Date.now(), undefined, { signal: combined });
           }
           if (combined.aborted) throw combined.reason;
           const body = {
@@ -626,7 +768,7 @@ export async function runSiderController(
             output_language: 'zh-CN',
           };
           try {
-            upstream = await siderClient.chat(body, siderToken, combined);
+            upstream = await siderClient.chat(body, account.token, combined);
           } catch (error) {
             // 仅重试明确的建立连接失败；SSE失败、读取超时和工具服务端副作用均不重试。
             const message = error instanceof Error ? error.message : '';
@@ -645,8 +787,9 @@ export async function runSiderController(
               outcome: 'connect_retry',
             });
             await new Promise((resolve) => setTimeout(resolve, 1000));
-            upstream = await siderClient.chat(body, siderToken, combined);
+            upstream = await siderClient.chat(body, account.token, combined);
           }
+          paceOutcome = 'ok';
         } catch (error) {
           persistSiderTelemetry({
             ts: Date.now(),
@@ -664,16 +807,20 @@ export async function runSiderController(
           if (error instanceof SiderUpstreamError && error.siderCode === 1135) {
             const wait = error.retryAfterMs ?? 60_000;
             await store.write(
-              `cooldown:${await controllerHash(siderToken)}:${model.siderModel}`,
+              `cooldown:${account.id}:${model.siderModel}`,
               Date.now() + wait,
               wait,
             );
           }
+          if (error instanceof SiderUpstreamError && error.siderCode === 1101) {
+            paceOutcome = 'concurrency';
+          }
           throw error;
         } finally {
+          const gapMs = nextSiderPaceGap(previousGap, paceOutcome, paceMinMs, paceMaxMs);
           await store.write(
             paceKey,
-            Date.now() + Number(getEnv('SIDER_CONTROLLER_PACE_MS', '12000')),
+            { nextAt: Date.now() + gapMs, gapMs } satisfies SiderPaceState,
             RETENTION_MS,
           );
         }
@@ -1060,7 +1207,7 @@ export async function runSiderController(
           replayKey,
           started,
         );
-        return response;
+        return { response };
       }
       throw new ControllerError('主控内部保存或参数纠正超过单请求轮数，检查点保留');
     },
