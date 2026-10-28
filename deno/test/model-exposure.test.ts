@@ -89,20 +89,24 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   const models = getAllModels();
   const ids = models.map((model) => model.id);
 
-  assertEquals(models.length, 106);
+  assertEquals(models.length, 109);
   for (
     const id of [
       'claude-sonnet-4.6',
       'gpt-5.5-think',
       'gpt-6.1-sol',
+      'gpt-6.1-terra',
       'gpt-6-sol-think',
       'claude-fable-5.1',
       'claude-opus-5.5',
       'claude-sonnet-5.5',
       'claude-haiku-5.5',
+      'gemini-4-argon',
+      'gemini-4-argon-think',
       'gemini-3.5-flash',
       'gemini-3.8-flash',
       'gemini-3.5-flash-lite-think',
+      'deepseek-v4-flash',
       'deepseek-v4-pro-think',
       'deepseek-v3.2-think',
       'grok-4',
@@ -136,6 +140,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
       'gemini-3.7-flash',
       'gemini-3.7-flash-think',
       'deepseek-flash',
+      'deepseek-v4.1-flash',
     ]
   ) {
     assertEquals(ids.includes(id), false);
@@ -155,7 +160,7 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
   assertEquals(listResponse.status, 200);
   const list = await listResponse.json() as { data?: Array<{ id?: string }> };
   const listIds = idsFromOpenAIModelList(list);
-  assertEquals(listIds.length, 106);
+  assertEquals(listIds.length, 109);
   assertEquals(listIds.includes('gpt-5.5-think'), true);
   assertEquals(listIds.includes('gemini-3.5-flash'), true);
 
@@ -167,6 +172,9 @@ Deno.test('model catalog exposes all upstream models for Anthropic/OpenAI discov
 
   const removedResponse = await app.request('/v1/models/claude-opus-4.6');
   assertEquals(removedResponse.status, 404);
+
+  const rejectedResponse = await app.request('/v1/models/deepseek-v4.1-flash');
+  assertEquals(rejectedResponse.status, 404);
 });
 
 Deno.test('Claude Code上下文窗口标签不影响严格模型查找与映射', () => {
@@ -251,7 +259,7 @@ Deno.test('Gemini model discovery exposes every upstream model', async () => {
     assertEquals(listResponse.status, 200);
     const list = await listResponse.json() as { models?: Array<{ name?: string }> };
     const ids = idsFromGeminiModelList(list);
-    assertEquals(ids.length, 106);
+    assertEquals(ids.length, 109);
     assertEquals(ids.includes('gpt-5.5-think'), true);
     assertEquals(ids.includes('gemini-3.5-flash'), true);
 

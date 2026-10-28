@@ -482,7 +482,10 @@ thinking 吃光小预算。
 
 模型清单严格同步参考仓库
 [`goldenhawksu/sider2api` 的 `deno_pro.ts`](https://github.com/goldenhawksu/sider2api/blob/main/deno_pro.ts)
-中的 `MODEL_MAPPING`。当前目录为 106 个模型（2026-10-12），后续以参考映射和源码为准。
+中的 `MODEL_MAPPING`。当前目录为 109 个模型（2026-10-28），后续以参考映射和源码为准。
+`gpt-6.1-terra`、`gemini-4-argon`、`gemini-4-argon-think` 是按用户显式清单增补的，
+参考映射当时尚未列出，同步参考时不要按「参考没有」删除。`deepseek-v4.1-flash`
+同日实测被 Sider 以 `1000: invalid model` 拒绝，未收录，`deepseek-v4-flash` 保留。
 新增、删除或改映射时，必须同步两份文件并更新 `deno/test/hybrid-routing.test.ts`
 与 `deno/test/model-exposure.test.ts` 里的计数与 id 断言。
 

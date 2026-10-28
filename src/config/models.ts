@@ -70,6 +70,9 @@ const CLAUDE_MODELS: ModelInfo[] = [
 
 // ── Sider 支持的其余上游模型（参考 sider2api deno_pro.ts MODEL_MAPPING） ──
 // 这些模型对外名与 Sider 名一致，无需改名；与 CLAUDE_MODELS 重名的以上表为准。
+// `gpt-6.1-terra`、`gemini-4-argon(-think)` 为 2026-10-28 显式增补，参考映射
+// 尚未列出，同步参考时不要按「参考没有」删掉它们。`deepseek-v4.1-flash` 同日
+// 实测被 Sider 以 `1000: invalid model` 拒绝，故未收录。
 const SIDER_UPSTREAM_MODELS: string[] = [
   // GPT 系列
   'gpt-4.1',
@@ -94,6 +97,7 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'gpt-4.1-mini',
   'gpt-6-luna',
   'gpt-6.1-sol',
+  'gpt-6.1-terra',
   'gpt-5.2',
   'gpt-5.2-think',
   'o4-mini',
@@ -139,6 +143,8 @@ const SIDER_UPSTREAM_MODELS: string[] = [
   'claude-3-opus',
 
   // Gemini 系列
+  'gemini-4-argon',
+  'gemini-4-argon-think',
   'gemini-2.5-pro',
   'gemini-2.5-pro-think',
   'gemini-2.5-flash-think',
