@@ -53,6 +53,9 @@ export const suite: Suite = {
         event.type === 'content_block_start' && event.content_block?.type === 'tool_use'
       );
       assertEquals(blockStart?.content_block?.name, 'Write', '客户端工具');
+      if (!blockStart) {
+        throw new Error('未找到 Write 的 content_block_start');
+      }
       const partial = response.events
         .filter((event: any) =>
           event.type === 'content_block_delta' && event.index === blockStart?.index &&
