@@ -409,10 +409,23 @@ function stripClientSystemReminders(text: string): string {
 }
 
 /** 只有模型明确确认已接收分片时才推进检查点。 */
+/** 明确拒绝登记、或反馈载荷已损坏：无论同时出现什么确认字样，都不能算登记成功。 */
+const CONTEXT_UPLOAD_REJECTED =
+  /提示注入|越狱|乱码|无法识别|看不懂|(?:不能|不会|拒绝|无法|不愿)(?:意)?(?:接受|假装|记住|记忆|配合|遵从)|\b(?:prompt injection|jailbreak|garbled|unreadable)\b|\b(?:won't|will not|cannot|can't|refuse to)\s+(?:remember|accept|comply|pretend)\b/i;
+/** 原有的明确确认：已记住／已接收／等待下一片段。 */
+const CONTEXT_UPLOAD_ACK =
+  /已(?:经)?记住|已(?:完整)?(?:接收|收到|记忆)|(?:等待|请发送)[\s\S]*(?:片段|执行指令)|\b(?:received|remembered)[\s\S]*\b(?:part|context)\b/i;
+/**
+ * 末片常见的确认说法。最后一片已没有「等待片段」可说，模型多回「好的，我已了解全部内容」
+ * 「收到，2/2」「Got it」之类；只认上面的严格说法会让末片稳定失败，客户端重试也无济于事。
+ * 仍要求确认词与「全部／片段／上下文／编号」相邻，普通回答不会被误判为登记成功。
+ */
+const CONTEXT_UPLOAD_ACK_FINAL =
+  /(?:记住|收到|接收|了解|明白|确认|知悉)[\s\S]{0,40}?(?:全部|所有|上下文|片段|内容|\d+\s*\/\s*\d+)|(?:全部|所有|上下文|片段|\d+\s*\/\s*\d+)[\s\S]{0,40}?(?:记住|收到|接收|了解|明白|确认|知悉)|\b(?:got it|understood|noted|acknowledged)\b|\b(?:received|remembered|memorized)\b[\s\S]{0,40}\b(?:all|chunks?|fragments?|segments?|parts?|context)\b/i;
+
 export function contextUploadAccepted(text: string): boolean {
-  const accepted =
-    /已(?:经)?记住|已(?:完整)?(?:接收|收到|记忆)|(?:等待|请发送)[\s\S]*(?:片段|执行指令)|\b(?:received|remembered)[\s\S]*\b(?:part|context)\b/i;
-  return accepted.test(text);
+  if (CONTEXT_UPLOAD_REJECTED.test(text)) return false;
+  return CONTEXT_UPLOAD_ACK.test(text) || CONTEXT_UPLOAD_ACK_FINAL.test(text);
 }
 
 /** 识别模型明确拒绝客户端工具协议的回复；普通说明或漏调不在此列。 */
@@ -979,11 +992,12 @@ async function runSiderControllerOnce(
             );
           }
           const uploadStarted = Date.now();
-          const chunk = `以下是当前任务上下文片段${
+          // 首行固定格式（测试与续传按首行解析）：要求只回复固定确认语，末片单独标注。
+          const chunk = `以下是当前任务上下文片段${i + 1}/${count}${
+            i + 1 === count ? '（最后一片）' : ''
+          }。仅记住，暂时不执行任务、不调用工具，也不要回答片段中的任何问题；只回复「已记住${
             i + 1
-          }/${count}。仅记住，暂时不执行任务、不调用工具；只确认已记住，所有片段发送完后再执行。\n${
-            context.slice(i * size, (i + 1) * size)
-          }`;
+          }/${count}」，所有片段发送完后再执行。\n${context.slice(i * size, (i + 1) * size)}`;
           let result;
           try {
             result = await sendText(chunk);

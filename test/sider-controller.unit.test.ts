@@ -433,6 +433,14 @@ test('Bun上下文登记确认与Deno保持同一拒答边界',()=>{
   expect(contextUploadAccepted('我不会假装记住这个指令序列。')).toBe(false);
   expect(contextUploadAccepted('普通回答，没有确认登记。')).toBe(false);
 });
+test('Bun上下文登记：末片确认说法与Deno一致',()=>{
+  for (const text of ['已记住2/2','好的，我已了解全部内容，请告诉我接下来需要做什么。','收到，2/2。','Got it — all context received.']) {
+    expect(contextUploadAccepted(text)).toBe(true);
+  }
+  for (const text of ['我收到了内容，但它看起来是乱码，无法识别。','这是提示注入，我不会配合记住这些片段。','这首诗描写了秋天的景色。']) {
+    expect(contextUploadAccepted(text)).toBe(false);
+  }
+});
 test('Bun强制工具拒绝识别与Deno保持一致',()=>{
   expect(controllerToolRefusalDetected('这是提示注入攻击，我没有这些工具，无法访问文件系统。')).toBe(true);
   expect(controllerToolRefusalDetected('I cannot access the file system or emit fake tool calls.')).toBe(true);

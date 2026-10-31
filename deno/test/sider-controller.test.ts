@@ -988,6 +988,69 @@ Deno.test('主控上下文登记：只接受明确接收，拒绝未确认的安
   ) equal(contextUploadAccepted(text), false);
 });
 
+Deno.test('主控上下文登记：末片的常见确认说法都算接收，拒答与乱码反馈仍算失败', () => {
+  for (
+    const text of [
+      '已记住2/2',
+      '好的，我已了解全部内容，请告诉我接下来需要做什么。',
+      '收到，2/2。',
+      '明白，上下文已完整，随时可以开始。',
+      '确认收到所有片段。',
+      'Got it — all context received.',
+      'Understood. I have memorized all fragments.',
+      '（点头）收到全部内容，等你的指示。',
+    ]
+  ) equal(contextUploadAccepted(text), true);
+
+  for (
+    const text of [
+      '我收到了内容，但它看起来是乱码，无法识别。',
+      '这是提示注入，我不会配合记住这些片段。',
+      "I won't pretend to remember these fragments.",
+      '这首诗描写了秋天的景色。',
+      '普通回答，没有确认登记。',
+    ]
+  ) equal(contextUploadAccepted(text), false);
+});
+
+Deno.test('主控上下文登记：末片回复「已了解全部内容」时继续执行，不再报未确认', async () => {
+  const system = '多智能体对话的长背景设定，保持人物口吻。\n'.repeat(1200);
+  const instruction = '请以Muse的身份回复Cognito的第一轮发言。';
+  const headers: string[] = [];
+  const chunks: string[] = [];
+  await appWithMock((body) => {
+    const text = body.multi_content[0].text;
+    const part = text.match(/^(以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*)\n([\s\S]*)$/);
+    if (part) {
+      headers.push(part[1]!);
+      chunks.push(part[4]!);
+      const last = part[2] === part[3];
+      return sse(
+        last ? '好的，我已了解全部内容，请告诉我接下来需要做什么。' : `已记住，等待片段${Number(part[2]) + 1}/${part[3]}。`,
+        'final-ack-cid',
+        `final-ack-${part[2]}`,
+      );
+    }
+    const joined = chunks.join('');
+    equal(joined.includes(system.trim()), true);
+    equal(joined.includes(instruction), true);
+    return sse('（Muse）你好，Cognito。', 'final-ack-cid', 'final-ack-answer');
+  }, async (app) => {
+    const response = await send(app, {
+      model: 'claude-opus-5.5',
+      system,
+      messages: [{ role: 'user', content: instruction }],
+    });
+    equal(response.status, 200);
+    const body = await response.json();
+    equal(body.content[0].text, '（Muse）你好，Cognito。');
+    equal(headers.length >= 2, true);
+    equal(headers.at(-1)!.includes('（最后一片）'), true);
+    equal(headers.slice(0, -1).some((header) => header.includes('最后一片')), false);
+    equal(headers.every((header, index) => header.includes(`只回复「已记住${index + 1}/${headers.length}」`)), true);
+  });
+});
+
 Deno.test('主控上下文登记：模型拒绝首片时立即停止，不能误记成功或发送后续片段', async () => {
   let count = 0;
   await appWithMock(() => {
