@@ -118,7 +118,7 @@ export async function resolveSiderStrategy(
 }
 
 /** 强制刷新（也用于测试推进）。 */
-export async function refreshStrategy(now = Date.now()): Promise<SiderStrategy | undefined> {
+export function refreshStrategy(now = Date.now()): Promise<SiderStrategy | undefined> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     const kv = await getKv();

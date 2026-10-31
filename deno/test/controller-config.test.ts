@@ -44,7 +44,9 @@ Deno.test({
         }),
       )).json();
       equal(status.routing.siderControllerStreaming, true);
-      const stats = await (await app.fetch(new Request('http://localhost/stats.json'))).json();
+      const stats = await (await app.fetch(
+        new Request('http://localhost/stats.json', { headers: { 'x-api-key': 'p0-admin' } }),
+      )).json();
       equal(stats.controller.streaming, true);
       equal((await request({ strategy: 'pro', controllerStreaming: false })).status, 200);
       const disabled = await (await app.fetch(

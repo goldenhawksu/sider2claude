@@ -551,6 +551,16 @@ const READ_TOOL = {
   },
 };
 
+/**
+ * 只声明名字、不带 properties 的工具：文本还原只允许请求里声明过的工具，
+ * 但不给键集，保持这些用例原有的「无 schema 制导」解析路径不变。
+ */
+const NAME_ONLY_TOOL = (name: string) => ({
+  name,
+  description: name,
+  input_schema: { type: 'object' },
+});
+
 Deno.test('DeepSeek adapter 还原 Previous-assistant-tool-request 文本为结构化 tool_use', async () => {
   const restore = stubUpstreamContent([{
     type: 'text',
@@ -780,7 +790,7 @@ Deno.test('DeepSeek adapter 还原含未转义 Windows 路径的转录（生产 
       model: 'claude-opus-4.6',
       messages: [{ role: 'user', content: 'find stats route' }],
       max_tokens: 128,
-      tools: [READ_TOOL],
+      tools: [READ_TOOL, NAME_ONLY_TOOL('Grep')],
     } as unknown as AnthropicRequest);
 
     assertEquals(response.stop_reason, 'tool_use');
@@ -839,7 +849,7 @@ Deno.test('DeepSeek adapter 修复未转义反斜杠时不破坏合法转义序�
       model: 'claude-opus-4.6',
       messages: [{ role: 'user', content: 'run' }],
       max_tokens: 128,
-      tools: [READ_TOOL],
+      tools: [READ_TOOL, NAME_ONLY_TOOL('Bash')],
     } as unknown as AnthropicRequest);
 
     assertEquals(response.stop_reason, 'tool_use');

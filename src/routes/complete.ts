@@ -7,7 +7,7 @@
 
 import { Hono } from 'hono';
 import { consola } from 'consola';
-import { requireAuth, getAuthInfo } from '../middleware/auth';
+import { requireAuth, getAuthInfo, siderTokenFor } from '../middleware/auth';
 import type { CompleteRequest, CompleteError } from '../types/complete';
 import {
   validateCompleteRequest,
@@ -78,7 +78,14 @@ app.post('/', async (c) => {
     }
 
     // 6. 调用 Sider API
-    const siderAuthToken = config.sider.authToken || auth.token;
+    const siderAuthToken = siderTokenFor(config.sider.authToken, auth.token);
+    if (!siderAuthToken) {
+      const errorResp: CompleteError = {
+        type: 'error',
+        error: { type: 'api_error', message: 'Sider backend is not configured' },
+      };
+      return c.json(errorResp, 503);
+    }
 
     // siderClient.chat() 返回已解析的 SiderParsedResponse
     const siderParsedResponse = await siderClient.chat(siderRequest, siderAuthToken);

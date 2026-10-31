@@ -5,9 +5,10 @@ yarn-debug.log*
 yarn-error.log*
 
 # deno.lock 刻意不入库（不是疏漏，加回来前请先看这段理由）：
-# 1. deno.json 的 imports 全是精确版本，且 hono/consola/gpt-tokenizer/
-#    tiny-invariant 四个包均无传递依赖——Deno 侧没有版本漂移的空间，
-#    lock 提供不了额外保障。
+# 1. deno.json 的 imports 全是精确版本；hono/consola/gpt-tokenizer/
+#    tiny-invariant 无传递依赖，但 ajv@8.17.1 带 4 个范围版本的传递依赖
+#    （fast-deep-equal、fast-uri、json-schema-traverse、require-from-string），
+#    这部分存在漂移空间。若要完全锁定，需要重新评估是否提交 deno.lock。
 # 2. deno.lock 里 15 个 specifiers 有 10 个带范围符且全部来自 package.json
 #    （eslint/tsup/typescript 等构建期依赖），这些已由 package-lock.json
 #    与 bun.lock 锁定；再提交一份等于三处锁同一批依赖，反而容易不同步。

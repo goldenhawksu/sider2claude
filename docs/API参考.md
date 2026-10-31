@@ -14,7 +14,17 @@ Authorization: Bearer your-client-token
 x-api-key: your-client-token
 ```
 
-同时提供时优先使用 `x-api-key`；其值应匹配服务端 `AUTH_TOKEN`。`dummy` 仅在服务端明确设置 `ALLOW_DUMMY_TOKEN=true` 时接受。服务部署应明确配置 `AUTH_TOKEN`。
+同时提供时优先使用 `x-api-key`；其值应匹配服务端 `AUTH_TOKEN`。`dummy` 仅在服务端明确设置 `ALLOW_DUMMY_TOKEN=true` 时接受。
+
+服务端未配置 `AUTH_TOKEN` 时默认失败关闭：受保护端点返回 503 `AUTH_NOT_CONFIGURED`。只有显式设置 `ALLOW_OPEN_AUTH=true`（仅限本地开发）才接受任意 ≥10 字符的 token。客户端 token 默认不会转发给 Sider；需要旧行为时设置 `SIDER_TOKEN_PASSTHROUGH=true`。
+
+| 凭证 | 用途 |
+| --- | --- |
+| `AUTH_TOKEN` | 调用 `/v1/*`；也可读看板 |
+| `ADMIN_TOKEN` | `POST /stats/strategy`；未配置时回退 `AUTH_TOKEN`；也可读看板 |
+| `STATS_TOKEN` | 只读看板 `/stats`、`/stats.json`、`/stats/telemetry.json` |
+
+浏览器打开 `/stats` 时先显示登录页，提交看板凭证后换取 12 小时有效的 HttpOnly 会话 cookie。`STATS_PUBLIC=true` 可恢复看板公开访问。请求体上限默认 32 MB（`MAX_REQUEST_BODY_BYTES`），超出返回 413 `request_too_large`。
 
 OpenAI／Gemini 转换路径当前转发 `Authorization` 和 `x-api-key`；未实现 `x-goog-api-key`／URL `key` 鉴权转换。
 
@@ -22,7 +32,7 @@ OpenAI／Gemini 转换路径当前转发 `Authorization` 和 `x-api-key`；未�
 
 | 方法与路径 | 鉴权 | 用途 |
 | --- | --- | --- |
-| GET `/`、`/health` | 无 | 服务信息、健康及版本 |
+| GET `/`、`/health` | 无 | 服务信息、健康及版本（`/` 不再包含用量数据） |
 | GET `/v1/models`、`/v1/models/:model_id` | 无 | 模型目录与详情 |
 | POST `/v1/messages` | 是 | Anthropic Messages |
 | POST `/v1/messages/count_tokens` | 是 | 输入 token 估算 |
@@ -35,9 +45,10 @@ OpenAI／Gemini 转换路径当前转发 `Authorization` 和 `x-api-key`；未�
 | GET `/v1/messages/backends/status` | 是 | 后端配置与路由状态 |
 | GET `/v1/messages/conversations`、`/v1/messages/sider-sessions` | 是 | 进程内普通会话信息 |
 | POST `/v1/messages/conversations/cleanup`、`/v1/messages/sider-sessions/cleanup` | 是 | 清理对应过期会话信息 |
-| GET `/stats`、`/stats.json` | 无 | 用量看板及快照 |
-| POST `/stats/strategy` | 是，Deno 独有 | 设置 `conservative/pro/max` |
-| GET `/stats/telemetry.json` | 是，Deno 独有 | 导出不含正文的 Sider 调用遥测 |
+| GET `/stats`、`/stats.json` | 看板凭证或登录 cookie | 用量看板及快照 |
+| POST `/stats/login`、`/stats/logout` | 登录提交看板凭证 | 浏览器看板会话 |
+| POST `/stats/strategy` | 管理凭证，Deno 独有 | 设置 `conservative/pro/max` |
+| GET `/stats/telemetry.json` | 看板凭证，Deno 独有 | 导出不含正文的 Sider 调用遥测 |
 
 普通会话管理端点不是主控任务／正文库的删除接口。主控通过专用 KV／SQLite 检查点恢复。
 

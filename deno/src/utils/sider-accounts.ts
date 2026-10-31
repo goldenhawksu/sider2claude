@@ -13,7 +13,10 @@ import { getEnv } from './env.ts';
 export const MAX_SIDER_ACCOUNTS = 8;
 
 export interface SiderAccount {
-  /** SHA-256(token)。与历史 `controllerHash(token)` 完全一致，旧键继续有效。 */
+  /**
+   * SHA-256(`sider-account:` + 账号身份)，身份取 JWT 的 user_id，解析不出时退回 token。
+   * 与旧版 `controllerHash(token)` 不同；旧绑定由 sider-controller 的迁移逻辑按 token 哈希找回。
+   */
   id: string;
   token: string;
   /** 主账号。升级前创建的主控检查点只能属于它。 */

@@ -479,6 +479,7 @@ export async function withControllerLease<T>(
   const keyOf = (account: SiderAccount) => `account:${account.id}:${siderModel}`;
   let claimed: SiderAccount | null = null;
   const until = Date.now() + 30_000;
+  let waitMs = LEASE_POLL_START_MS;
   try {
     for (const account of accounts) {
       if (await store.claim(keyOf(account), holder, totalMs + 5000)) {
@@ -497,13 +498,50 @@ export async function withControllerLease<T>(
           break;
         }
       }
-      if (!claimed) await new Promise((resolve) => setTimeout(resolve, 200));
+      if (!claimed) {
+        await abortableSleep(jitter(waitMs), signal);
+        waitMs = Math.min(LEASE_POLL_MAX_MS, Math.round(waitMs * 1.5));
+      }
     }
     return await fn(claimed);
   } finally {
     queued--;
-    if (claimed) await store.release(keyOf(claimed), holder);
+    if (claimed) {
+      // 释放失败不能覆盖真实结果；租约自带过期时间，最坏情况是晚一会儿可用。
+      try {
+        await store.release(keyOf(claimed), holder);
+      } catch (error) {
+        console.warn('⚠️ 主控租约释放失败，等待租约自然过期', {
+          model: siderModel,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
+}
+
+/** 租约轮询退避：起步 200ms，×1.5 递增，封顶 2s，避免多个等待者以固定节奏打满存储。 */
+export const LEASE_POLL_START_MS = 200;
+export const LEASE_POLL_MAX_MS = 2000;
+
+function jitter(ms: number): number {
+  return Math.round(ms * (0.75 + Math.random() * 0.5));
+}
+
+/** 可被客户端断开打断的等待；不会因请求已离开而继续占用排队名额。 */
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** 一次尝试的结果：正常响应，或任务绑定在另一个账号上需要重试。 */

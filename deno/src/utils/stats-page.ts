@@ -336,7 +336,11 @@ const REFRESH_SCRIPT = `<script>
     if (inFlight || document.hidden) return;
     inFlight = true;
     fetch(location.pathname, { headers: { 'Accept': 'text/html' }, cache: 'no-store' })
-      .then(function (res) { return res.ok ? res.text() : Promise.reject(res.status); })
+      .then(function (res) {
+        // 看板会话过期：整页重载，交给服务端渲染登录页。
+        if (res.status === 401) { location.reload(); return Promise.reject(401); }
+        return res.ok ? res.text() : Promise.reject(res.status);
+      })
       .then(function (html) {
         apply(new DOMParser().parseFromString(html, 'text/html'));
       })
@@ -727,7 +731,7 @@ const STRATEGY_SCRIPT = `<script>
   function getToken() {
     var token = sessionStorage.getItem(tokenKey);
     if (!token) {
-      token = prompt('请输入管理凭证') || '';
+      token = prompt('请输入管理凭证（ADMIN_TOKEN）') || '';
       if (token) sessionStorage.setItem(tokenKey, token);
     }
     return token;

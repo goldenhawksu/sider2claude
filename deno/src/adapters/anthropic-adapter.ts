@@ -26,6 +26,7 @@ import { getEnv } from '../utils/env.ts';
 import {
   bareBashInputFromText,
   collectHistoryToolUseIds,
+  collectDeclaredToolNames,
   collectToolInputKeys,
   hasBareBashToolUse,
   hasBareWriteToolUse,
@@ -320,6 +321,7 @@ export class AnthropicApiAdapter {
       request.stop_sequences,
       request.tool_choice?.type !== 'tool' || request.tool_choice.name.toLowerCase() === 'write',
       false,
+      collectDeclaredToolNames(request.tools),
     );
     logWarn('bash_tool_input_normalized', {
       ...this.contextFields(logContext),
@@ -406,6 +408,7 @@ export class AnthropicApiAdapter {
           request.tool_choice?.type !== 'tool' ||
             request.tool_choice.name.toLowerCase() === 'write',
           request.tool_choice?.type !== 'tool' || request.tool_choice.name === 'Bash',
+          collectDeclaredToolNames(request.tools),
         ),
         request,
         logContext,
@@ -782,6 +785,7 @@ export class AnthropicApiAdapter {
     stopSequences?: string[],
     allowBareWrite = true,
     allowBareBash = true,
+    declaredToolNames?: ReadonlySet<string>,
   ): AnthropicResponse {
     if (!data || typeof data !== 'object') {
       throw new Error(`${this.provider} API returned invalid response format`);
@@ -849,6 +853,7 @@ export class AnthropicApiAdapter {
         historyToolUseIds,
         toolInputKeys,
         allowTextualToolUse,
+        declaredToolNames,
       );
     } catch (error) {
       if (
@@ -904,6 +909,7 @@ export class AnthropicApiAdapter {
     historyToolUseIds?: Set<string>,
     toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
     allowTextualToolUse = true,
+    declaredToolNames?: ReadonlySet<string>,
   ): AnthropicResponseContent[] {
     if (!Array.isArray(content) || content.length === 0) {
       throw new Error(`${this.provider} API response missing content array`);
@@ -986,7 +992,15 @@ export class AnthropicApiAdapter {
       normalized,
       historyToolUseIds,
       toolInputKeys,
+      declaredToolNames,
     );
+    if (converted.undeclaredCount > 0) {
+      logWarn('textual_tool_use_undeclared_skipped', {
+        ...this.contextFields(logContext),
+        provider: this.provider,
+        undeclaredCount: converted.undeclaredCount,
+      });
+    }
     if (converted.unparsedWriteCount > 0) {
       logError('invalid_write_tool_input', {
         ...this.contextFields(logContext),

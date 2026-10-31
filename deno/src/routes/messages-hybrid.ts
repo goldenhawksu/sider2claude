@@ -15,7 +15,7 @@ import { getSiderAccounts } from '../utils/sider-accounts.ts';
 import { controllerResponse } from '../utils/controller-http.ts';
 import { isSafetyClassifierRequest, isStandaloneVisionRequest } from '../utils/request-analyzer.ts';
 import type { Context } from 'hono';
-import { getAuthInfo, requireAuth } from '../middleware/auth.ts';
+import { getAuthInfo, requireAuth, siderTokenFor } from '../middleware/auth.ts';
 import type { AnthropicError, AnthropicRequest, AnthropicResponse } from '../types/anthropic.ts';
 import type { SiderRequest } from '../types/sider.ts';
 import {
@@ -74,6 +74,7 @@ import {
   logWarn,
   NON_STREAM_SLOW_MS,
   observeDuplicateCandidate,
+  replayScopeKey,
   type RequestLogContext,
   serializeError,
   STREAM_FIRST_EVENT_SLOW_MS,
@@ -180,8 +181,14 @@ messagesRouter.post('/', async (c: Context) => {
 
     warnLargeRequest(logContext, anthropicRequest);
 
+    const replayScope = replayScopeKey(
+      auth.token,
+      c.req.query('cid') || c.req.header('X-Conversation-ID'),
+      c.req.header('X-Parent-Message-ID'),
+    );
+
     if (!anthropicRequest.stream) {
-      const cached = getCachedDuplicateResponse(logContext.requestHash);
+      const cached = getCachedDuplicateResponse(logContext.requestHash, replayScope);
       if (cached) {
         logInfo('duplicate_request_replayed', {
           requestId: logContext.requestId,
@@ -342,7 +349,7 @@ messagesRouter.post('/', async (c: Context) => {
         thresholdMs: NON_STREAM_SLOW_MS,
       });
     }
-    cacheDuplicateResponse(logContext.requestHash, selectedBackend, response);
+    cacheDuplicateResponse(logContext.requestHash, replayScope, selectedBackend, response);
 
     const jsonResponse = c.json(response);
     jsonResponse.headers.set('X-Request-ID', logContext.requestId);
@@ -716,7 +723,10 @@ async function buildSiderRequest(
   parentMessageId?: string,
 ): Promise<{ siderRequest: SiderRequest; siderAuthToken: string }> {
   let siderRequest: SiderRequest;
-  const siderAuthToken = config.sider.authToken || authToken;
+  const siderAuthToken = siderTokenFor(config.sider.authToken, authToken);
+  if (!siderAuthToken) {
+    throw new Error('Sider backend is not configured (SIDER_AUTH_TOKEN missing)');
+  }
 
   if (conversationId) {
     try {
@@ -857,11 +867,13 @@ function warnLargeRequest(
 
 function getCachedDuplicateResponse(
   requestHash: string,
+  scope: string,
 ): { response: AnthropicResponse; backend: Backend; storedAt: number } | undefined {
   cleanupDuplicateResponseCache();
   // 缓存键带流式标记：指纹刻意忽略 stream 以跨流式/非流式识别客户端重试（观测用），
   // 但响应缓存不能共享——非流式回放流式缓存的响应属于语义错配。
-  const cached = duplicateResponseCache.get(`${requestHash}:non-stream`);
+  // 作用域（调用方 + 会话）也进键：相同正文在不同会话里不是同一次重试。
+  const cached = duplicateResponseCache.get(`${requestHash}:${scope}:non-stream`);
   if (!cached) {
     return undefined;
   }
@@ -875,11 +887,12 @@ function getCachedDuplicateResponse(
 
 function cacheDuplicateResponse(
   requestHash: string,
+  scope: string,
   backend: Backend,
   response: AnthropicResponse,
 ): void {
   cleanupDuplicateResponseCache();
-  duplicateResponseCache.set(`${requestHash}:non-stream`, {
+  duplicateResponseCache.set(`${requestHash}:${scope}:non-stream`, {
     response: cloneAnthropicResponse(response),
     backend,
     storedAt: Date.now(),

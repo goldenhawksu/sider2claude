@@ -55,7 +55,7 @@ export function parseCompletePrompt(prompt: string): { role: 'user' | 'assistant
   const messages: { role: 'user' | 'assistant'; content: string }[] = [];
 
   // 移除开头的空白
-  let text = prompt.trim();
+  const text = prompt.trim();
 
   // 按 "\n\nHuman:" 和 "\n\nAssistant:" 分割
   const parts = text.split(/\n\n(Human|Assistant):\s*/);

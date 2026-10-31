@@ -192,6 +192,7 @@ export interface AnthropicTool {
   description?: string;
   input_schema: {
     type: 'object';
+    // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
     properties: Record<string, any>;
     required?: string[];
   };
@@ -207,6 +208,7 @@ export interface AnthropicToolUse {
   type: 'tool_use';
   id: string;
   name: string;
+  // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
   input: Record<string, any>;
 }
 

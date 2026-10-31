@@ -22,7 +22,7 @@ export interface SiderConversationMessage {
   }>;
   type: 'chat';
   created_at: string;
-  client_prompt: Record<string, any>;
+  client_prompt: Record<string, unknown>;
   is_error: boolean;
   app_name: string;
 }

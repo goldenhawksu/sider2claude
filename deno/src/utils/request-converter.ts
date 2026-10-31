@@ -472,9 +472,9 @@ function buildSafeToolsConfig(anthropicRequest: AnthropicRequest): SiderTools {
 /**
  * 构建安全的客户端提示 - 避免 API 错误
  */
-function buildSafeClientPrompt(anthropicRequest: AnthropicRequest): Record<string, any> {
+function buildSafeClientPrompt(anthropicRequest: AnthropicRequest): Record<string, unknown> {
   // 返回空对象避免可能的格式问题
-  const prompt: Record<string, any> = {};
+  const prompt: Record<string, unknown> = {};
 
   // 暂时只保留基本参数
   if (

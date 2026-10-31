@@ -28,7 +28,6 @@ import {
 } from '../config/backends.ts';
 import {
   persistCachedReplay,
-  type PersistentStats,
   persistUsage,
   readPersistentStats,
 } from './usage-stats-kv.ts';

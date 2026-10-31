@@ -28,6 +28,7 @@ export interface SiderTools {
     timeout?: number;
   };
   // 扩展其他工具配置
+  // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
   [key: string]: any;
 }
 
@@ -39,11 +40,12 @@ export interface SiderRequest {
   from: string; // 通常为 "chat"
   filter_search_history?: boolean; // 是否过滤搜索历史
   chat_models?: string[]; // 聊天模型列表
-  quote?: any; // 引用信息
+  quote?: unknown; // 引用信息
   client_prompt?: Record<string, unknown>; // 客户端提示（可选）
   multi_content: SiderMultiContent[];
   prompt_templates: Array<{
     key: string;
+    // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
     attributes: Record<string, any>;
   }>;
   tools: SiderTools;
@@ -134,6 +136,7 @@ export interface SiderParsedResponse {
   toolResults?: Array<{    // 工具调用结果数组
     toolName: string;
     toolId: string;
+    // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
     result: any;
     status: 'start' | 'processing' | 'finish';
     error?: string;
@@ -177,6 +180,7 @@ export interface SiderToolCallResult {
     id: string;
     name: string;
     status: 'finish';
+    // deno-lint-ignore no-explicit-any -- 外部 API 的任意 JSON 结构
     result: any;
     error?: string;
   };

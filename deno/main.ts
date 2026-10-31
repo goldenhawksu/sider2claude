@@ -9,6 +9,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
+import { bodyLimit } from 'hono/body-limit';
 import { hybridMessagesRouter } from './src/routes/messages-hybrid.ts';
 import modelsRouter from './src/routes/models.ts';
 import completeRouter from './src/routes/complete.ts';
@@ -18,12 +19,10 @@ import { getStatsSnapshot } from './src/utils/usage-stats.ts';
 import { renderStatsPage } from './src/utils/stats-page.ts';
 import { setControllerStreaming, setSiderStrategy } from './src/utils/runtime-strategy.ts';
 import { readSiderTelemetry } from './src/utils/sider-telemetry.ts';
-import { requireAuth } from './src/middleware/auth.ts';
+import { requireAdmin } from './src/middleware/auth.ts';
+import { requireStatsAuth, statsLogin, statsLogout } from './src/middleware/stats-auth.ts';
 
 const app = new Hono();
-
-// 环境变量 - Deno Deploy 方式
-const PORT = parseInt(getEnv('PORT', '8000'), 10);
 
 /**
  * 服务版本：语义化版本 + 构建标识。
@@ -80,6 +79,29 @@ app.use(
 
 app.use('*', logger());
 
+/**
+ * 请求体上限与 Anthropic Messages API 一致（32 MB），可用 MAX_REQUEST_BODY_BYTES 调整。
+ * 超出时返回 Anthropic 形状的 413，避免超大 JSON 在解析、指纹与转换中被反复复制。
+ */
+const MAX_REQUEST_BODY_BYTES = (() => {
+  const parsed = Number(getEnv('MAX_REQUEST_BODY_BYTES'));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 32 * 1024 * 1024;
+})();
+app.use(
+  '*',
+  bodyLimit({
+    maxSize: MAX_REQUEST_BODY_BYTES,
+    onError: (c) =>
+      c.json({
+        type: 'error',
+        error: {
+          type: 'request_too_large',
+          message: `Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`,
+        },
+      }, 413),
+  }),
+);
+
 // 健康检查端点
 app.get('/health', (c) => {
   return c.json({
@@ -92,8 +114,8 @@ app.get('/health', (c) => {
   });
 });
 
-// 根路径信息
-app.get('/', async (c) => {
+// 根路径信息（不含用量数据：用量在需要鉴权的 /stats.json）
+app.get('/', (c) => {
   return c.json({
     name: 'Sider2Claude',
     description: 'Convert Sider AI API to Anthropic API format for Claude Code compatibility',
@@ -120,21 +142,24 @@ app.get('/', async (c) => {
       backends: ['sider', 'deepseek'],
       capability_fallback: 'deepseek',
     },
-    usage: await getStatsSnapshot(),
   });
 });
 
-// 用量看板：/stats 返回 HTML 页面，/stats.json 返回同一份快照的原始数据
-app.get('/stats', async (c) => {
+// 用量看板：/stats 返回 HTML 页面，/stats.json 返回同一份快照的原始数据。
+// 两者都需要看板凭证（请求头或登录 cookie），STATS_PUBLIC=true 可恢复公开。
+app.post('/stats/login', statsLogin);
+app.post('/stats/logout', statsLogout);
+
+app.get('/stats', requireStatsAuth, async (c) => {
   return c.html(renderStatsPage(await getStatsSnapshot()));
 });
 
-app.get('/stats.json', async (c) => {
+app.get('/stats.json', requireStatsAuth, async (c) => {
   return c.json(await getStatsSnapshot());
 });
 
 // 写进 KV 让多实例最多 3 秒收敛；当前实例立即生效。
-app.post('/stats/strategy', requireAuth, async (c) => {
+app.post('/stats/strategy', requireAdmin, async (c) => {
   const body = await c.req.json().catch(() => ({})) as {
     strategy?: unknown;
     controllerStreaming?: unknown;
@@ -164,7 +189,7 @@ app.post('/stats/strategy', requireAuth, async (c) => {
 });
 
 // 运行遥测原始记录，供离线分析优化调度策略。
-app.get('/stats/telemetry.json', requireAuth, async (c) => {
+app.get('/stats/telemetry.json', requireStatsAuth, async (c) => {
   return c.json({ records: await readSiderTelemetry() });
 });
 
@@ -181,8 +206,13 @@ app.notFound((c) => {
 
 // 错误处理
 app.onError((err, c) => {
-  console.error('Server error:', err);
-  return c.json({ error: 'Internal Server Error', message: err.message }, 500);
+  // 细节只进日志，不回传给客户端（可能含内部路径或上游地址）。
+  const requestId = c.req.header('X-Request-ID') || crypto.randomUUID();
+  console.error('Server error:', { requestId, error: err });
+  return c.json({
+    type: 'error',
+    error: { type: 'api_error', message: 'Internal Server Error', request_id: requestId },
+  }, 500);
 });
 
 // Deno Deploy 导出（新平台不接受显式端口，由平台自动分配）

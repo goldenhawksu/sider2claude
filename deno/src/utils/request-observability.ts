@@ -84,7 +84,7 @@ export function createRequestLogContext(
 }
 
 export function hashAnthropicRequest(request: AnthropicRequest): string {
-  return fnv1a53(stableStringify(redactForFingerprint(request)));
+  return fingerprint64(stableStringify(redactForFingerprint(request)));
 }
 
 export function observeDuplicateCandidate(
@@ -227,15 +227,31 @@ function stableStringify(value: unknown): string {
   }}`;
 }
 
-function fnv1a53(input: string): string {
-  let hash = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const mask = 0xffffffffffffffffn;
-
+/**
+ * 64 位指纹：两路独立的 32 位 FNV-1a（不同起始值）拼接。
+ *
+ * 原实现逐字符做 BigInt 乘法，Claude Code 的数百 KB 请求在热路径上要付出可观的 CPU；
+ * Math.imul 版本结果同样稳定、长度不变（16 位十六进制），只用于去重与观测，不作安全用途。
+ */
+function fingerprint64(input: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0xcbf29ce4;
   for (let index = 0; index < input.length; index += 1) {
-    hash ^= BigInt(input.charCodeAt(index));
-    hash = (hash * prime) & mask;
+    const code = input.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 0x01000193);
+    h2 = Math.imul(h2 ^ code, 0x01000193) ^ (h2 >>> 13);
   }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
 
-  return hash.toString(16).padStart(16, '0');
+/**
+ * 重复响应缓存的作用域：调用方凭证 + 会话标识。
+ * 只对正文哈希会让不同会话（或开放鉴权下的不同调用方）在 5 分钟内互相拿到回放结果。
+ */
+export function replayScopeKey(
+  clientToken: string,
+  conversationId?: string,
+  parentMessageId?: string,
+): string {
+  return fingerprint64(`${clientToken}\u0000${conversationId ?? ''}\u0000${parentMessageId ?? ''}`);
 }

@@ -34,10 +34,16 @@ export class ControllerKvStore implements ControllerStore {
 }
 let pending: Promise<ControllerStore> | undefined;
 export function getControllerStore(): Promise<ControllerStore> {
-  pending ??= getEnv('SIDER_CONTROLLER_STORAGE') === 'memory'
-    ? Promise.resolve(new ControllerMemoryStore())
+  if (pending) return pending;
+  const opening = getEnv('SIDER_CONTROLLER_STORAGE') === 'memory'
+    ? Promise.resolve<ControllerStore>(new ControllerMemoryStore())
     : openControllerKv().then((kv) => new ControllerKvStore(kv));
-  return pending;
+  pending = opening;
+  // 打开失败时清空缓存，下一次请求重新尝试；否则一次瞬时故障会让主控永久不可用。
+  opening.catch(() => {
+    if (pending === opening) pending = undefined;
+  });
+  return opening;
 }
 
 async function openControllerKv(): Promise<Deno.Kv> {

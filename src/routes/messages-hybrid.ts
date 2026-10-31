@@ -15,7 +15,7 @@ import { getSiderAccounts } from '../utils/sider-accounts.js';
 import { controllerResponse } from '../utils/controller-http.js';
 import { isSafetyClassifierRequest, isStandaloneVisionRequest } from '../utils/request-analyzer';
 import type { Context } from 'hono';
-import { getAuthInfo, requireAuth } from '../middleware/auth';
+import { getAuthInfo, requireAuth, siderTokenFor } from '../middleware/auth';
 import type {
   AnthropicError,
   AnthropicRequest,
@@ -648,7 +648,10 @@ async function callSider(
   parentMessageId?: string,
 ): Promise<AnthropicResponse> {
   let siderRequest;
-  const siderAuthToken = config.sider.authToken || authToken;
+  const siderAuthToken = siderTokenFor(config.sider.authToken, authToken);
+  if (!siderAuthToken) {
+    throw new Error('Sider backend is not configured (SIDER_AUTH_TOKEN missing)');
+  }
 
   if (conversationId) {
     try {

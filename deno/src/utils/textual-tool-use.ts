@@ -531,6 +531,16 @@ export function collectToolInputKeys(
   return map;
 }
 
+/** 本次请求声明的全部工具名（含无 input_schema 的工具）。 */
+export function collectDeclaredToolNames(tools: AnthropicRequest['tools']): Set<string> {
+  const names = new Set<string>();
+  for (const tool of tools ?? []) {
+    const name = (tool as { name?: unknown }).name;
+    if (typeof name === 'string' && name) names.add(name);
+  }
+  return names;
+}
+
 /**
  * 采集本次请求历史里已出现的 tool_use id。
  * 用于识别「模型复述历史」而非发起新调用，避免还原后重复执行工具。
@@ -565,16 +575,19 @@ export function normalizeTextualToolUseBlocks(
   blocks: AnthropicResponseContent[],
   historyToolUseIds?: Set<string>,
   toolInputKeys?: ReadonlyMap<string, ReadonlySet<string>>,
+  declaredToolNames?: ReadonlySet<string>,
 ): {
   content: AnthropicResponseContent[];
   toolUseCount: number;
   replayedCount: number;
   unparsedCount: number;
   unparsedWriteCount: number;
+  undeclaredCount: number;
 } {
   const next: AnthropicResponseContent[] = [];
   let toolUseCount = 0;
   let replayedCount = 0;
+  let undeclaredCount = 0;
   let unparsedCount = 0;
   let unparsedWriteCount = 0;
 
@@ -641,6 +654,16 @@ export function normalizeTextualToolUseBlocks(
         continue;
       }
 
+      // 本次请求未声明的工具不能还原成可执行调用：客户端没有授权它，
+      // 而这类行最可能来自模型复述网页、文件等外部内容（注入面）。
+      if (
+        toolUse.type === 'tool_use' && declaredToolNames && !declaredToolNames.has(toolUse.name)
+      ) {
+        undeclaredCount += 1;
+        pendingText.push(line);
+        continue;
+      }
+
       flushText();
       convertedParts.push(toolUse);
       toolUseCount += 1;
@@ -656,7 +679,14 @@ export function normalizeTextualToolUseBlocks(
     next.push(...convertedParts);
   }
 
-  return { content: next, toolUseCount, replayedCount, unparsedCount, unparsedWriteCount };
+  return {
+    content: next,
+    toolUseCount,
+    replayedCount,
+    unparsedCount,
+    unparsedWriteCount,
+    undeclaredCount,
+  };
 }
 
 /**
@@ -791,6 +821,7 @@ export function isValidWriteInput(input: unknown): boolean {
   return keys.length === 2 && keys.includes('file_path') && keys.includes('content') &&
     typeof args.file_path === 'string' && args.file_path.trim().length > 0 &&
     typeof args.content === 'string' &&
+    // deno-lint-ignore no-control-regex -- 有意检测路径中的控制字符
     !(/^[A-Za-z]:/.test(args.file_path) && /[\x00-\x1f]/.test(args.file_path));
 }
 

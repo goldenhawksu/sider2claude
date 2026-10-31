@@ -16,10 +16,10 @@
     "lint": "eslint . --cache",
     "typecheck": "tsc",
     "test:unit": "deno task test",
-    "test:unit:node": "bun test --preload ./test/setup-env.ts --max-concurrency=1 test/deepseek-adapter.unit.test.ts test/request-converter.unit.test.ts test/server-tools.unit.test.ts test/upstream-timeout.unit.test.ts test/write-integrity.unit.test.ts test/sider-controller.unit.test.ts",
+    "test:unit:node": "bun test --preload ./test/setup-env.ts --max-concurrency=1 test/deepseek-adapter.unit.test.ts test/request-converter.unit.test.ts test/server-tools.unit.test.ts test/upstream-timeout.unit.test.ts test/write-integrity.unit.test.ts test/sider-controller.unit.test.ts test/security-hardening.unit.test.ts",
     "test:smoke": "bun run test/smoke-test.ts",
     "test:integration": "bun run test/run-all-tests.ts",
-    "test:regression": "deno task test && deno task check && deno check deno/tools/probe-sider-capabilities.ts && npm run typecheck && npm run test:unit:node",
+    "test:regression": "deno task test && deno task lint:src && deno task check && deno check deno/tools/probe-sider-capabilities.ts && npm run typecheck && npm run test:unit:node",
     "prepack": "bun run build"
   },
   "keywords": [

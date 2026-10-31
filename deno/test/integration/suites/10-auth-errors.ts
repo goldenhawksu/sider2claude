@@ -52,6 +52,24 @@ export const suite: Suite = {
       },
     },
     {
+      name: '管理接口拒绝错误凭证，看板与遥测拒绝匿名访问',
+      async run({ api }) {
+        const strategy = await api.post('/stats/strategy', { strategy: '__invalid__' }, {
+          ...PLAIN,
+          'x-api-key': 'sk-definitely-not-a-valid-token',
+        });
+        assertStatus(strategy, 401);
+        const stats = await api.get('/stats.json', {});
+        assertStatus(stats, 401);
+        const telemetry = await api.get('/stats/telemetry.json', {});
+        assertTrue(
+          telemetry.status === 401 || telemetry.status === 404,
+          `遥测匿名拒绝（Bun 侧无此端点为 404，实际 ${telemetry.status}）`,
+        );
+        return `strategy=${strategy.status} stats=${stats.status} telemetry=${telemetry.status}`;
+      },
+    },
+    {
       name: '缺 messages 返回 400',
       async run({ api, config }) {
         const res = await api.post('/v1/messages', { model: config.liveModel, max_tokens: 16 });

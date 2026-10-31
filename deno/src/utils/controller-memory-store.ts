@@ -1,3 +1,4 @@
+// deno-lint-ignore-file require-await -- 内存实现满足异步接口，抛错须以 rejected Promise 形式传出
 export interface ControllerStore {
   read<T>(key: string): Promise<T | null>;
   write(key: string, value: unknown, ttlMs: number): Promise<void>;

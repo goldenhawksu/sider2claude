@@ -32,6 +32,10 @@ jobs:
       - name: Deno test (单元测试)
         run: deno task test
 
+      # 部署的 Deno 源码必须 lint 全绿；测试与探针脚本暂不纳入，避免一次性大改。
+      - name: Deno lint (生产源码)
+        run: deno task lint:src
+
       - name: Deno check (sider probe)
         run: deno check deno/tools/probe-sider-capabilities.ts
 

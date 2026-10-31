@@ -125,6 +125,13 @@ const READ_TOOL = {
   },
 };
 
+/** 只声明名字、不带 properties：允许还原该工具，同时保持原有的无 schema 制导解析路径。 */
+const NAME_ONLY_TOOL = (name: string) => ({
+  name,
+  description: name,
+  input_schema: { type: 'object' },
+});
+
 describe('DeepSeek adapter 文本工具调用兜底', () => {
   test('还原 [tool_use:Name] 转录（Node 侧 sanitize 产出的格式）', async () => {
     stubUpstreamContent([{
@@ -161,7 +168,7 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       model: 'claude-opus-4.6',
       messages: [{ role: 'user', content: 'grep' }],
       max_tokens: 128,
-      tools: [READ_TOOL],
+      tools: [READ_TOOL, NAME_ONLY_TOOL('Bash')],
     } as unknown as AnthropicRequest);
 
     expect(response.stop_reason).toBe('tool_use');
@@ -242,7 +249,7 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       model: 'claude-opus-4.6',
       messages: [{ role: 'user', content: 'find' }],
       max_tokens: 128,
-      tools: [READ_TOOL],
+      tools: [READ_TOOL, NAME_ONLY_TOOL('Grep')],
     } as unknown as AnthropicRequest);
 
     expect(response.stop_reason).toBe('tool_use');
@@ -264,7 +271,7 @@ describe('DeepSeek adapter 文本工具调用兜底', () => {
       model: 'claude-opus-4.6',
       messages: [{ role: 'user', content: 'run' }],
       max_tokens: 128,
-      tools: [READ_TOOL],
+      tools: [READ_TOOL, NAME_ONLY_TOOL('Bash')],
     } as unknown as AnthropicRequest);
 
     expect(response.stop_reason).toBe('tool_use');

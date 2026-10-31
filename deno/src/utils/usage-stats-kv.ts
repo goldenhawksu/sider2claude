@@ -48,18 +48,6 @@ const REASON_FIELD: Record<DeepSeekReason, string> = {
   routing: 'deepseekRouting',
 };
 
-/** 模型行里允许累加的字段，防止未知 key 混进聚合。 */
-const MODEL_FIELDS = new Set([
-  'requests',
-  'sider',
-  'deepseek',
-  'inputTokens',
-  'outputTokens',
-  'deepseekTools',
-  'deepseekFallback',
-  'deepseekRouting',
-]);
-
 /**
  * 趋势桶里允许累加的字段。
  *
@@ -86,7 +74,7 @@ const TREND_FIELDS = new Set([
 /**
  * 模型 × 小时的字段集。
  *
- * 比 MODEL_FIELDS 少一个 `sider`：它恒等于 `requests - deepseek`，存进去只是
+ * 不含 `sider`：它恒等于 `requests - deepseek`，存进去只是
  * 让每个模型每小时多占一个 key。这类 key 数量是「活跃模型 × 25 桶 × 字段数」，
  * 省一个字段就是省 25 × 模型数个 key，而 /stats 每次刷新都要扫它们。
  */

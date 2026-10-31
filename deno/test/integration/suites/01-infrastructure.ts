@@ -37,11 +37,14 @@ export const suite: Suite = {
       },
     },
     {
-      name: 'GET / 返回用量统计且结构完整',
+      name: 'GET / 不暴露用量，/stats.json 凭证访问返回完整结构',
       async run({ api }) {
-        const res = await api.get('/', {});
+        const root = await api.get('/', {});
+        assertStatus(root, 200);
+        assertTrue(!('usage' in (root.json ?? {})), '根路径不含 usage');
+        const res = await api.get('/stats.json');
         assertStatus(res, 200);
-        const usage = res.json?.usage;
+        const usage = res.json;
         assertTrue(!!usage, 'usage 字段存在');
         assertTrue(typeof usage.totals?.requests === 'number', 'totals.requests 是数字');
         assertTrue(typeof usage.backendShare?.sider === 'string', 'backendShare.sider 是字符串');
@@ -56,7 +59,7 @@ export const suite: Suite = {
     {
       name: '用量统计随真实请求增长并记录后端',
       async run({ api, config }) {
-        const before = (await api.get('/', {})).json.usage.totals.requests;
+        const before = (await api.get('/stats.json')).json.totals.requests;
 
         const chat = await api.post('/v1/messages', {
           model: config.liveModel,
@@ -70,10 +73,10 @@ export const suite: Suite = {
         // 发请求后立刻读经常还看不到计数增长。轮询等待，容忍异步落库的延迟——
         // 只有真等了 10 秒仍不增长才判失败（那才说明统计链路坏了）。
         const deadline = Date.now() + 10_000;
-        let usage = (await api.get('/', {})).json.usage;
+        let usage = (await api.get('/stats.json')).json;
         while (usage.totals.requests <= before && Date.now() < deadline) {
           await new Promise((resolve) => setTimeout(resolve, 500));
-          usage = (await api.get('/', {})).json.usage;
+          usage = (await api.get('/stats.json')).json;
         }
 
         assertTrue(
@@ -92,9 +95,17 @@ export const suite: Suite = {
       },
     },
     {
-      name: 'GET /stats 返回看板页面',
-      async run({ api }) {
-        const res = await api.get('/stats', {});
+      name: 'GET /stats 无凭证返回登录页，凭证访问返回看板页面',
+      async run({ api, config }) {
+        const anonymous = await fetch(`${config.baseUrl}/stats`, {
+          headers: { accept: 'text/html' },
+          signal: AbortSignal.timeout(config.timeoutMs),
+        });
+        const loginHtml = await anonymous.text();
+        assertEquals(anonymous.status, 401, '无凭证状态');
+        assertTrue(loginHtml.includes('/stats/login'), '无凭证时返回登录页');
+        assertTrue(!loginHtml.includes('最近请求'), '登录页不含看板内容');
+        const res = await api.get('/stats');
         assertStatus(res, 200);
         const html = res.text;
         assertTrue(html.startsWith('<!DOCTYPE html>'), '是 HTML 文档');
@@ -107,9 +118,11 @@ export const suite: Suite = {
       },
     },
     {
-      name: 'GET /stats.json 返回含趋势与模型的快照',
+      name: 'GET /stats.json 无凭证 401，凭证访问返回含趋势与模型的快照',
       async run({ api }) {
-        const res = await api.get('/stats.json', {});
+        const anonymous = await api.get('/stats.json', {});
+        assertStatus(anonymous, 401);
+        const res = await api.get('/stats.json');
         assertStatus(res, 200);
         const u = res.json;
         assertTrue(Array.isArray(u.trend) && u.trend.length === 24, 'trend 是 24 个小时桶');

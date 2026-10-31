@@ -9,9 +9,10 @@
     "check": "deno check deno/main.ts",
     "test": "S2C_DISABLE_DOTENV=true deno test --unstable-kv --allow-env --allow-read=deno,tools,deno.json deno/test",
     "test:e2e": "deno run --allow-net --allow-env --allow-read --allow-write deno/test/integration/run.ts",
-    "regression": "deno task test && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts && deno check deno/test/integration/run.ts",
+    "regression": "deno task test && deno task lint:src && deno check deno/main.ts && deno check deno/tools/probe-sider-capabilities.ts && deno check deno/test/integration/run.ts",
     "probe:sider": "deno run --allow-net --allow-env --allow-read --allow-write deno/tools/probe-sider-capabilities.ts",
     "lint": "deno lint deno/",
+    "lint:src": "deno lint deno/src deno/main.ts deno/serve.ts",
     "fmt": "deno fmt deno/"
   },
   "imports": {

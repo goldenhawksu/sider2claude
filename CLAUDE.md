@@ -97,6 +97,11 @@ deno task probe:sider
 
 ```env
 AUTH_TOKEN=your-client-token
+# ADMIN_TOKEN=管理凭证（/stats/strategy），不填回退 AUTH_TOKEN
+# STATS_TOKEN=只读看板凭证；STATS_PUBLIC=true 才公开看板
+# ALLOW_OPEN_AUTH=true 仅本地开发：未配 AUTH_TOKEN 时放行任意 ≥10 字符 token
+# SIDER_TOKEN_PASSTHROUGH=true 才把客户端 token 当 Sider 凭证
+# MAX_REQUEST_BODY_BYTES=33554432
 SIDER_AUTH_TOKEN=your-sider-jwt
 SIDER_API_URL=https://sider.ai/api/chat/v1/completions
 
@@ -585,7 +590,7 @@ probe 结论用于更新模型清单和路由策略，但临时 JSON 不应默�
 
 ## 用量统计
 
-`GET /` 的响应里带 `usage` 字段，回答"最近的调用由谁完成、比例多少、工具用了多少"：
+`GET /stats.json`（需要看板凭证，见「维护约束」）回答"最近的调用由谁完成、比例多少、工具用了多少"；`GET /` 不再携带 `usage`：
 
 - `totals`：真实上游调用数、sider/deepseek 各自次数、fallback 次数、流式次数、
   工具调用次数，以及 `cachedReplays`（命中重复响应缓存、未触达上游的请求，
@@ -846,3 +851,8 @@ npm run test:integration
 - Deno 与 Node/Bun 双运行时的核心逻辑要同步。
 - 修改路由、模型、DeepSeek adapter 时必须补测试。
 - `deno/.env` 只作为本地配置输入，不能提交（已被 .gitignore 覆盖）。
+- 鉴权默认失败关闭：未配置 `AUTH_TOKEN` 返回 503，开放模式只能由 `ALLOW_OPEN_AUTH=true` 显式开启；
+  看板 `/stats*` 需要凭证或登录 cookie，管理接口只认 `ADMIN_TOKEN`（回退 `AUTH_TOKEN`）。
+  `security-hardening` 两套测试守着这些边界，改鉴权或看板时先跑它们。
+- 文本工具调用只还原本次请求 `tools` 中声明过的工具名；未声明的保持文本（`textual_tool_use_undeclared_skipped`）。
+- 重复响应缓存键含调用方 token 与会话 ID（`replayScopeKey`），不要回退成只按正文哈希。

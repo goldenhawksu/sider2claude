@@ -19,6 +19,30 @@ export interface SiderSessionState {
 // 内存中的会话存储（生产环境可替换为Redis等）
 const siderSessionStore = new Map<string, SiderSessionState>();
 
+/** 上限与过期：会话按 Sider cid 持续增加，长驻进程不能无界增长。 */
+const MAX_SIDER_SESSIONS = 2000;
+const SIDER_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 60_000;
+let lastSweepAt = 0;
+
+/** 写入并维持「最近使用在后」的顺序；超出容量淘汰最久未用的，定期清掉过期项。 */
+function storeSession(cid: string, session: SiderSessionState): void {
+  siderSessionStore.delete(cid);
+  siderSessionStore.set(cid, session);
+  const now = session.lastActivity;
+  if (now - lastSweepAt >= SWEEP_INTERVAL_MS) {
+    lastSweepAt = now;
+    for (const [key, value] of siderSessionStore) {
+      if (now - value.lastActivity > SIDER_SESSION_TTL_MS) siderSessionStore.delete(key);
+    }
+  }
+  while (siderSessionStore.size > MAX_SIDER_SESSIONS) {
+    const oldest = siderSessionStore.keys().next().value;
+    if (oldest === undefined) break;
+    siderSessionStore.delete(oldest);
+  }
+}
+
 /**
  * 保存或更新 Sider 会话状态
  */
@@ -63,8 +87,8 @@ export function saveSiderSession(
     });
   }
   
-  // 保存到存储
-  siderSessionStore.set(cid, session);
+  // 保存到存储（带容量与过期控制）
+  storeSession(cid, session);
   
   return session;
 }
