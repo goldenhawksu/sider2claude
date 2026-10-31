@@ -2270,3 +2270,129 @@ Deno.test('主控部署期限：非流式上游超时返回400并要求改用流
     { DENO_DEPLOYMENT_ID: 'timeout-test', SIDER_TOTAL_TIMEOUT_MS: '50' },
   );
 });
+
+// ---------- 流式提交窗口：开流前的失败必须是真正的 HTTP 错误 ----------
+
+function quota1135() {
+  return new Response(
+    'data: ' +
+      JSON.stringify({
+        code: 1135,
+        msg:
+          "You've reached the current usage limit. This limit ensures fair use for all users. Please try again after 1 minutes.",
+        data: null,
+      }) + '\n\n',
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+}
+
+Deno.test('主控流式：上下文登记中撞1135时返回HTTP 429与Retry-After，客户端立即重试命中冷却也不再调用Sider', async () => {
+  const store = await getControllerStore();
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:gemini-3.8-flash`;
+  let calls = 0;
+  try {
+    await appWithMock((body) => {
+      calls++;
+      const text = body.multi_content[0].text as string;
+      const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+      // 复现生产日志：第1片确认成功，第2片撞额度。
+      if (part && part[1] === '1') return sse('已记住1/2', 'quota-cid', 'quota-parent-1', 'gemini-3.8-flash');
+      return quota1135();
+    }, async (app) => {
+      const request: AnthropicRequest = {
+        model: 'gemini-3.8-flash',
+        stream: true,
+        system: '多智能体协作的长背景设定。\n'.repeat(600),
+        messages: [{ role: 'user', content: '请回复Cognito的第一轮发言。' }],
+      };
+      const first = await send(app, request);
+      equal(first.status, 429);
+      equal(first.headers.get('retry-after'), '60');
+      equal((first.headers.get('content-type') ?? '').includes('application/json'), true);
+      const body = await first.json();
+      equal(body.type, 'error');
+      equal(body.error.type, 'rate_limit_error');
+      equal(calls, 2);
+
+      const retry = await send(app, request);
+      equal(retry.status, 429);
+      equal(Number(retry.headers.get('retry-after')) > 0, true);
+      equal(calls, 2);
+    });
+  } finally {
+    await store.write(key, 0, -1);
+  }
+});
+
+Deno.test('主控流式：提交窗口设为0时保持旧行为（200流内error事件）', async () => {
+  const store = await getControllerStore();
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:claude-haiku-5.5`;
+  try {
+    await appWithMock(() => quota1135(), async (app) => {
+      const response = await send(app, {
+        model: 'claude-haiku-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      });
+      equal(response.status, 200);
+      const text = await response.text();
+      equal(text.includes('event: message_start'), true);
+      equal(text.includes('event: error'), true);
+      equal(text.includes('rate_limit_error'), true);
+    }, { SIDER_CONTROLLER_STREAM_COMMIT_MS: '0' });
+  } finally {
+    await store.write(key, 0, -1);
+  }
+});
+
+Deno.test('主控流式：首个文本产出即提交SSE，成功回答不受提交窗口影响', async () => {
+  await appWithMock(
+    () => sse('流式正文已送达', 'commit-ok-cid', 'commit-ok-parent', 'claude-sonnet-5.5'),
+    async (app) => {
+      const response = await send(app, {
+        model: 'claude-sonnet-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      });
+      equal(response.status, 200);
+      equal((response.headers.get('content-type') ?? '').includes('text/event-stream'), true);
+      const text = await response.text();
+      equal(text.includes('流式正文已送达'), true);
+      equal(text.includes('event: message_stop'), true);
+    },
+  );
+});
+
+Deno.test('协议转换：429错误保留Retry-After并使用各协议的限流错误类型', async () => {
+  const previousSider = Deno.env.get('SIDER_AUTH_TOKEN');
+  Deno.env.set('SIDER_AUTH_TOKEN', 'protocol-error-test-token');
+  let protocolErrorResponse: typeof import('../src/routes/protocols.ts').protocolErrorResponse;
+  try {
+    ({ protocolErrorResponse } = await import('../src/routes/protocols.ts'));
+  } finally {
+    if (previousSider === undefined) Deno.env.delete('SIDER_AUTH_TOKEN');
+    else Deno.env.set('SIDER_AUTH_TOKEN', previousSider);
+  }
+  const upstream = () =>
+    Response.json(
+      { type: 'error', error: { type: 'rate_limit_error', message: 'Sider额度冷却中' } },
+      { status: 429, headers: { 'Retry-After': '60' } },
+    );
+  const openai = await protocolErrorResponse(upstream(), 'openai');
+  equal(openai.status, 429);
+  equal(openai.headers.get('retry-after'), '60');
+  const openaiBody = await openai.json();
+  equal(openaiBody.error.type, 'rate_limit_exceeded');
+  equal(openaiBody.error.message, 'Sider额度冷却中');
+
+  const gemini = await protocolErrorResponse(upstream(), 'gemini');
+  equal(gemini.status, 429);
+  equal(gemini.headers.get('retry-after'), '60');
+  equal((await gemini.json()).error.status, 'RESOURCE_EXHAUSTED');
+
+  const noRetry = await protocolErrorResponse(
+    Response.json({ error: { message: 'bad' } }, { status: 400 }),
+    'openai',
+  );
+  equal(noRetry.headers.get('retry-after'), null);
+});

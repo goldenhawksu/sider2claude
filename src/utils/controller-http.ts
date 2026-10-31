@@ -1,4 +1,5 @@
 import { recordSiderActivity } from './sider-activity.js';
+import { getEnv } from './env.js';
 import type { AnthropicRequest } from '../types/anthropic.js';
 import { ControllerError, runSiderController, type ControllerTextSink } from './sider-controller.js';
 import { SiderUpstreamError } from './sider-client.js';
@@ -23,6 +24,17 @@ function errorBody(error: unknown) {
     },
   };
 }
+/**
+ * 流式请求的提交窗口：首个内容产出前最多等待这么久才发出 HTTP 200 与 SSE 头。
+ * 窗口内失败（1135 限流、冷却、登记检查点）返回真正的 HTTP 错误与 Retry-After；
+ * 否则客户端只能在 200 的流里看到 error 事件，拿不到退避时长，会立即盲目重试。
+ * 设为 0 恢复旧行为（立即提交）。
+ */
+export function streamCommitWindowMs(): number {
+  const value = Number(getEnv('SIDER_CONTROLLER_STREAM_COMMIT_MS', '20000'));
+  return Number.isFinite(value) && value >= 0 ? value : 20000;
+}
+
 export async function controllerResponse(
   request: AnthropicRequest,
   token: string,
@@ -69,6 +81,21 @@ export async function controllerResponse(
   const encoder = new TextEncoder();
   let closed = false;
   let ping: ReturnType<typeof setInterval> | undefined;
+  // 首个内容产出（或完成、或窗口到期）才提交流；之前的失败改走 HTTP 错误。
+  let committed = false;
+  let decide!: (outcome: { kind: 'commit' } | { kind: 'error'; error: unknown }) => void;
+  const decision = new Promise<{ kind: 'commit' } | { kind: 'error'; error: unknown }>(
+    (resolve) => (decide = resolve),
+  );
+  const commit = () => {
+    if (committed) return;
+    committed = true;
+    decide({ kind: 'commit' });
+  };
+  const commitWindowMs = streamCommitWindowMs();
+  // 0 表示旧行为：立即提交，不进入延迟窗口。
+  if (commitWindowMs === 0) commit();
+  const commitTimer = commitWindowMs > 0 ? setTimeout(commit, commitWindowMs) : undefined;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (event: Record<string, unknown>) => {
@@ -102,6 +129,7 @@ export async function controllerResponse(
       const sink: ControllerTextSink = {
         onTextDelta(text: string) {
           if (!text || closed) return;
+          commit();
           if (!textStarted) {
             textStarted = true;
             send({
@@ -121,6 +149,7 @@ export async function controllerResponse(
       void (async () => {
         try {
           const response = await runSiderController(request, token, combined, session, sink);
+          commit();
           for (const [index, block] of response.content.entries()) {
             if (block.type === 'text' && textStarted) {
               // 文本已经实时下发过；最终文本更长时只补发尾部，避免重复。
@@ -188,6 +217,12 @@ export async function controllerResponse(
           recordSiderActivity(request.model, error instanceof ControllerError && error.statusCode === 429 &&
         /^上下文登记(?:进度|达到本次时限)/.test(error.message)
         ? { checkpointResponses: 1 } : { requestFailures: 1 });
+          if (!committed) {
+            // 还没提交流：交给外层返回带状态码与 Retry-After 的 HTTP 错误。
+            committed = true;
+            decide({ kind: 'error', error });
+            return;
+          }
           if (textStarted && !textClosed) {
             textClosed = true;
             send({ type: 'content_block_stop', index: 0 });
@@ -201,6 +236,7 @@ export async function controllerResponse(
           }
         } finally {
           clearInterval(ping);
+          clearTimeout(commitTimer);
           if (!closed) {
             closed = true;
             controller.close();
@@ -211,9 +247,32 @@ export async function controllerResponse(
     cancel() {
       closed = true;
       clearInterval(ping);
+      clearTimeout(commitTimer);
       abort.abort();
     },
   });
+  const outcome = await decision;
+  if (outcome.kind === 'error') {
+    const { error } = outcome;
+    const { status, body } = errorBody(error);
+    logWarn('controller_failed', {
+      requestId: context.requestId,
+      status,
+      stream: true,
+      committed: false,
+      message: body.error.message,
+    });
+    const retry = error instanceof ControllerError || error instanceof SiderUpstreamError
+      ? error.retryAfterMs
+      : undefined;
+    return Response.json(body, {
+      status,
+      headers: {
+        ...headers,
+        ...(status === 429 ? { 'Retry-After': String(Math.ceil((retry ?? 1000) / 1000)) } : {}),
+      },
+    });
+  }
   return new Response(stream, {
     headers: {
       ...headers,

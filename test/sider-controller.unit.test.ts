@@ -739,3 +739,41 @@ test('Bun 路由：提供方工具走 DeepSeek，续轮不被 Sider 记录带回
   expect(decision.ruleId).toBe('rule_4_provider_tools');
   expect(decision.allowFallback).toBe(false);
 });
+
+test('Bun主控流式：开流前撞1135返回HTTP 429与Retry-After；提交窗口为0保持旧行为', async () => {
+  const original = globalThis.fetch;
+  const keys = ['SIDER_AUTH_TOKEN', 'SIDER_CONTROLLER_STORAGE', 'SIDER_CONTROLLER_PACE_MS', 'SIDER_CONTROLLER_STREAM_COMMIT_MS'];
+  const previous = keys.map((key) => process.env[key]);
+  const quota = () => new Response(
+    'data: ' + JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.', data: null }) + '\n\n',
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+  try {
+    process.env.SIDER_CONTROLLER_STORAGE = 'memory';
+    process.env.SIDER_CONTROLLER_PACE_MS = '0';
+    globalThis.fetch = (async () => quota()) as unknown as typeof fetch;
+
+    process.env.SIDER_AUTH_TOKEN = `bun-stream-commit-${crypto.randomUUID()}`;
+    delete process.env.SIDER_CONTROLLER_STREAM_COMMIT_MS;
+    const request: AnthropicRequest = { model: 'claude-haiku-5.5', stream: true,
+      messages: [{ role: 'user', content: crypto.randomUUID() }] };
+    const deferred = await controllerResponse(request, crypto.randomUUID(), createRequestLogContext(request));
+    expect(deferred.status).toBe(429);
+    expect(deferred.headers.get('retry-after')).toBe('60');
+    expect((await deferred.json()).error.type).toBe('rate_limit_error');
+
+    process.env.SIDER_AUTH_TOKEN = `bun-stream-commit-${crypto.randomUUID()}`;
+    process.env.SIDER_CONTROLLER_STREAM_COMMIT_MS = '0';
+    const legacy = await controllerResponse(request, crypto.randomUUID(), createRequestLogContext(request));
+    expect(legacy.status).toBe(200);
+    const text = await legacy.text();
+    expect(text).toContain('event: error');
+    expect(text).toContain('rate_limit_error');
+  } finally {
+    globalThis.fetch = original;
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+  }
+});
