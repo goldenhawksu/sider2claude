@@ -1,5 +1,6 @@
 /// <reference lib="deno.unstable" />
 import { getEnv } from './env.ts';
+import { resolveKvPath } from './kv-path.ts';
 import { ControllerMemoryStore, type ControllerStore } from './controller-memory-store.ts';
 
 /** 任务数据必须等待落库；KV失败直接报错，禁止静默丢失主控状态。 */
@@ -47,9 +48,11 @@ export function getControllerStore(): Promise<ControllerStore> {
 }
 
 async function openControllerKv(): Promise<Deno.Kv> {
-  const configured = getEnv('SIDER_CONTROLLER_KV_PATH');
-  const path = configured ||
-    (getEnv('DENO_DEPLOYMENT_ID') ? undefined : '.runtime/controller.sqlite');
+  const path = resolveKvPath(
+    getEnv('SIDER_CONTROLLER_KV_PATH'),
+    '.runtime/controller.sqlite',
+    'SIDER_CONTROLLER_KV_PATH',
+  );
   if (path?.startsWith('.runtime/')) {
     await Deno.mkdir('.runtime', { recursive: true });
   }

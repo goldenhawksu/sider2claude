@@ -28,6 +28,7 @@
 // 运行时需要 --unstable-kv 标志（deno.json 的任务里已加；
 // Deno Deploy 平台默认开放 unstable API）。
 
+import { resolveKvPath } from './kv-path.ts';
 import type { Backend } from '../config/backends.ts';
 import { getEnv } from './env.ts';
 import type { DeepSeekReason, UsageRecord } from './usage-stats.ts';
@@ -103,9 +104,7 @@ export function getKv(): Promise<Deno.Kv | null> {
       try {
         const mode = getEnv('STATS_KV').toLowerCase();
         if (!mode) return null; // 未显式启用：完全跳过，行为同纯进程内
-        const configuredPath = getEnv('STATS_KV_PATH');
-        const path = configuredPath ||
-          (getEnv('DENO_DEPLOYMENT_ID') ? undefined : '.runtime/stats.sqlite');
+        const path = resolveKvPath(getEnv('STATS_KV_PATH'), '.runtime/stats.sqlite', 'STATS_KV_PATH');
         if (mode === 'kv' && path?.startsWith('.runtime/')) {
           await Deno.mkdir('.runtime', { recursive: true });
         }
