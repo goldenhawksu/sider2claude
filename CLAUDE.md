@@ -29,6 +29,7 @@ Sider2Claude 是 Anthropic Messages API 兼容代理，目标是让 Claude Code 
 - 入口是两套 `utils/sider-controller.ts` 和 `controller-http.ts`；Deno KV、Bun SQLite 保存任务、父消息、工具关联、正文引用和账号租约。参数不能靠宽松 JSON 修补；完整工具结果必须续轮回到同一 Sider 会话。
 - 并发额度实测按模型隔离（2026-10-24 直连 probe：同模型两路并发必有一路 1101，sonnet+haiku 三轮全部并行；250ms 间隔连续 12 次无 1101/1135）。账号池由 `SIDER_AUTH_TOKEN` 与 `SIDER_AUTH_TOKEN_1..8` 提供，最多 8 个，并按 JWT `user_id` 归并——同一账号的多个 token 并发仍会 1101，只能算一个账号。租约键 `account:<账号键>:<model>`。任务写入 `account` 后必须由同一账号续轮，只有尚未建立 `cid` 的新任务可换账号；账号被移除时返回 503，不能改投；旧版按 token 哈希写下的绑定会自动迁移。
 - 主控 SSE 在**无工具且无 `stop_sequences`** 时把 Sider 文本增量实时转发（`ControllerTextSink`，`controller-http` 统一收口块生命周期）；带工具时仍整段缓冲后还原，防止文本调用行泄漏；带 `stop_sequences` 时也缓冲，服务端才能正确截断。已流出的内容不能撤回，因此一旦吐字就不再走连接重试；错误发生时先关闭已打开的文本块再发 `error`。
+- 主控流式请求在首个内容产出前不提交 HTTP 头（提交窗口默认 20 秒，`SIDER_CONTROLLER_STREAM_COMMIT_MS`，0 为立即提交）。窗口内的失败（1135、冷却、登记检查点）返回真正的 HTTP 错误并带 `Retry-After`；否则客户端只能在 200 流里看到 `error` 事件，拿不到退避时长，会 1 秒后盲目重试。OpenAI／Gemini 协议层经 `protocolErrorResponse` 保留状态码与 `Retry-After`。
 - 部署环境的非流式主控请求总期限约 70 秒（流式默认 600 秒）。超时返回 400 并要求改用 `stream=true`，不能返回会诱发重试的 502；上下文登记进度类 429 与真实上游错误原样保留。长 Write 等耗时任务应使用流式。
 - Opus 5.5 和 Sonnet 5.5 已实测工具契约、多轮失败恢复、长 Write 及 StoreContent→WriteFromRef。旧版 Opus 的历史额度数据不能作为硬排除 Opus 5.5 的依据。推理事件存在不等于 Anthropic thinking 预算参数已被兑现。
 - 真实 Claude Code 2.1.195 使用 JSON Schema 2020-12，校验器必须支持该方言。模型“已完成”自述不算验收；文件复制必须检查实际 Write 成功反馈、文件存在、JSON 项数和字节完整性。

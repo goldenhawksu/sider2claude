@@ -2331,7 +2331,8 @@ for (const scenario of ['恢复', '期限不足', '再次限流', '执行前限�
           equal(failed?.choices, []);
           equal(chunks, scenario === '再次限流' ? [1, 2, 2] : [1, 2]);
         }
-      }, { SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', SIDER_TOTAL_TIMEOUT_MS: '1000' });
+      }, { SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', SIDER_TOTAL_TIMEOUT_MS: '1000',
+        SIDER_CONTROLLER_STREAM_COMMIT_MS: '0' });
     } finally {
       await store?.write(cooldownKey, 0, -1);
     }
@@ -2399,5 +2400,213 @@ Deno.test('主控OpenAI流式：客户端取消时中止上游请求', async () 
     } finally {
       abort.abort();
     }
-  });
+  }, { SIDER_CONTROLLER_STREAM_COMMIT_MS: '0' });
+});
+
+// ---------- 流式提交窗口：开流前的失败必须是真正的 HTTP 错误 ----------
+
+function quota1135() {
+  return new Response(
+    'data: ' +
+      JSON.stringify({
+        code: 1135,
+        msg:
+          "You've reached the current usage limit. This limit ensures fair use for all users. Please try again after 1 minutes.",
+        data: null,
+      }) + '\n\n',
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+}
+
+Deno.test('主控流式：上下文登记中撞1135时返回HTTP 429与Retry-After，客户端立即重试命中冷却也不再调用Sider', async () => {
+  const store = await getControllerStore();
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:gemini-3.8-flash`;
+  let calls = 0;
+  try {
+    await appWithMock((body) => {
+      calls++;
+      const text = body.multi_content[0].text as string;
+      const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+      // 复现生产日志：第1片确认成功，第2片撞额度。
+      if (part && part[1] === '1') return sse('已记住1/2', 'quota-cid', 'quota-parent-1', 'gemini-3.8-flash');
+      return quota1135();
+    }, async (app) => {
+      const request: AnthropicRequest = {
+        model: 'gemini-3.8-flash',
+        stream: true,
+        system: '多智能体协作的长背景设定。\n'.repeat(600),
+        messages: [{ role: 'user', content: '请回复Cognito的第一轮发言。' }],
+      };
+      const first = await send(app, request);
+      equal(first.status, 429);
+      equal(first.headers.get('retry-after'), '60');
+      equal((first.headers.get('content-type') ?? '').includes('application/json'), true);
+      const body = await first.json();
+      equal(body.type, 'error');
+      equal(body.error.type, 'rate_limit_error');
+      equal(calls, 2);
+
+      const retry = await send(app, request);
+      equal(retry.status, 429);
+      equal(Number(retry.headers.get('retry-after')) > 0, true);
+      equal(calls, 2);
+    }, { SIDER_TOTAL_TIMEOUT_MS: '1000' });
+  } finally {
+    await store.write(key, 0, -1);
+  }
+});
+
+Deno.test('主控流式：提交窗口设为0时保持旧行为（200流内error事件）', async () => {
+  const store = await getControllerStore();
+  const key = `cooldown:${await siderAccountId('controller-sider-token')}:claude-haiku-5.5`;
+  try {
+    await appWithMock(() => quota1135(), async (app) => {
+      const response = await send(app, {
+        model: 'claude-haiku-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      });
+      equal(response.status, 200);
+      const text = await response.text();
+      equal(text.includes('event: message_start'), true);
+      equal(text.includes('event: error'), true);
+      equal(text.includes('rate_limit_error'), true);
+    }, { SIDER_CONTROLLER_STREAM_COMMIT_MS: '0' });
+  } finally {
+    await store.write(key, 0, -1);
+  }
+});
+
+Deno.test('主控流式：首个文本产出即提交SSE，成功回答不受提交窗口影响', async () => {
+  await appWithMock(
+    () => sse('流式正文已送达', 'commit-ok-cid', 'commit-ok-parent', 'claude-sonnet-5.5'),
+    async (app) => {
+      const response = await send(app, {
+        model: 'claude-sonnet-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      });
+      equal(response.status, 200);
+      equal((response.headers.get('content-type') ?? '').includes('text/event-stream'), true);
+      const text = await response.text();
+      equal(text.includes('流式正文已送达'), true);
+      equal(text.includes('event: message_stop'), true);
+    },
+  );
+});
+
+Deno.test('协议转换：429错误保留Retry-After并使用各协议的限流错误类型', async () => {
+  const previousSider = Deno.env.get('SIDER_AUTH_TOKEN');
+  Deno.env.set('SIDER_AUTH_TOKEN', 'protocol-error-test-token');
+  let protocolErrorResponse: typeof import('../src/routes/protocols.ts').protocolErrorResponse;
+  try {
+    ({ protocolErrorResponse } = await import('../src/routes/protocols.ts'));
+  } finally {
+    if (previousSider === undefined) Deno.env.delete('SIDER_AUTH_TOKEN');
+    else Deno.env.set('SIDER_AUTH_TOKEN', previousSider);
+  }
+  const upstream = () =>
+    Response.json(
+      { type: 'error', error: { type: 'rate_limit_error', message: 'Sider额度冷却中' } },
+      { status: 429, headers: { 'Retry-After': '60' } },
+    );
+  const openai = await protocolErrorResponse(upstream(), 'openai');
+  equal(openai.status, 429);
+  equal(openai.headers.get('retry-after'), '60');
+  const openaiBody = await openai.json();
+  equal(openaiBody.error.type, 'rate_limit_exceeded');
+  equal(openaiBody.error.message, 'Sider额度冷却中');
+
+  const gemini = await protocolErrorResponse(upstream(), 'gemini');
+  equal(gemini.status, 429);
+  equal(gemini.headers.get('retry-after'), '60');
+  equal((await gemini.json()).error.status, 'RESOURCE_EXHAUSTED');
+
+  const noRetry = await protocolErrorResponse(
+    Response.json({ error: { message: 'bad' } }, { status: 400 }),
+    'openai',
+  );
+  equal(noRetry.headers.get('retry-after'), null);
+});
+
+Deno.test('协议提交窗口：三种流式接口在开流前返回各自格式的HTTP 429', async () => {
+  const model = 'claude-haiku-5.5';
+  let store: Awaited<ReturnType<typeof getControllerStore>> | undefined;
+  try {
+    await appWithMock(() => quota1135(), async () => {
+      store = await getControllerStore();
+      const { default: server } = await import(`../main.ts?review-cors=${crypto.randomUUID()}`);
+      const cases = [
+        ['/v1/chat/completions', { model, stream: true, messages: [{ role: 'user', content: '审查限流' }] }],
+        ['/v1/responses', { model, stream: true, input: '审查限流' }],
+        [`/v1beta/models/${model}:streamGenerateContent`,
+          { contents: [{ role: 'user', parts: [{ text: '审查限流' }] }] }],
+      ] as const;
+      for (const [path, body] of cases) {
+        const response = await server.fetch(new Request(`http://local${path}`, {
+          method: 'POST', headers: { ...headers, Origin: 'https://review-client.invalid' },
+          body: JSON.stringify(body),
+        }));
+        equal(response.status, 429);
+        equal(response.headers.get('access-control-expose-headers')?.toLowerCase().includes('retry-after'), true);
+        equal(Number(response.headers.get('retry-after')) > 0, true);
+        equal(response.headers.get('content-type')?.includes('application/json'), true);
+        const error = (await response.json()).error;
+        equal(path.includes('v1beta') ? error.status : error.code,
+          path.includes('v1beta') ? 'RESOURCE_EXHAUSTED' : 'rate_limit_exceeded');
+      }
+    }, { SIDER_AUTH_TOKEN: 'commit-protocol-review-token' });
+  } finally {
+    await store?.write(`cooldown:${await siderAccountId('commit-protocol-review-token')}:${model}`, 0, -1);
+  }
+});
+
+Deno.test('主控提交窗口：窗口到期先返回流，正文随后正常输出', async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    await appWithMock((_body, init) => new Promise<Response>((resolve, reject) => {
+      pending.then(() => resolve(sse('窗口后的正文')));
+      init!.signal!.addEventListener('abort', () => reject(init!.signal!.reason), { once: true });
+    }), async (app) => {
+      const response = await send(app, { model: 'claude-opus-5.5', stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }] });
+      equal(response.status, 200);
+      release();
+      equal((await response.text()).includes('窗口后的正文'), true);
+    }, { SIDER_CONTROLLER_STREAM_COMMIT_MS: '30', SIDER_TOTAL_TIMEOUT_MS: '1000' });
+  } finally {
+    release();
+  }
+});
+
+Deno.test('协议提交窗口：收到响应头前取消请求也会中止上游', async () => {
+  let started!: () => void;
+  const pending = new Promise<void>((resolve) => { started = resolve; });
+  const abort = new AbortController();
+  let aborted = false;
+  await appWithMock((_body, init) => new Promise<Response>((_resolve, reject) => {
+    init!.signal!.addEventListener('abort', () => {
+      aborted = true;
+      reject(init!.signal!.reason);
+    }, { once: true });
+    started();
+  }), async (app) => {
+    const { default: protocolRouter } = await import('../src/routes/protocols.ts');
+    app.route('/', protocolRouter);
+    const response = app.request('/v1/chat/completions', {
+      method: 'POST', headers, signal: abort.signal, body: JSON.stringify({
+        model: 'claude-sonnet-5.5', stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      }),
+    });
+    try {
+      await pending;
+      abort.abort(new Error('审查请求取消'));
+      equal((await response).status, 502);
+      equal(aborted, true);
+    } finally {
+      abort.abort();
+    }
+  }, { SIDER_TOTAL_TIMEOUT_MS: '1000' });
 });

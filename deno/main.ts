@@ -73,6 +73,7 @@ app.use(
       'X-Request-ID',
       'X-Backend-Used',
       'X-Routing-Rule',
+      'Retry-After',
     ],
   }),
 );

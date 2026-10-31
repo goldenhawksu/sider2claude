@@ -143,10 +143,7 @@ async function mapJsonResponse(
   errorFormat: 'openai' | 'gemini',
 ): Promise<Response> {
   if (!response.ok) {
-    const message = await extractErrorMessage(response);
-    return errorFormat === 'openai'
-      ? openAIError(message, response.status)
-      : geminiError(message, response.status);
+    return await protocolErrorResponse(response, errorFormat);
   }
 
   const anthropic = await response.json() as AnthropicResponse;
@@ -174,29 +171,55 @@ async function extractErrorMessage(response: Response): Promise<string> {
   }
 }
 
-function openAIError(error: unknown, status: number): Response {
+function openAIError(error: unknown, status: number, headers?: HeadersInit): Response {
   const message = error instanceof Error ? error.message : String(error);
   return Response.json({
     error: {
       message,
-      type: status === 401 ? 'authentication_error' : 'api_error',
-      code: null,
+      type: status === 401
+        ? 'authentication_error'
+        : status === 429
+        ? 'rate_limit_exceeded'
+        : 'api_error',
+      code: status === 429 ? 'rate_limit_exceeded' : null,
     },
-  }, { status });
+  }, { status, headers: headers ?? {} });
 }
 
-function geminiError(message: string, status: number): Response {
+/**
+ * 把 Anthropic 形状的错误响应转换成目标协议的错误，保留状态码与 Retry-After。
+ * 流式请求在开流前失败时（主控提交窗口内的 1135、冷却等）也走这里。
+ */
+export async function protocolErrorResponse(
+  response: Response,
+  format: 'openai' | 'gemini',
+): Promise<Response> {
+  const message = await extractErrorMessage(response);
+  return format === 'openai'
+    ? openAIError(message, response.status, retryHeaders(response))
+    : geminiError(message, response.status, retryHeaders(response));
+}
+
+/** 上游 429 的退避时长必须跟着协议转换一起带给客户端，否则 SDK 会盲目重试。 */
+function retryHeaders(response: Response): HeadersInit | undefined {
+  const retryAfter = response.headers.get('retry-after');
+  return retryAfter ? { 'Retry-After': retryAfter } : undefined;
+}
+
+function geminiError(message: string, status: number, headers?: HeadersInit): Response {
   return Response.json({
     error: {
       code: status,
       message,
       status: status === 401
         ? 'UNAUTHENTICATED'
+        : status === 429
+        ? 'RESOURCE_EXHAUSTED'
         : status === 404
         ? 'NOT_FOUND'
         : 'INVALID_ARGUMENT',
     },
-  }, { status });
+  }, { status, headers: headers ?? {} });
 }
 
 function toGeminiModel(model: ModelInfo): Record<string, unknown> {
@@ -211,11 +234,15 @@ function toGeminiModel(model: ModelInfo): Record<string, unknown> {
   };
 }
 
-function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Response {
+function mapAnthropicStreamToOpenAIChat(
+  response: Response,
+  model: string,
+): Response | Promise<Response> {
   const id = `chatcmpl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const created = Math.floor(Date.now() / 1000);
 
   return mapAnthropicSse(response, {
+    errorFormat: 'openai',
     onEvent(event, send) {
       if (event.type === 'message_start') {
         send({
@@ -295,12 +322,16 @@ function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Resp
   });
 }
 
-function mapAnthropicStreamToOpenAIResponses(response: Response, model: string): Response {
+function mapAnthropicStreamToOpenAIResponses(
+  response: Response,
+  model: string,
+): Response | Promise<Response> {
   const id = `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const createdAt = Math.floor(Date.now() / 1000);
   let text = '';
 
   return mapAnthropicSse(response, {
+    errorFormat: 'openai',
     eventPrefix: true,
     onStart(send) {
       send({
@@ -366,8 +397,9 @@ function mapAnthropicStreamToOpenAIResponses(response: Response, model: string):
   });
 }
 
-function mapAnthropicStreamToGemini(response: Response): Response {
+function mapAnthropicStreamToGemini(response: Response): Response | Promise<Response> {
   return mapAnthropicSse(response, {
+    errorFormat: 'gemini',
     onEvent(event, send) {
       const delta = event.delta as { type?: string; text?: string } | undefined;
       if (event.type === 'content_block_delta' && delta?.type === 'text_delta' && delta.text) {
@@ -398,7 +430,13 @@ function mapAnthropicStreamToGemini(response: Response): Response {
       // 只收到一个空流 + [DONE]，无法得知限流或故障。
       if (event.type === 'error') {
         const err = event.error as { message?: string } | undefined;
-        send({ error: { code: 429, message: err?.message ?? 'upstream error', status: 'RESOURCE_EXHAUSTED' } });
+        send({
+          error: {
+            code: 429,
+            message: err?.message ?? 'upstream error',
+            status: 'RESOURCE_EXHAUSTED',
+          },
+        });
       }
     },
   });
@@ -406,16 +444,15 @@ function mapAnthropicStreamToGemini(response: Response): Response {
 
 interface SseMapper {
   eventPrefix?: boolean;
+  /** 流尚未开始就失败时（HTTP 非 2xx），按目标协议的错误格式返回。 */
+  errorFormat: 'openai' | 'gemini';
   onStart?: (send: (event: unknown, name?: string) => void) => void;
   onEvent: (event: Record<string, unknown>, send: (event: unknown, name?: string) => void) => void;
 }
 
-function mapAnthropicSse(response: Response, mapper: SseMapper): Response {
+function mapAnthropicSse(response: Response, mapper: SseMapper): Response | Promise<Response> {
   if (!response.ok || !response.body) {
-    return new Response(response.body, {
-      status: response.status,
-      headers: response.headers,
-    });
+    return protocolErrorResponse(response, mapper.errorFormat);
   }
 
   const encoder = new TextEncoder();
