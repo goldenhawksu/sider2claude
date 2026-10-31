@@ -115,11 +115,36 @@ async function runTestFile(file: string): Promise<FileResult> {
       TEST_API_BASE_URL: config.apiBaseUrl,
       TEST_AUTH_TOKEN: config.authToken,
     },
-    stdout: 'inherit',
-    stderr: 'inherit',
+    stdout: 'pipe',
+    stderr: 'pipe',
   });
 
+  // 原样转发输出，同时保留尾部，失败时写成 GitHub Actions 注解：
+  // 公开仓库的日志需要登录才能看，注解却能通过 API 读取，便于远程排查。
+  // 注解内容经 GitHub 的 secret 打码，生产地址与 token 不会明文出现。
+  const tail: string[] = [];
+  const pump = async (stream: ReadableStream<Uint8Array>, sink: NodeJS.WriteStream) => {
+    const decoder = new TextDecoder();
+    for await (const chunk of stream) {
+      const text = decoder.decode(chunk, { stream: true });
+      sink.write(text);
+      tail.push(...text.split('\n').filter((line) => line.trim()));
+      if (tail.length > 200) tail.splice(0, tail.length - 200);
+    }
+  };
+  await Promise.all([pump(subprocess.stdout, process.stdout), pump(subprocess.stderr, process.stderr)]);
+
   const exitCode = await subprocess.exited;
+  if (exitCode !== 0 && process.env.GITHUB_ACTIONS === 'true') {
+    const interesting = tail.filter((line) => /❌|⚠️|error|Error|失败|HTTP \d{3}/.test(line)).slice(-12);
+    const message = (interesting.length ? interesting : tail.slice(-12))
+      .map((line) => line.slice(0, 300))
+      .join('\n')
+      .replace(/%/g, '%25')
+      .replace(/\r/g, '')
+      .replace(/\n/g, '%0A');
+    console.log(`::error title=${basename(file)} exit ${exitCode}::${message}`);
+  }
   return {
     file,
     passed: exitCode === 0,
