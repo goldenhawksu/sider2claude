@@ -15,11 +15,17 @@ function errorBody(error: unknown) {
     : status === 400 || status === 409
     ? 'invalid_request_error'
     : 'api_error';
+  const retry = error instanceof ControllerError || error instanceof SiderUpstreamError
+    ? error.retryAfterMs
+    : undefined;
   return {
     status,
     body: {
       type: 'error',
-      error: { type, message: error instanceof Error ? error.message : '主控请求失败' },
+      error: {
+        type, message: error instanceof Error ? error.message : '主控请求失败',
+        ...(status === 429 ? { retry_after: Math.ceil((retry ?? 1000) / 1000) } : {}),
+      },
     },
   };
 }

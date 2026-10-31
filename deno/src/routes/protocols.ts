@@ -125,6 +125,7 @@ async function dispatchAnthropic(c: Context, request: AnthropicRequest): Promise
       method: 'POST',
       headers,
       body: JSON.stringify(request),
+      signal: c.req.raw.signal,
     }),
   );
 }
@@ -277,14 +278,17 @@ function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Resp
       // 上游失败在 Anthropic 流里是 error 事件；丢弃它会让 OpenAI 客户端
       // 只收到空 chunk 流 + [DONE]，无法得知限流或故障。
       if (event.type === 'error') {
-        const err = event.error as { message?: string } | undefined;
+        const err = event.error as { type?: string; message?: string; retry_after?: number } | undefined;
         send({
           id,
           object: 'chat.completion.chunk',
           created,
           model,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          error: { type: 'upstream_error', message: err?.message ?? 'upstream error' },
+          choices: [],
+          error: {
+            type: err?.type ?? 'upstream_error', message: err?.message ?? 'upstream error',
+            ...(err?.retry_after !== undefined ? { retry_after: err.retry_after } : {}),
+          },
         });
       }
     },
@@ -416,10 +420,13 @@ function mapAnthropicSse(response: Response, mapper: SseMapper): Response {
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
+  const reader = response.body.getReader();
 
   const stream = new ReadableStream({
+    cancel() {
+      return reader.cancel();
+    },
     async start(controller) {
-      const reader = response.body!.getReader();
       const send = (event: unknown, name?: string) => {
         if (mapper.eventPrefix && name) {
           controller.enqueue(encoder.encode(`event: ${name}\n`));
@@ -428,6 +435,11 @@ function mapAnthropicSse(response: Response, mapper: SseMapper): Response {
       };
 
       mapper.onStart?.(send);
+      // 冷却等待期间保留 SSE 心跳，避免协议转换后客户端误判连接空闲。
+      const onEvent = (event: Record<string, unknown>) => {
+        if (event.type === 'ping') controller.enqueue(encoder.encode(': ping\n\n'));
+        else mapper.onEvent(event, send);
+      };
 
       let buffer = '';
       try {
@@ -435,11 +447,11 @@ function mapAnthropicSse(response: Response, mapper: SseMapper): Response {
           const { value, done } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
-          buffer = processSseBuffer(buffer, (event) => mapper.onEvent(event, send));
+          buffer = processSseBuffer(buffer, onEvent);
         }
 
         if (buffer.trim()) {
-          processSseBlock(buffer, (event) => mapper.onEvent(event, send));
+          processSseBlock(buffer, onEvent);
         }
 
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));

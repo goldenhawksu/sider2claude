@@ -739,3 +739,82 @@ test('Bun 路由：提供方工具走 DeepSeek，续轮不被 Sider 记录带回
   expect(decision.ruleId).toBe('rule_4_provider_tools');
   expect(decision.allowFallback).toBe(false);
 });
+
+for (const scenario of ['恢复', '期限不足', '再次限流', '执行前限流']) {
+  test(`Bun主控OpenAI流式上传：1135${scenario}`, async () => {
+    const recover = scenario === '恢复' || scenario === '执行前限流';
+    const quotaWaitMs = scenario === '期限不足' ? 60_000 : 40;
+    const keys = ['AUTH_TOKEN', 'SIDER_AUTH_TOKEN', 'SIDER_CONTROLLER', 'SIDER_CONTROLLER_STORAGE',
+      'SIDER_CONTROLLER_PACE_MS', 'SIDER_CONTROLLER_MAX_INPUT_CHARS', 'SIDER_TOTAL_TIMEOUT_MS'];
+    const values = ['quota-client', 'quota-bun-token', 'true', 'memory', '0', '3000', '1000'];
+    const previous = keys.map((key) => process.env[key]);
+    keys.forEach((key, index) => { process.env[key] = values[index]; });
+    const original = globalThis.fetch;
+    const store = await getControllerStore();
+    const model = 'gemini-3.8-flash';
+    const cooldownKey = `cooldown:${await siderAccountId('quota-bun-token')}:${model}`;
+    const chunks: number[] = [];
+    let retries = 0, limitedAt = 0;
+    try {
+      const { SiderUpstreamError } = await import('../src/utils/sider-client');
+      const { default: protocolRouter } = await import('../src/routes/protocols');
+      globalThis.fetch = ((_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        const part = body.multi_content[0].text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+        let reply = '上传恢复后真实回答';
+        if (!part && scenario === '执行前限流' && retries++ === 0) {
+          limitedAt = Date.now();
+          throw new SiderUpstreamError('登记后执行前达到额度', 1135, 429, '', quotaWaitMs);
+        }
+        if (part) {
+          const index = Number(part[1]);
+          chunks.push(index);
+          if (index === 2 && scenario !== '执行前限流') {
+            expect(body.cid).toBe('quota-bun-cid');
+            expect(body.parent_message_id).toBe('quota-parent-1');
+            if (retries++ === 0 || scenario === '再次限流') {
+              limitedAt = Date.now();
+              throw new SiderUpstreamError('上传时达到模型额度', 1135, 429, '', quotaWaitMs);
+            }
+            expect(Date.now() - limitedAt).toBeGreaterThanOrEqual(30);
+          }
+          reply = `已记住${index}/${part[2]}`;
+        }
+        return Promise.resolve(new Response([
+          { code: 0, msg: 'ok', data: { type: 'message_start', model,
+            message_start: { cid: 'quota-bun-cid', user_message_id: 'u', assistant_message_id: `quota-parent-${part?.[1] ?? 'answer'}` } } },
+          { code: 0, msg: 'ok', data: { type: 'text', model, text: reply } },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+          { headers: { 'content-type': 'text/event-stream' } }));
+      }) as typeof fetch;
+      const response = await protocolRouter.request('/v1/chat/completions', {
+        method: 'POST', headers: { 'x-api-key': 'quota-client', 'content-type': 'application/json' },
+        body: JSON.stringify({ model, stream: true, messages: [
+          { role: 'system', content: '完整规范。'.repeat(1600) },
+          { role: 'user', content: crypto.randomUUID() },
+        ] }),
+      });
+      const text = await response.text();
+      const events = text.split('\n').filter((line) => line.startsWith('data: {')).map((line) => JSON.parse(line.slice(6)));
+      if (recover) {
+        expect(events.some((event) => event.error)).toBe(false);
+        expect(text).toContain('上传恢复后真实回答');
+        expect(chunks.filter((index) => index === 1)).toHaveLength(1);
+        expect(chunks.filter((index) => index === 2)).toHaveLength(scenario === '执行前限流' ? 1 : 2);
+      } else {
+        const failed = events.find((event) => event.error);
+        expect(failed.error.type).toBe('rate_limit_error');
+        expect(failed.error.retry_after).toBe(Math.ceil(quotaWaitMs / 1000));
+        expect(failed.choices).toEqual([]);
+        expect(chunks).toEqual(scenario === '再次限流' ? [1, 2, 2] : [1, 2]);
+      }
+    } finally {
+      globalThis.fetch = original;
+      await store.write(cooldownKey, 0, -1);
+      keys.forEach((key, index) => {
+        if (previous[index] === undefined) delete process.env[key];
+        else process.env[key] = previous[index];
+      });
+    }
+  });
+}

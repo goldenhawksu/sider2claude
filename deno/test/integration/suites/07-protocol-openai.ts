@@ -17,6 +17,26 @@ export const suite: Suite = {
   id: '07',
   title: 'OpenAI 协议兼容',
   cases: [
+    ...(Deno.env.get('E2E_CONTROLLER') === 'true' ? [{
+      name: 'Gemini长system：OpenAI流式完整登记后直接回答',
+      async run({ api }: import('../harness.ts').TestContext) {
+        const marker = `GEMINI-CONTEXT-${crypto.randomUUID()}`;
+        const system = 'Reference context: keep all project instructions for the next task.\n'.repeat(150) +
+          `\n项目唯一代号：${marker}。用户查询代号时，只回答该代号。`;
+        const response = await api.sse('/v1/chat/completions', {
+          model: 'gemini-3.8-flash', stream: true, max_tokens: 128,
+          messages: [{ role: 'system', content: system },
+            { role: 'user', content: '项目唯一代号是什么？只回答代号。' }],
+        });
+        assertEquals(response.status, 200, 'HTTP 状态');
+        const failed = response.events.find((event) => event.error);
+        assertTrue(!failed, `流式错误：${JSON.stringify(failed?.error)}`);
+        const text = response.events.map((event) => event.choices?.[0]?.delta?.content ?? '').join('');
+        assertIncludes(text, marker, '完整system末尾的代号');
+        assertTrue(response.raw.includes('[DONE]'), '流完整结束');
+        return `gemini-3.8-flash 的${system.length}字符system通过分片登记，OpenAI流式返回真实代号`;
+      },
+    }] : []),
     {
       name: 'POST /v1/chat/completions 非流式',
       async run({ api, config }) {

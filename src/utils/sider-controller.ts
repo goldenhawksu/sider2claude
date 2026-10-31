@@ -655,8 +655,19 @@ async function runSiderControllerOnce(
           task.account = primary.id;
         }
       }
+      let quotaWaited = false;
+      // 上下文已登记的流式任务在吐字前最多等待一次，继续使用原总期限和会话。
+      const waitForUploadQuota = async (waitMs: number): Promise<boolean> => {
+        if (!request.stream || (!task.pendingUpload && !Object.keys(task.uploads ?? {}).length) || quotaWaited ||
+          waitMs >= totalMs - (Date.now() - started)) return false;
+        quotaWaited = true;
+        await store.write(`cooldown:${account.id}:${model.siderModel}`, Date.now() + waitMs, waitMs);
+        await delay(waitMs, undefined, { signal: combined });
+        return true;
+      };
       const cooldown = await store.read<number>(`cooldown:${account.id}:${model.siderModel}`);
-      if (cooldown && cooldown > Date.now()) {
+      if (cooldown && cooldown > Date.now() &&
+        !await waitForUploadQuota(cooldown - Date.now())) {
         recordSiderActivity(model.siderModel, { cooldownRejections: 1 });
         throw new ControllerError(
           'Sider模型额度仍在冷却，主控任务保留',
@@ -845,27 +856,32 @@ async function runSiderControllerOnce(
           try {
             upstream = await siderClient.chat(body, account.token, combined, forward);
           } catch (error) {
-            // 仅重试明确的建立连接失败；SSE失败、读取超时和工具服务端副作用均不重试。
-            // 已经吐出文本后也不能重试，否则客户端会收到重复内容。
-            const message = error instanceof Error ? error.message : '';
-            if (
-              combined.aborted || streamedAny || !(/\(Connect\)|Unable to connect/.test(message))
-            ) throw error;
-            persistSiderTelemetry({
-              ts: Date.now(),
-              model: request.model,
-              strategy: 'controller',
-              ...controllerPayloadDiagnostics(prompt),
-              ok: false,
-              siderCode: 0,
-              ms: Date.now() - callStarted,
-              hasTools: !!tools.length,
-              restoredToolUse: false,
-              phase: 'upstream',
-              outcome: 'connect_retry',
-            });
-            await new Promise((resolve) => setTimeout(resolve, 1000));
-            upstream = await siderClient.chat(body, account.token, combined, forward);
+            // 1135 是明确拒绝处理；上下文任务尚未吐字时按上游恢复时间等待一次。
+            if (!combined.aborted && !streamedAny && error instanceof SiderUpstreamError &&
+              error.siderCode === 1135 && await waitForUploadQuota(error.retryAfterMs ?? 60_000)) {
+              upstream = await siderClient.chat(body, account.token, combined, forward);
+            } else {
+              // 其他情况仅重试明确的建立连接失败；已吐字、读取超时和工具副作用不重试。
+              const message = error instanceof Error ? error.message : '';
+              if (
+                combined.aborted || streamedAny || !(/\(Connect\)|Unable to connect/.test(message))
+              ) throw error;
+              persistSiderTelemetry({
+                ts: Date.now(),
+                model: request.model,
+                strategy: 'controller',
+                ...controllerPayloadDiagnostics(prompt),
+                ok: false,
+                siderCode: 0,
+                ms: Date.now() - callStarted,
+                hasTools: !!tools.length,
+                restoredToolUse: false,
+                phase: 'upstream',
+                outcome: 'connect_retry',
+              });
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              upstream = await siderClient.chat(body, account.token, combined, forward);
+            }
           }
           paceOutcome = 'ok';
         } catch (error) {

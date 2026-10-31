@@ -2270,3 +2270,134 @@ Deno.test('主控部署期限：非流式上游超时返回400并要求改用流
     { DENO_DEPLOYMENT_ID: 'timeout-test', SIDER_TOTAL_TIMEOUT_MS: '50' },
   );
 });
+
+for (const scenario of ['恢复', '期限不足', '再次限流', '执行前限流']) {
+  Deno.test(`主控OpenAI流式上传：1135${scenario}`, async () => {
+    const recover = scenario === '恢复' || scenario === '执行前限流';
+    const quotaWaitMs = scenario === '期限不足' ? 60_000 : 40;
+    const { SiderUpstreamError } = await import('../src/utils/sse-line-reader.ts');
+    const model = 'gemini-3.8-flash';
+    let store: Awaited<ReturnType<typeof getControllerStore>> | undefined;
+    const cooldownKey = `cooldown:${await siderAccountId('controller-sider-token')}:${model}`;
+    const chunks: number[] = [];
+    let limitedAt = 0;
+    let retries = 0;
+    try {
+      await appWithMock((body) => {
+        const prompt = body.multi_content[0].text as string;
+        const part = prompt.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+        if (!part) {
+          if (scenario === '执行前限流' && retries++ === 0) {
+            limitedAt = Date.now();
+            throw new SiderUpstreamError('登记后执行前达到额度', 1135, 429, '', quotaWaitMs);
+          }
+          return sse('上传恢复后真实回答', 'quota-upload-cid', 'answer', model);
+        }
+        const index = Number(part[1]);
+        chunks.push(index);
+        if (index === 2 && scenario !== '执行前限流') {
+          equal(body.cid, 'quota-upload-cid');
+          equal(body.parent_message_id, 'quota-parent-1');
+          if (retries++ === 0 || scenario === '再次限流') {
+            limitedAt = Date.now();
+            throw new SiderUpstreamError('上传时达到模型额度', 1135, 429, '', quotaWaitMs);
+          }
+          equal(Date.now() - limitedAt >= 30, true);
+        }
+        return sse(`已记住${index}/${part[2]}`, 'quota-upload-cid', `quota-parent-${index}`, model);
+      }, async (app) => {
+        store = await getControllerStore();
+        const { default: protocolRouter } = await import('../src/routes/protocols.ts');
+        app.route('/', protocolRouter);
+        const response = await app.request('/v1/chat/completions', {
+          method: 'POST', headers,
+          body: JSON.stringify({ model, stream: true, messages: [
+            { role: 'system', content: '完整规范。'.repeat(1600) },
+            { role: 'user', content: crypto.randomUUID() },
+          ] }),
+        });
+        const text = await response.text();
+        const events = text.split('\n').filter((line) => line.startsWith('data: {'))
+          .map((line) => JSON.parse(line.slice(6)));
+        if (recover) {
+          equal(events.some((event) => event.error), false);
+          equal(text.includes('上传恢复后真实回答'), true);
+          equal(chunks.filter((index) => index === 1).length, 1);
+          equal(chunks.filter((index) => index === 2).length, scenario === '执行前限流' ? 1 : 2);
+        } else {
+          const failed = events.find((event) => event.error);
+          equal(failed?.error.type, 'rate_limit_error');
+          equal(failed?.error.retry_after, Math.ceil(quotaWaitMs / 1000));
+          equal(failed?.choices, []);
+          equal(chunks, scenario === '再次限流' ? [1, 2, 2] : [1, 2]);
+        }
+      }, { SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', SIDER_TOTAL_TIMEOUT_MS: '1000' });
+    } finally {
+      await store?.write(cooldownKey, 0, -1);
+    }
+  });
+}
+
+Deno.test('主控OpenAI流式上传：等待冷却期间仍发送心跳', async () => {
+  const { SiderUpstreamError } = await import('../src/utils/sse-line-reader.ts');
+  const model = 'gemini-3.8-flash';
+  let store: Awaited<ReturnType<typeof getControllerStore>> | undefined;
+  let limited = false;
+  try {
+    await appWithMock((body) => {
+      const part = body.multi_content[0].text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+      if (!part) return sse('心跳等待后完成', 'heartbeat-cid', 'answer', model);
+      if (part[1] === '2' && !limited) {
+        limited = true;
+        throw new SiderUpstreamError('等待模型额度', 1135, 429, '', 5100);
+      }
+      return sse(`已记住${part[1]}/${part[2]}`, 'heartbeat-cid', part[1], model);
+    }, async (app) => {
+      store = await getControllerStore();
+      const { default: protocolRouter } = await import('../src/routes/protocols.ts');
+      app.route('/', protocolRouter);
+      const response = await app.request('/v1/chat/completions', {
+        method: 'POST', headers, body: JSON.stringify({ model, stream: true, messages: [
+          { role: 'system', content: '规范。'.repeat(2500) },
+          { role: 'user', content: crypto.randomUUID() },
+        ] }),
+      });
+      const text = await response.text();
+      equal(text.includes(': ping\n\n'), true);
+      equal(text.includes('心跳等待后完成'), true);
+      equal(text.includes('"error"'), false);
+    }, { SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000', SIDER_TOTAL_TIMEOUT_MS: '15000' });
+  } finally {
+    await store?.write(`cooldown:${await siderAccountId('controller-sider-token')}:${model}`, 0, -1);
+  }
+});
+
+Deno.test('主控OpenAI流式：客户端取消时中止上游请求', async () => {
+  let started!: () => void;
+  const pending = new Promise<void>((resolve) => { started = resolve; });
+  let aborted = false;
+  const abort = new AbortController();
+  await appWithMock((_body, init) => new Promise<Response>((_resolve, reject) => {
+    const signal = init!.signal!;
+    signal.addEventListener('abort', () => {
+      aborted = true;
+      reject(signal.reason);
+    }, { once: true });
+    started();
+  }), async (app) => {
+    const { default: protocolRouter } = await import('../src/routes/protocols.ts');
+    app.route('/', protocolRouter);
+    const response = await app.request('/v1/chat/completions', {
+      method: 'POST', headers, signal: abort.signal,
+      body: JSON.stringify({ model: 'gemini-3.8-flash', stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }] }),
+    });
+    try {
+      await pending;
+      await response.body!.cancel();
+      equal(aborted, true);
+    } finally {
+      abort.abort();
+    }
+  });
+});
