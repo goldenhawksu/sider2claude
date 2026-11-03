@@ -278,7 +278,7 @@ test('Bun长会话：超过16分片完整登记，中断后追加继续仍保留
       const seen = new Map<number, string>();
       let total = 0, failed = false;
       const request: AnthropicRequest = { model: 'claude-sonnet-5.5',
-        system: '既有SVG规范。'.repeat(mode === 'long' ? 8000 : 1800) + `尾部唯一路径：${path}`,
+        system: '既有SVG规范。'.repeat(mode === 'long' ? 80000 : 68000) + `尾部唯一路径：${path}`,
         tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }],
         messages: [
           { role: 'user', content: 'P07已完成，读取规范后继续P08。' },
@@ -334,24 +334,54 @@ test('Bun长会话：超过16分片完整登记，中断后追加继续仍保留
   }
 });
 
-test('Bun长会话：内容库超限返回明确的400容量错误，保留真正上游413的语义', async () => {
-  const original = globalThis.fetch;
-  const previous = process.env.SIDER_AUTH_TOKEN;
-  process.env.SIDER_AUTH_TOKEN = 'context-capacity-bun';
-  const request: AnthropicRequest = { model: 'claude-sonnet-5.5', system: 'x'.repeat(512001),
-    messages: [{ role: 'user', content: crypto.randomUUID() }] };
-  try {
-    globalThis.fetch = (() => { throw new Error('容量校验失败不应调用上游'); }) as typeof fetch;
-    const response = await controllerResponse(request, crypto.randomUUID(), createRequestLogContext(request));
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error.type).toBe('invalid_request_error');
-    expect(body.error.message).toContain('512000');
-  } finally {
-    globalThis.fetch = original;
-    if (previous === undefined) delete process.env.SIDER_AUTH_TOKEN;
-    else process.env.SIDER_AUTH_TOKEN = previous;
+for (const stream of [false, true]) {
+  for (const compact of [false, true]) {
+    test(`Bun长会话容量：超过512000字符的SVG历史可${compact ? '压缩' : '继续'}，stream=${stream}`, async () => {
+      await withUploadDiagnosticsFixture(async (f) => {
+        const marker = crypto.randomUUID();
+        const svg = '<svg><text>历史页面</text></svg>\n'.repeat(18000);
+        const instruction = compact ? '请总结当前会话，保留尾部事实。' : '请继续并回答尾部事实。';
+        const request: AnthropicRequest = { model: 'claude-sonnet-5.5', stream,
+          system: compact ? 'Your task is to create a detailed summary of the conversation so far.' : '继续现有任务。',
+          messages: [{ role: 'user', content: '生成演示文稿。' },
+            { role: 'assistant', content: svg + marker }, { role: 'user', content: instruction }] };
+        const original = `System: ${request.system}\n\nUser: 生成演示文稿。\n\nAssistant: ${svg}${marker}\n\nUser: ${instruction}\n\nAssistant:`;
+        expect(original.length).toBeGreaterThan(512000);
+        const chunks: string[] = [];
+        f.mock((body: any) => {
+          const text = body.multi_content[0].text;
+          expect(text.length).toBeLessThanOrEqual(3000);
+          const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+          if (part) {
+            expect(Number(part[1])).toBe(chunks.length + 1);
+            if (chunks.length) expect(body.parent_message_id).toBe(`capacity-${chunks.length}`);
+            chunks.push(part[3]);
+            return f.sse(body, '已记住', `capacity-${chunks.length}`);
+          }
+          expect(chunks.join('')).toBe(original);
+          return f.sse(body, marker, 'capacity-answer');
+        });
+        const response = await controllerResponse(request, marker, createRequestLogContext(request));
+        expect(response.status).toBe(200);
+        if (stream) {
+          const text = await response.text();
+          expect(text).toContain(marker);
+          expect(text).toContain('event: message_stop');
+          expect(text).not.toContain('event: error');
+        } else {
+          expect((await response.json()).content[0].text).toBe(marker);
+        }
+      });
+    });
   }
+}
+test('Bun长会话容量：文件正文仍保留512000字符限制', async () => {
+  await withUploadDiagnosticsFixture(async (f) => {
+    await saveControllerText(f.store, 'asset-boundary', 'x'.repeat(512000));
+    expect((await readControllerText(f.store, 'asset-boundary')).length).toBe(512000);
+    await expect(saveControllerText(f.store, 'asset-too-large', 'x'.repeat(512001))).rejects.toThrow('512000');
+    expect(await f.store.read('asset-too-large')).toBe(null);
+  });
 });
 
 test('Bun部署期限：小批登记后纯用户追加继续保持原文和父消息', async () => {

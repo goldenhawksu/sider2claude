@@ -1400,7 +1400,7 @@ Deno.test('主控长会话：上传中断后追加请继续，先续传原始尾
   const request: AnthropicRequest = {
     model: 'claude-opus-5.5',
     tools: [tools![0]!],
-    system: '必须保留完整SVG及规范。\n'.repeat(1800) + `尾部唯一下一页路径：${path}`,
+    system: '必须保留完整SVG及规范。\n'.repeat(40000) + `尾部唯一下一页路径：${path}`,
     messages: [
       { role: 'user', content: 'P07完成，读取规范后继续P08。' },
       {
@@ -1444,20 +1444,62 @@ Deno.test('主控长会话：上传中断后追加请继续，先续传原始尾
     equal(seen.size, total);
   });
 });
-Deno.test('主控长会话：内部内容库超限显示实际容量错误，不伪装成HTTP32MB限制', async () => {
-  await appWithMock(() => {
-    throw new Error('容量校验失败不应调用上游');
-  }, async (app) => {
-    const response = await send(app, {
-      model: 'claude-opus-5.5',
-      system: 'x'.repeat(512001),
-      messages: [{ role: 'user', content: crypto.randomUUID() }],
+for (const stream of [false, true]) {
+  for (const compact of [false, true]) {
+    Deno.test(`主控长会话容量：超过512000字符的SVG历史可${compact ? '压缩' : '继续'}，stream=${stream}`, async () => {
+      const marker = crypto.randomUUID();
+      const svg = '<svg><text>历史页面</text></svg>\n'.repeat(18000);
+      const instruction = compact ? '请总结当前会话，保留尾部事实。' : '请继续并回答尾部事实。';
+      const request: AnthropicRequest = {
+        model: 'claude-opus-5.5',
+        stream,
+        system: compact
+          ? 'Your task is to create a detailed summary of the conversation so far.'
+          : '继续现有任务。',
+        messages: [
+          { role: 'user', content: '生成演示文稿。' },
+          { role: 'assistant', content: svg + marker },
+          { role: 'user', content: instruction },
+        ],
+      };
+      const original =
+        `System: ${request.system}\n\nUser: 生成演示文稿。\n\nAssistant: ${svg}${marker}\n\nUser: ${instruction}\n\nAssistant:`;
+      equal(original.length > 512000, true);
+      equal(new TextEncoder().encode(JSON.stringify(request)).length < 32 * 1024 * 1024, true);
+      const chunks: string[] = [];
+      await appWithMock((body) => {
+        const text = body.multi_content[0].text;
+        equal(text.length <= 6000, true);
+        const part = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+        if (part) {
+          equal(Number(part[1]), chunks.length + 1);
+          if (chunks.length) equal(body.parent_message_id, `capacity-${chunks.length}`);
+          chunks.push(part[3]);
+          return sse('已记住', `capacity-${marker}`, `capacity-${chunks.length}`);
+        }
+        equal(chunks.join(''), original);
+        return sse(marker, `capacity-${marker}`, 'capacity-answer');
+      }, async (app) => {
+        const response = await send(app, request);
+        equal(response.status, 200);
+        if (stream) {
+          const text = await response.text();
+          equal(text.includes(marker), true);
+          equal(text.includes('event: message_stop'), true);
+          equal(text.includes('event: error'), false);
+        } else {
+          equal((await response.json()).content[0].text, marker);
+        }
+      });
     });
-    equal(response.status, 400);
-    const body = await response.json();
-    equal(body.error.type, 'invalid_request_error');
-    equal(body.error.message.includes('512000'), true);
-  });
+  }
+}
+Deno.test('主控长会话容量：文件正文仍保留512000字符限制', async () => {
+  const store = new ControllerMemoryStore();
+  await saveControllerText(store, 'asset-boundary', 'x'.repeat(512000));
+  equal((await readControllerText(store, 'asset-boundary')).length, 512000);
+  await rejects(() => saveControllerText(store, 'asset-too-large', 'x'.repeat(512001)), '512000');
+  equal(await store.read('asset-too-large'), null);
 });
 Deno.test('主控部署期限：非流式分批返回可重试进度，纯用户追加继续仍续传同一原文', async () => {
   resetSiderActivity();

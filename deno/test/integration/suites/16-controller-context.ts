@@ -82,18 +82,27 @@ export const suite: Suite = {
       },
     },
     {
-      name: '512000字符内容库边界：明确返回400容量信息，不误报32MB',
+      name: '超过512000字符的SVG会话可以压缩，并保留尾部事实',
       async run({ api, config }) {
+        const marker = crypto.randomUUID();
+        const history = '<svg><text>已完成页面</text></svg>\n'.repeat(18000) +
+          `\n尾部事实：交付国家为德国，唯一标记为${marker}。`;
+        assertTrue(history.length > 512000, '历史超过单份正文容量');
         const response = await api.post('/v1/messages', {
           model: config.liveModel,
-          system: 'x'.repeat(512001),
-          max_tokens: 64,
-          messages: [{ role: 'user', content: crypto.randomUUID() }],
+          system: '请总结会话供后续继续使用，必须保留最后给出的交付国家和唯一标记。',
+          max_tokens: 1024,
+          messages: [
+            { role: 'user', content: '整理已经完成的演示文稿。' },
+            { role: 'assistant', content: history },
+            { role: 'user', content: '请压缩当前会话，只输出简要摘要和尾部事实。' },
+          ],
         });
-        assertStatus(response, 400);
-        assertEquals(response.json.error.type, 'invalid_request_error');
-        assertIncludes(response.json.error.message, '512000');
-        return '内部内容库容量边界保留，错误信息暴露真实限制；不进入模型调用';
+        assertStatus(response, 200);
+        assertAnthropicMessage(response.json, config.liveModel);
+        assertIncludes(textOf(response.json), '德国');
+        assertIncludes(textOf(response.json), marker);
+        return '超过512000字符的完整历史已登记，压缩摘要保留尾部事实';
       },
     },
   ],

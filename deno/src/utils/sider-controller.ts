@@ -122,10 +122,11 @@ export async function saveControllerText(
   store: ControllerStore,
   key: string,
   text: string,
+  maxChars = 512_000,
 ): Promise<void> {
-  if (text.length > 512_000) {
+  if (text.length > maxChars) {
     throw new ControllerError(
-      '待登记内容超过可信内容库单项512000字符容量，请压缩会话历史或缩短正文',
+      `待登记内容超过可信内容库单项${maxChars}字符容量，请缩短正文`,
       400,
     );
   }
@@ -1066,7 +1067,8 @@ async function runSiderControllerOnce(
         const resumed = task.pendingUpload === hash;
         task.uploads ??= {};
         if ((task.uploads[hash] ?? 0) < count && task.pendingUpload !== hash) {
-          await saveControllerText(store, `${owner}:${task.id}:upload:${hash}`, context);
+          // 上下文体积由 HTTP 入口限制，不套用单份文件正文的 512000 字符限额。
+          await saveControllerText(store, `${owner}:${task.id}:upload:${hash}`, context, Infinity);
           task.pendingUpload = hash;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         }

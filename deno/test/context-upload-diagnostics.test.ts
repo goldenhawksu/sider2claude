@@ -11,6 +11,7 @@ function equal(actual: unknown, expected: unknown) {
   }
 }
 type Checkpoint = {
+  id: string;
   cid: string;
   parent: string;
   uploads?: Record<string, number>;
@@ -726,5 +727,59 @@ Deno.test('请求锁期限：账号重选共用原始截止时间，不能重新
       Date.now = originalNow;
       AbortSignal.timeout = originalTimeout;
     }
+  });
+});
+
+Deno.test('上下文容量：超过512000字符的历史在KV重建后无损续传，已确认分片不重发', async () => {
+  await fixture(async (f) => {
+    const marker = crypto.randomUUID();
+    const system = '<svg><text>历史页面😀</text></svg>\n'.repeat(18000) + marker;
+    const req: AnthropicRequest = {
+      ...request(),
+      system,
+      messages: [{ role: 'user', content: '请总结会话并保留尾部事实。' }],
+    };
+    const original = system + '\n\n请总结会话并保留尾部事实。';
+    equal(original.length > 512000, true);
+    const chunks: string[] = [];
+    let interrupted = false;
+    f.mock((body) => {
+      const text = body.multi_content[0]!.text;
+      const match = text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)[^\n]*\n([\s\S]*)$/);
+      if (match) {
+        const index = Number(match[1]);
+        if (index === 2 && !interrupted) {
+          interrupted = true;
+          return sse(body, '合成中断，尚未确认。', 'unconfirmed');
+        }
+        equal(index, chunks.length + 1);
+        if (index > 1) equal(body.parent_message_id, `large-${index - 1}`);
+        chunks.push(match[3]!);
+        return sse(body, '已记住', `large-${index}`);
+      }
+      equal(chunks.join(''), original);
+      return sse(body, marker, 'large-answer');
+    });
+    const owner = crypto.randomUUID();
+    const first = await controllerResponse(req, owner, createRequestLogContext(req));
+    equal(first.status, 502);
+    equal((await first.json()).error.code, 'context_unconfirmed');
+    const checkpoint = await f.checkpoint();
+    equal(checkpoint.parent, 'large-1');
+    equal(Object.values(checkpoint.uploads ?? {}), [1]);
+    equal(
+      await controller.readControllerText(
+        f.store,
+        `${await controller.controllerHash(
+          owner,
+        )}:${checkpoint.id}:upload:${checkpoint.pendingUpload}`,
+      ),
+      original,
+    );
+    const fresh = await f.restart();
+    const result = await fresh.runSiderController(req, owner);
+    equal(result.content.find((block) => block.type === 'text')?.text, marker);
+    equal(chunks.join(''), original);
+    equal((await f.checkpoint()).pendingUpload, undefined);
   });
 });
